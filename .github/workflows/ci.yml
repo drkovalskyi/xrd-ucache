@@ -20,6 +20,8 @@ jobs:
     env: {CC: '${{ matrix.cc }}', CXX: '${{ matrix.cxx }}'}
     steps:
       - uses: actions/checkout@v4
+      - name: codec libraries (build + test the transposer too)
+        run: sudo apt-get -qq update && sudo apt-get -qq install -y liblzma-dev libzstd-dev liblz4-dev zlib1g-dev
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_PLUGIN=OFF
       - run: cmake --build build -j"$(nproc)"
       - name: unit + differential (1e5 ops)
@@ -32,7 +34,8 @@ jobs:
       - name: deps
         run: |
           dnf -y install epel-release
-          dnf -y install gcc-c++ cmake make git xrootd-client-devel xrootd-client xrootd-server
+          dnf -y install gcc-c++ cmake make git xrootd-client-devel xrootd-client xrootd-server \
+                         xz-devel libzstd-devel lz4-devel zlib-devel
       - uses: actions/checkout@v4
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF
              -DUCACHE_XROOTD_ROOT=/usr

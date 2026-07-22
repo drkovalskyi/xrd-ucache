@@ -980,7 +980,9 @@ int cmdMaterialize(CacheStore* store, const Config& cfg, IOBackend& io, int argc
 // Calibrated LZMA decode rate (MB/s == bytes/µs), measured from real
 // transcodes (Overlay.decodeBytes/decodeNs) and persisted per cache dir.
 // 0 = not calibrated yet. Not consulted for decisions while the gate is
-// parked — maintained for its revival.
+// parked — maintained for its revival. Only the transcoding sweep calls
+// these, so codec-less builds must not compile them (-Werror=unused-function).
+#ifdef UCACHE_HAVE_TRANSPOSE
 double readCalibration(const Config& cfg) {
   std::ifstream in(cfg.cacheDir + "/calibration");
   double v = 0;
@@ -998,6 +1000,7 @@ void writeCalibration(const Config& cfg, double mbps) {
   out.close();
   ::rename(tmp.c_str(), (cfg.cacheDir + "/calibration").c_str());
 }
+#endif // UCACHE_HAVE_TRANSPOSE
 
 // Modes: kSweep (explicit `ucache recompress`: foreground pass over the
 // existing cache with live progress; punches superseded v1 pages of what it
