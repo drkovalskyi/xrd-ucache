@@ -1,0 +1,91 @@
+# Release: build the floor-correct el9 RPM + tarball and attach them to the
+# GitHub Release for a v* tag. The artifact MUST declare the 5.6 XrdCl
+# handshake floor (see docs), and GitHub runners have no CVMFS, so we build the
+# xrootd 5.6.4 client from source (headers + libXrdCl) and package against it.
+# workflow_dispatch runs the build + uploads the artifact for inspection
+# WITHOUT creating a release (safe to test the pipeline before tagging).
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    container: almalinux:9
+    env:
+      XRD_VER: 5.6.4
+      XRD_PREFIX: /opt/xrootd-5.6.4
+    steps:
+      - name: deps (host toolchain + xrootd build deps + codec -devel)
+        run: |
+          dnf -y install epel-release
+          # lz4-devel intentionally omitted (matches package-el9.sh: the
+          # transposer treats LZ4 source as fail-open, page cache unaffected).
+          dnf -y install gcc-c++ cmake make git rpm-build binutils \
+                         openssl-devel libuuid-devel zlib-devel \
+                         xz-devel libzstd-devel
+      - name: cache xrootd ${{ env.XRD_VER }} floor build
+        id: xrdcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.XRD_PREFIX }}
+          key: xrootd-${{ env.XRD_VER }}-el9-v1
+      - name: build xrootd ${{ env.XRD_VER }} client from source (headers + libXrdCl)
+        if: steps.xrdcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch v$XRD_VER --depth 1 https://github.com/xrootd/xrootd /tmp/xrd
+          # Only XrdCl headers + libXrdCl are needed; disable optional features
+          # to cut deps/time (unknown flags are harmless cmake warnings).
+          cmake -S /tmp/xrd -B /tmp/xrd/build -DCMAKE_INSTALL_PREFIX="$XRD_PREFIX" \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DENABLE_HTTP=FALSE -DENABLE_PYTHON=FALSE -DENABLE_VOMS=FALSE \
+                -DENABLE_KRB5=FALSE -DENABLE_XRDEC=FALSE -DENABLE_MACAROONS=FALSE \
+                -DENABLE_SCITOKENS=FALSE -DENABLE_TESTS=FALSE -DENABLE_FUSE=FALSE \
+                -DENABLE_READLINE=FALSE
+          cmake --build /tmp/xrd/build -j"$(nproc)"
+          cmake --install /tmp/xrd/build
+      - uses: actions/checkout@v4
+      - name: package (build against the 5.6.4 floor, produce RPM + tarball)
+        run: UCACHE_PKG_XROOTD_ROOT="$XRD_PREFIX" bash scripts/package-el9.sh
+      - name: assert the plugin declares the 5.6 handshake floor
+        run: |
+          v=$(strings build-pkg/src/plugin/libXrdClUCache.so \
+              | grep -oE '@V:XrdClUCache v[0-9.]+' | head -1)
+          echo "handshake: $v"
+          case "$v" in
+            *v5.6.*) echo "OK: 5.6 floor" ;;
+            *) echo "FATAL: artifact does not declare the 5.6 floor ($v)"; exit 1 ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xrd-ucache-el9-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # least privilege: only this job can write the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: xrd-ucache-el9-*
+          merge-multiple: true
+          path: dist
+      - name: create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.rpm dist/*.tar.gz -R "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/*.rpm dist/*.tar.gz -R "$REPO" \
+               --title "$TAG" --generate-notes
+          fi
