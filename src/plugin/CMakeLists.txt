@@ -1,10 +1,15 @@
 # libXrdClUCache: the XrdCl client plugin.
 # Built against the pinned XRootD client (cmake/XRootDPin.cmake):
 # headers + libXrdCl from UCACHE_XROOTD_ROOT.
+# UCACHE_XROOTD_ROOT is authoritative when it resolves: search it FIRST with
+# NO_DEFAULT_PATH so an ambient CMAKE_PREFIX_PATH (toolchain views) cannot
+# substitute a different libXrdCl than the headers being compiled against.
 find_path(XRDCL_INCLUDE_DIR XrdCl/XrdClPlugInInterface.hh
-          PATHS ${UCACHE_XROOTD_ROOT}/include/xrootd REQUIRED)
+          PATHS ${UCACHE_XROOTD_ROOT}/include/xrootd NO_DEFAULT_PATH)
+find_path(XRDCL_INCLUDE_DIR XrdCl/XrdClPlugInInterface.hh REQUIRED)
 find_library(XRDCL_LIBRARY XrdCl
-             PATHS ${UCACHE_XROOTD_ROOT}/lib64 ${UCACHE_XROOTD_ROOT}/lib REQUIRED)
+             PATHS ${UCACHE_XROOTD_ROOT}/lib64 ${UCACHE_XROOTD_ROOT}/lib NO_DEFAULT_PATH)
+find_library(XRDCL_LIBRARY XrdCl REQUIRED)
 ucache_require_xrootd_version("${XRDCL_INCLUDE_DIR}")
 
 add_library(XrdClUCache SHARED
