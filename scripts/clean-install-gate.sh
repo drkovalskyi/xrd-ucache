@@ -32,7 +32,14 @@ CONF_FILE="$XRD_HOME/.xrootd/client.plugins.d/ucache.conf"
 trap 'rm -f "$CONF_FILE"' EXIT
 
 say() { printf '\n=== %s ===\n' "$*"; }
-fail() { printf 'clean-install FAIL: %s\n' "$*" >&2; exit 1; }
+fail() {
+  printf 'clean-install FAIL: %s\n' "$*" >&2
+  # post-mortem for CI (the container is destroyed on exit): origin log tail
+  for f in /tmp/ucache-gate/xrootd.log*; do
+    [ -f "$f" ] && { echo "--- $f (tail) ---" >&2; tail -30 "$f" >&2; }
+  done
+  exit 1
+}
 
 say "1. install deps (bare OS, no CVMFS)"
 if command -v dnf >/dev/null; then
@@ -79,7 +86,9 @@ fi
 "${XRD[@]}" -b -p "$PORT" -l /tmp/ucache-gate/xrootd.log "$ORIGINDIR" || \
   fail "could not start xrootd origin"
 sleep 2
-URL="root://localhost:$PORT//probe.bin"
+# The origin exports the filesystem path it was started with, so the URL
+# carries the ABSOLUTE path of the probe file.
+URL="root://localhost:$PORT/$ORIGINDIR/probe.bin"
 
 # Zero-env activation: no XRD_* or UCACHE_* variables at all —
 # XrdCl finds the conf in the default user plugin dir, and the cache dir

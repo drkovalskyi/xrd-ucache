@@ -1496,7 +1496,7 @@ int cmdRm(CacheStore& store, const Config& cfg, int argc, char** argv) {
     std::fputs("rm: needs at least one <url>\n", stderr);
     return 2;
   }
-  int removed = 0, missing = 0, bad = 0;
+  int missing = 0, bad = 0;
   for (int i = 2; i < argc; ++i) {
     auto key = UrlKey::parse(argv[i], cfg.keepCgi); // SAME normalization as the plugin
     if (!key) {
@@ -1506,7 +1506,6 @@ int cmdRm(CacheStore& store, const Config& cfg, int argc, char** argv) {
     }
     if (store.removeEntry(*key)) {
       std::printf("removed %s\n", key->key.c_str());
-      ++removed;
     } else {
       std::fprintf(stderr, "%s: not cached\n", argv[i]);
       ++missing;
