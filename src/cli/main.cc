@@ -32,6 +32,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <fstream>
+#include <iterator>
 #include <pwd.h>
 #include <sstream>
 #include <string>
@@ -1999,6 +2000,88 @@ int soProbe(const std::string& confLib) {
   std::printf("  [%s] %s (%s)\n", sym ? " OK " : "WARN", what, so.c_str());
   return sym ? 0 : 1;
 }
+
+// Parse the first vX.Y.Z in a string into {major,minor,patch}; false if none.
+bool parseXrdVersion(const std::string& s, int v[3]) {
+  size_t i = 0;
+  while ((i = s.find('v', i)) != std::string::npos) {
+    if (std::sscanf(s.c_str() + i + 1, "%d.%d.%d", &v[0], &v[1], &v[2]) == 3)
+      return true;
+    ++i;
+  }
+  return false;
+}
+// The handshake version the plugin declares (XrdVERSIONINFO), embedded in the
+// .so as "@V:XrdClUCache vX.Y.Z" — the same string packaging validates. Read
+// it straight from the file so the check adapts to whatever the plugin was
+// built against (no build-time coupling to the CLI).
+std::string pluginDeclaredVersion(const std::string& so) {
+  std::ifstream f(so, std::ios::binary);
+  if (!f)
+    return "";
+  std::string blob((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  const std::string marker = "@V:XrdClUCache ";
+  size_t p = blob.find(marker);
+  if (p == std::string::npos)
+    return "";
+  size_t e = blob.find('\0', p);
+  return blob.substr(p + marker.size(), (e == std::string::npos ? blob.size() : e) - p - marker.size());
+}
+// The XRootD client actually present in this environment — the one that would
+// load (or refuse) the plugin. `xrdcp` ships with the client and tracks its
+// version. "" if unavailable/unparseable.
+std::string ambientClientVersion() {
+  FILE* p = ::popen("xrdcp --version 2>&1", "r");
+  if (!p)
+    return "";
+  char buf[256] = {0};
+  size_t n = std::fread(buf, 1, sizeof buf - 1, p);
+  ::pclose(p);
+  buf[n] = '\0';
+  int v[3];
+  return parseXrdVersion(buf, v) ? std::string(buf).substr(0, std::string(buf).find_first_of("\r\n"))
+                                 : "";
+}
+// Handshake compatibility: XrdCl loads a plugin only when the plugin's declared
+// version is <= the client's — a NEWER-looking plugin is refused SILENTLY and
+// the job runs uncached. Catch that here instead of letting it fail invisibly.
+int handshakeProbe(const std::string& confLib) {
+  std::string so = confLib.empty() ? pluginSoPath() : confLib;
+  if (so.empty())
+    return 0; // soProbe already reported the missing library
+  std::string decl = pluginDeclaredVersion(so);
+  std::string client = ambientClientVersion();
+  int dv[3], cv[3];
+  if (decl.empty() || !parseXrdVersion("v" + decl, dv)) {
+    std::printf("  [WARN] could not read the plugin's handshake version from %s\n", so.c_str());
+    return 0;
+  }
+  if (client.empty() || !parseXrdVersion(client, cv)) {
+    std::printf("  [WARN] XRootD client version unknown (xrdcp not on PATH?) — cannot verify "
+                "handshake; the plugin needs a client >= %s\n",
+                decl.c_str());
+    return 0;
+  }
+  bool clientNewerOrEqual = (cv[0] > dv[0]) || (cv[0] == dv[0] && (cv[1] > dv[1] ||
+                            (cv[1] == dv[1] && cv[2] >= dv[2])));
+  if (clientNewerOrEqual) {
+    std::printf("  [ OK ] XRootD client %s >= plugin handshake floor %s\n", client.c_str(),
+                decl.c_str());
+    return 0;
+  }
+  if (cv[0] < 5 && dv[0] >= 5) {
+    std::printf("  [FAIL] XRootD client %s predates the 5.x plugin ABI (needs libXrdCl.so.3); this "
+                "plugin cannot load here AT ALL and jobs run uncached. Use a client/framework "
+                "built against XRootD >= %s.\n",
+                client.c_str(), decl.c_str());
+  } else {
+    std::printf("  [FAIL] XRootD client %s is OLDER than this plugin (built for %s); XrdCl "
+                "silently refuses a plugin newer than the client, so jobs run UNCACHED. Use a "
+                "client/framework built against XRootD >= %s (newer framework builds ship it).\n",
+                client.c_str(), decl.c_str(), decl.c_str());
+  }
+  return 1;
+}
 // Activation = any plugin conf XrdCl will process that loads ucache
 // (USER_GUIDE §2). Probe the dirs XrdCl scans — verified order (5.8.3 pin and
 // host 5.9.6): /etc/xrootd/client.plugins.d, then ~/.xrootd/client.plugins.d
@@ -2092,6 +2175,7 @@ int cmdDoctor(const Config& cfg) {
   } else
     problems += fsProbe(cfg.cacheDir);
   problems += soProbe(conf.empty() ? "" : confKey(conf, "lib")) + activationProbe();
+  problems += handshakeProbe(conf.empty() ? "" : confKey(conf, "lib"));
   if (conf.empty() && systemStarSlotClaimed())
     std::printf("  [WARN] /etc/xrootd/client.plugins.d claims the '*' slot; bind explicit hosts "
                 "(url = host:port) or use `setup --host`\n");

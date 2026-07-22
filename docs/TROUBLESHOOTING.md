@@ -46,6 +46,20 @@ second. If not:
      If you build from source against newer headers, older clients (e.g.
      CMSSW's) log `Plugin version client v5.6.4 is incompatible …` and run
      uncached — rebuild against the oldest headers you need to serve.
+     **`ucache doctor` now checks this for you**: it compares the plugin's
+     declared version against the `xrootd` client on your PATH and FAILs with
+     a clear message when the client is too old (silent-refusal) or is a 4.x
+     client (a different ABI — `libXrdCl.so.3` is absent, so a 5.x plugin
+     cannot load at all).
+   - *Which framework release do I need?* Find your client version with
+     `xrdcp --version` (or, in a CMSSW area, `scram tool info xrootd`). The
+     prebuilt plugin needs xrootd **≥ 5.6**. CMSSW ships modern xrootd in the
+     latest patch release of **actively-maintained** cycles — e.g.
+     `CMSSW_10_6_50` (2026) carries xrootd 5.7.2, though early patches of the
+     same cycle (`10_6_26`) shipped 4.8.5 — so *upgrading to the newest patch
+     in your cycle* usually resolves it. **Frozen** cycles never got the bump
+     (`CMSSW_10_2_29` stays 4.8.3, `CMSSW_11_3_4` stays 4.12.3) and cannot run
+     the plugin at any patch level; move to a maintained cycle.
    - *Older containers* (`cmssw-el8`/`cmssw-el7`): the el9-built `.so` needs
      GLIBC_2.34 and cannot load in an el8/el7 apptainer (glibc ≤ 2.28). el9
      CMSSW releases work as-is; an el8-flavor artifact is future work.
