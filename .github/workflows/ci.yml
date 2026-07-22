@@ -1,0 +1,108 @@
+# CI: build+unit, coverage gate, ASan/UBSan, TSan, crash suite, per-PR
+# differential fuzz, zero-admin clean-install; nightly long fuzz + crash loop.
+# NOTE: the same gates are mirrored by a local pre-push runner.
+name: ci
+on:
+  push: {branches: [main]}
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *' # nightly: long fuzz + full crash loop
+
+jobs:
+  build-unit:
+    strategy:
+      matrix:
+        include:
+          - {os: ubuntu-24.04, cc: gcc, cxx: g++, type: Release}
+          - {os: ubuntu-24.04, cc: gcc, cxx: g++, type: Debug}
+          - {os: ubuntu-24.04, cc: clang, cxx: clang++, type: Release}
+    runs-on: ${{ matrix.os }}
+    env: {CC: '${{ matrix.cc }}', CXX: '${{ matrix.cxx }}'}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_PLUGIN=OFF
+      - run: cmake --build build -j"$(nproc)"
+      - name: unit + differential (1e5 ops)
+        run: cd build && ctest --output-on-failure -E crash-suite
+
+  build-alma9:
+    runs-on: ubuntu-24.04
+    container: almalinux:9
+    steps:
+      - name: deps
+        run: |
+          dnf -y install epel-release
+          dnf -y install gcc-c++ cmake make git xrootd-client-devel xrootd-client xrootd-server
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF
+             -DUCACHE_XROOTD_ROOT=/usr
+      - run: cmake --build build -j"$(nproc)"
+      - run: cd build && ctest --output-on-failure -E crash-suite
+      - name: plugin fuzz vs local origin (1e5 + 8-thread)
+        run: |
+          mkdir -p /bench/data && dd if=/dev/urandom of=/bench/data/f.bin bs=1M count=64
+          xrootd -b -p 10940 /bench/data
+          mkdir -p /tmp/conf /tmp/cache
+          printf 'url = 127.0.0.1:10940\nlib = %s\nenable = true\n' "$PWD/build/src/plugin/libXrdClUCache.so" > /tmp/conf/u.conf
+          XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 1 1
+          XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 8 2
+
+  # Zero-admin acceptance: install -> `ucache setup` (no root) ->
+  # new-shell cached read (warm origin=0) -> fail-open, all in a CLEAN container
+  # (no CVMFS/LCG). Alma9 gates it; Ubuntu is best-effort (needs xrootd-dev >=5.6).
+  zero-admin-install:
+    runs-on: ubuntu-24.04
+    container: almalinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: clean-install zero-admin gate
+        run: bash scripts/clean-install-gate.sh "$PWD"
+
+  sanitizers:
+    strategy:
+      matrix:
+        sanitize: ['address,undefined', 'thread']
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DUCACHE_BUILD_BENCH=OFF
+             -DUCACHE_BUILD_PLUGIN=OFF -DUCACHE_SANITIZE=${{ matrix.sanitize }}
+      - run: cmake --build build -j"$(nproc)"
+      - run: cd build && ctest --output-on-failure -E crash-suite
+      - name: crash suite under sanitizer (30 iters)
+        run: UCACHE_CRASH_ITERS=30 ./build/tests/ucache-crash-harness
+
+  coverage-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install gcovr
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_PLUGIN=OFF -DUCACHE_COVERAGE=ON
+      - run: cmake --build build -j"$(nproc)"
+      - run: UCACHE_TEST_OPS=50000 ./build/tests/ucache-unit-tests
+      - name: gate >= 85% on src/core
+        run: gcovr --root . --filter 'src/core/' --exclude 'src/core/testing/'
+             --gcov-ignore-parse-errors=negative_hits.warn
+             --gcov-ignore-errors=no_working_dir_found
+             --fail-under-line 85 build --txt
+
+  crash-suite:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_PLUGIN=OFF
+      - run: cmake --build build -j"$(nproc)"
+      - name: 200 kill -9 iterations
+        run: UCACHE_CRASH_ITERS=200 ./build/tests/ucache-crash-harness
+
+  nightly-long:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_PLUGIN=OFF
+      - run: cmake --build build -j"$(nproc)"
+      - name: long differential (1e6 ops) + long crash loop (1000)
+        run: |
+          UCACHE_TEST_OPS=1000000 ./build/tests/ucache-unit-tests --gtest_filter='Differential.*'
+          UCACHE_CRASH_ITERS=1000 ./build/tests/ucache-crash-harness

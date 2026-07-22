@@ -1,0 +1,10 @@
+build*/
+*.o
+*.so
+*.root
+__pycache__/
+.cache/
+compile_commands.json
+.claude/scheduled_tasks.lock
+dist/
+*~

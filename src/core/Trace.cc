@@ -1,0 +1,88 @@
+#include "Trace.h"
+
+#include "IOBackend.h"
+#include <chrono>
+#include <cstdio>
+#include <fcntl.h>
+#include <functional>
+
+namespace ucache {
+namespace {
+
+uint64_t wallUs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count());
+}
+
+// Minimal JSON string escape for URLs (quote/backslash/control bytes).
+std::string jsonEscape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (static_cast<unsigned char>(c) < 0x20) {
+      char b[8];
+      std::snprintf(b, sizeof b, "\\u%04x", c);
+      out += b;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+} // namespace
+
+Tracer::Tracer(IOBackend& io, std::string path, int sample)
+    : io_(io), path_(std::move(path)), sample_(sample < 1 ? 1 : sample) {}
+
+Tracer::~Tracer() {
+  if (fd_ >= 0)
+    io_.close(fd_);
+}
+
+void Tracer::rec(const char* op, const std::string& key, uint64_t off, uint64_t len,
+                 uint64_t us, bool sampled) {
+  if (sampled && sample_ > 1 &&
+      n_.fetch_add(1, std::memory_order_relaxed) % static_cast<uint64_t>(sample_) != 0)
+    return;
+  const uint64_t h = std::hash<std::string>{}(key);
+  char line[192];
+  int n = std::snprintf(line, sizeof line,
+                        "{\"t\":%llu,\"op\":\"%s\",\"k\":\"%016llx\",\"off\":%llu,"
+                        "\"len\":%llu,\"us\":%llu}\n",
+                        static_cast<unsigned long long>(wallUs()), op,
+                        static_cast<unsigned long long>(h),
+                        static_cast<unsigned long long>(off),
+                        static_cast<unsigned long long>(len),
+                        static_cast<unsigned long long>(us));
+  if (n <= 0 || n >= static_cast<int>(sizeof line))
+    return;
+
+  std::lock_guard<std::mutex> g(mu_);
+  if (fd_ < 0) {
+    fd_ = io_.open(path_, O_WRONLY | O_CREAT, 0600);
+    if (fd_ < 0)
+      return; // trace loss is acceptable; job health is not
+  }
+  if (legend_.insert(h).second) {
+    const std::string leg = "{\"op\":\"key\",\"k\":\"" +
+                            [&] {
+                              char hx[20];
+                              std::snprintf(hx, sizeof hx, "%016llx",
+                                            static_cast<unsigned long long>(h));
+                              return std::string(hx);
+                            }() +
+                            "\",\"url\":\"" + jsonEscape(key) + "\"}\n";
+    if (io_.pwriteFull(fd_, leg.data(), leg.size(), off_) ==
+        static_cast<int64_t>(leg.size()))
+      off_ += leg.size();
+  }
+  if (io_.pwriteFull(fd_, line, static_cast<uint64_t>(n), off_) == static_cast<int64_t>(n))
+    off_ += static_cast<uint64_t>(n);
+}
+
+} // namespace ucache

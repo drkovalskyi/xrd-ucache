@@ -1,0 +1,217 @@
+// Process-wide cache root: entry registry, validation policy, eviction,
+// stats dump.
+//
+// One FileEntry per key per process (refcounted via shared_ptr; concurrent
+// IMT streams share state). Eviction purges LRU-by-atime whole entries from
+// HIGH_WATER down to LOW_WATER under the cache-wide LOCK flock, skipping
+// pinned entries; entries unlinked while open keep serving via their fd.
+//
+// Budget: by DEFAULT the cache uses the disk and evicts to
+// keep a statvfs free-disk FLOOR (minFreeBytes, auto-set from the disk) — an
+// active session fills most of the disk and reclaims LRU under pressure. The
+// floor uses statvfs directly (no per-startup scan) and is the accurate
+// cross-process guard. An OPTIONAL hard byte cap (maxBytes, via UCACHE_MAX_BYTES)
+// adds a second trigger driven by a per-process running usage total (approxUsage_:
+// seeded once when the cap is set, adjusted on page-write, reconciled to an
+// authoritative scan after every evictNow) — cheap but per-process, hence
+// best-effort under concurrency. Eviction checks run on both open() and the
+// page-write path, rate-limited by evictCheckSeconds.
+//
+// Thread-safety: fully thread-safe (registry mutex; Stats + approxUsage_
+// atomics; eviction serialized cross-process by flock and in-process by a mutex).
+#pragma once
+
+#include "Config.h"
+#include "FileEntry.h"
+#include "IOBackend.h"
+#include "Stats.h"
+#include "UrlKey.h"
+
+#include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+
+namespace ucache {
+
+class Tracer; // sampled IO tracer (Trace.h)
+
+class CacheStore {
+ public:
+  // Creates cacheDir/objects + /stats (0700). `io` must outlive the store.
+  CacheStore(IOBackend& io, Config cfg);
+  ~CacheStore(); // best-effort stats dump
+
+  CacheStore(const CacheStore&) = delete;
+  CacheStore& operator=(const CacheStore&) = delete;
+
+  const Config& config() const { return cfg_; }
+  Stats& stats() { return stats_; }
+
+  // Opens (or shares) the entry for `key`, validating against the origin
+  // metadata. nullptr => caller fails open to pass-through.
+  // Triggers a rate-limited eviction check.
+  std::shared_ptr<FileEntry> open(const UrlKey& key, uint64_t originSize,
+                                  uint64_t originMtime = 0,
+                                  uint8_t cksumKind = MetaData::kCksumNone,
+                                  uint32_t originCksum = 0);
+
+  // Rate-limited high-water check; runs eviction when above.
+  void maybeEvict();
+  // Unconditional eviction pass (CLI/tests). Returns entries removed, or
+  // -1 when another process holds the eviction lock.
+  int evictNow();
+  // Sum of cached payload bytes across all sidecars (allocated-data view).
+  // Authoritative but O(N): a full sidecar scan. Prefer approxUsageBytes() for
+  // hot-path checks; use this for CLI `status` and reconciliation.
+  uint64_t usageBytes();
+  // Cheap running estimate of this process's view of cache usage.
+  uint64_t approxUsageBytes() const { return approxUsage_.load(std::memory_order_relaxed); }
+
+  // One cached object as seen on disk, for the CLI `ls`/`status` (cold path).
+  struct EntryInfo {
+    std::string key;         // full normalized key
+    uint64_t fileSize = 0;   // origin size
+    uint64_t cachedBytes = 0;
+    uint64_t replicaBytes = 0; // .tdata overlay size; 0 = no replica
+    uint64_t atime = 0;
+    double coverage = 0.0;   // fraction of the file present in cache [0,1]
+    bool pinned = false;
+    bool complete = false;
+  };
+  // Snapshot of every cached entry (authoritative disk scan; torn sidecars
+  // skipped). Cold path — use approxUsageBytes()/stats for hot checks.
+  std::vector<EntryInfo> listEntries();
+
+  // CRC scrub of one entry (CLI `verify`). The caller MUST pass the entry's OWN
+  // validation metadata (from its sidecar) — size AND mtime/cksum — so the
+  // re-open adopts under every validate mode; passing defaults would fail §7
+  // validation and truncate/wipe the entry instead of scrubbing it.
+  FileEntry::ScrubResult verify(const UrlKey& key, uint64_t originSize, uint64_t originMtime = 0,
+                                uint8_t cksumKind = MetaData::kCksumNone, uint32_t originCksum = 0);
+
+  // Pin/unpin the entry for `key` (CLI `pin`/`unpin`): mutates the live entry
+  // if open, else rewrites the sidecar flag directly under the entry flock
+  // (no origin metadata needed — never re-validates, so it cannot wipe data).
+  // Returns false if the entry is not cached or the rewrite failed.
+  bool setPinnedByKey(const UrlKey& key, bool pinned);
+
+  // Remove a single entry by key (CLI `rm`): byte cache + any replica overlay.
+  // Returns false if nothing was cached under that key. A handle still holding
+  // the entry keeps serving via its fd (unlink-while-open guard).
+  bool removeEntry(const UrlKey& key);
+
+  // Criterion-based bulk removal for the CLI cleanup commands (`clear`, `evict
+  // --older-than`, `evict --to-size`). `arg` depends on the mode:
+  //   kAll       — remove every entry (arg ignored)
+  //   kOlderThan — arg = seconds; remove entries whose last-access (atime) is
+  //                older than now-arg
+  //   kNewerThan — arg = seconds; remove entries whose last-access is WITHIN
+  //                the window (undo a polluting run)
+  //   kToSize    — arg = bytes; LRU-remove (oldest first) until the total cache
+  //                size (cached + replica) is <= arg
+  // keepPinned skips pinned entries. dryRun selects victims and totals bytes
+  // WITHOUT unlinking anything (preview). Serialized cross-process by the same
+  // eviction LOCK as evictNow(); report.locked is false (and victims empty) if
+  // another process holds it.
+  enum class CleanupMode { kAll, kOlderThan, kNewerThan, kToSize };
+  struct CleanupVictim {
+    std::string key;
+    uint64_t bytes = 0; // cached + replica
+    uint64_t atime = 0;
+  };
+  struct CleanupReport {
+    bool locked = false; // false => another process holds the eviction lock
+    uint64_t bytes = 0;  // total across victims
+    std::vector<CleanupVictim> victims;
+  };
+  CleanupReport cleanup(CleanupMode mode, uint64_t arg, bool keepPinned, bool dryRun);
+
+  // Drops the entry for `key`: registry detach + unlink of data+sidecar
+  // (any write access to a cached URL invalidates its entry).
+  // Handles still holding the entry keep serving via their fds; the
+  // unlink-while-open guard prevents sidecar resurrection.
+  void invalidate(const UrlKey& key);
+
+  // Appends one JSON line to stats/<host>-<pid>-<start_ts>.jsonl. finalDump:
+  // this is the process's LAST dump (atexit/dtor) — also emit the Layer-2
+  // per-file records of entries still alive (their destructors may never run;
+  // emit-once guard prevents doubles).
+  void dumpStats(bool finalDump = false);
+  // The CLI opens a store only to read/mutate; suppress the destructor's stats
+  // dump so `ucache` invocations don't litter stats/ with zero-counter lines.
+  void disableStatsDump() { dumpStatsOnDtor_ = false; }
+
+ private:
+  // Sidecar-adjacent artifacts observed in the shard listing: removal
+  // paths unlink only what the scan saw instead of
+  // paying a blind ENOENT round trip per suffix per entry. An artifact
+  // published AFTER the scan snapshot is missed here and reaped by the
+  // age-guarded sweepReplicaOrphans instead.
+  enum : uint8_t {
+    kArtTdata = 1u << 0,
+    kArtTmeta = 1u << 1,
+    kArtTok = 1u << 2,
+    kArtVal = 1u << 3,
+    kArtCost = 1u << 4,
+  };
+  struct MetaScan {
+    std::string dataPath, metaPath, hashHex, key;
+    uint64_t fileSize = 0; // origin size (listEntries reporting)
+    uint64_t atime = 0, cachedBytes = 0;
+    uint64_t replicaBytes = 0; // .tdata size (0 = none) — evicted with the entry
+    double coverage = 0.0;     // fraction of pages present [0,1]
+    uint8_t artifacts = 0;     // kArt* bits present in the shard listing
+    bool pinned = false;
+    bool complete = false;
+  };
+  // Full-cache sidecar walk (eviction, usage, listEntries): reads
+  // sidecar SUMMARIES (MetaFile::loadSummary — header+bitmap, not the page-crc
+  // table) and fans out over shard dirs with up to 16 threads; results are in
+  // sorted-shard order (deterministic given a quiescent cache). Requires the
+  // IOBackend to be thread-safe (RealIO: stateless syscalls; FaultIO: internal
+  // mutex). Threads are joined before return — none escape the call.
+  std::vector<MetaScan> scanObjects();
+  // One shard directory's entries, appended to `out` (worker body of the scan).
+  void scanShard(const std::string& objRoot, const std::string& shard,
+                 std::vector<MetaScan>& out);
+  // Remove replica artifacts (.tdata/.tmeta/*.tmp) whose v1 .meta is gone —
+  // debris of a crash mid-publish or of a v1.0.0 process evicting an entry
+  // without knowing about replica files (D1 mixed-version caveat). Age-guarded
+  // (1 h) so a concurrent publisher's in-flight files are never swept.
+  // Caller must hold the cache-wide eviction LOCK.
+  void sweepReplicaOrphans();
+  // Called from the page-write path: add persisted bytes to the running total
+  // and run a rate-limited eviction check.
+  void notePersisted(uint64_t bytes, bool allowEvict = true);
+  // Resolves budgetAuto -> concrete maxBytes/minFreeBytes from free disk, then
+  // seeds approxUsage_. Called once from the constructor.
+  void resolveBudget();
+
+  IOBackend& io_;
+  Config cfg_;
+  Stats stats_;
+  std::mutex regMu_;
+  std::map<std::string, std::weak_ptr<FileEntry>> registry_; // hash -> entry
+  // Session summaries of closed entries for the per-entry coverage dump.
+  std::mutex sumMu_;
+  std::vector<std::string> entrySummaries_;
+  std::mutex evictMu_;
+  uint64_t lastEvictCheckS_ = 0;
+  std::atomic<uint64_t> approxUsage_{0}; // running usage estimate
+  // Entries removed by the last real eviction pass. 0 => the budget is over but
+  // nothing is evictable (pinned/open set exceeds high-water); the over-budget
+  // rate-limit bypass is then disabled so we don't scan-storm on every write.
+  std::atomic<int> lastEvictEvicted_{1};
+  std::string statsPath_;
+  bool dumpStatsOnDtor_ = true;
+  // Distinct keys opened this process (drives stats.filesOpened);
+  // the Layer-2 record sink and the optional Layer-3 tracer. The sink is
+  // shared with entries so a record can still land after store teardown.
+  std::set<std::string> seenKeys_; // under regMu_
+  std::shared_ptr<FileEntry::ObsSink> obsSink_;
+  std::unique_ptr<Tracer> tracer_;
+};
+
+} // namespace ucache

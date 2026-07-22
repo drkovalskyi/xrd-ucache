@@ -1,0 +1,365 @@
+# uCache — User Guide
+
+`ucache` is a transparent, per-user read cache for remote ROOT/XRootD data. You
+install it once; thereafter every `root://…` file your jobs read is cached on
+local disk, so the **second and later** passes over the same data read from your
+NVMe instead of the network. Nothing in your analysis code changes.
+
+It is safe by construction: if anything goes wrong (bad cache dir, disk full,
+version mismatch, corruption) it **fails open** — your job still runs correctly,
+just without the speedup.
+
+## 1. Install (no root — like everything else here)
+
+Unpack the release tarball into your home:
+
+```sh
+mkdir -p ~/.local
+tar -C ~/.local --strip-components=1 -xf xrd-ucache-<version>-el9-x86_64.tar.gz
+ucache doctor      # expect FAILs for cache dir + activation — §2 fixes both;
+                   # the `plugin loads` line is what confirms the install
+```
+
+That's the whole install: `bin/ucache`, `bin/ucache-netbench` and
+`lib64/libXrdClUCache.so` under `~/.local`. On EL9 `~/.local/bin` is on `PATH` by default; if `ucache` is
+not found, add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup
+file (`~/.bashrc`, `~/.zshrc`, …). Any other prefix works too — nothing
+cares where the files live. Continue with §2 (activation — one config
+file). Ask the maintainer for the current tarball until the project has a
+public download page.
+
+The one runtime dependency is the XRootD 5 client library — and any machine
+that already reads `root://` URLs has it (CMSSW, LCG/CVMFS ROOT, or EPEL's
+`xrootd-client`). The plugin never links ROOT; it binds to whatever XrdCl
+**5.6–5.9** the process already uses, and where it can't load (CentOS 7-era
+releases under apptainer, xrootd 6 stacks) it fails open — the job just runs
+uncached.
+
+### Build from source — AlmaLinux 9 / RHEL 9
+
+Install the toolchain and the XRootD **client** headers. `xrootd*` comes from
+EPEL, so enable it first. None of this needs to be the same machine that later
+runs your jobs — it just needs the headers to build against.
+
+```sh
+sudo dnf -y install epel-release
+sudo dnf -y install gcc-c++ cmake make \
+     xrootd-client xrootd-client-devel \
+     xz-devel zlib-devel libzstd-devel lz4-devel     # codec libs (see note)
+```
+
+- `xrootd-client-devel` provides `libXrdCl` + headers (must be ≥ 5.6; EPEL 9
+  ships 5.6+). Its headers live under `/usr/include/xrootd`, which is why the
+  build needs `-DUCACHE_XROOTD_ROOT=/usr` below.
+- The four `*-devel` codec packages are only needed for the **recompression**
+  feature (`ucache recompress`, see §Configuration). Omit them
+  and everything else still builds — the page cache works fully; the replica
+  tier is simply skipped (fail-open at build time). `lz4-devel` is optional even
+  among those (it only lets the transposer *read* LZ4-compressed inputs).
+
+Build against the **host** XRootD (point the version pin at `/usr`) and install
+to a user prefix — no root needed for the build/install itself:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_TESTS=OFF \
+      -DUCACHE_XROOTD_ROOT=/usr
+cmake --build build -j"$(nproc)"
+cmake --install build --prefix ~/.local        # or a system prefix (needs write access)
+```
+
+`configure` prints `ucache: XRootD client <version> (>= 5.6 required) — OK`; if
+it instead can't find `XrdCl/XrdClPlugInInterface.hh`, `xrootd-client-devel`
+isn't installed or `-DUCACHE_XROOTD_ROOT` doesn't point at its prefix. This
+installs the plugin `lib64/libXrdClUCache.so` and the `ucache` CLI to `bin/`.
+Put the prefix's `bin` on your `PATH` if it isn't already.
+
+> **Note:** `-DUCACHE_XROOTD_ROOT=/usr` is required on a stock EL9 box — the
+> default points at the CERN CVMFS/LCG build used for development, which a
+> normal host does not have. Set it to wherever `xrootd-client-devel` landed
+> (`$(dirname "$(dirname "$(command -v xrdcp)")")` resolves it).
+
+### Other distributions
+
+The only distro-specific part is the XRootD client package; the rest is the same
+`cmake` invocation with `-DUCACHE_XROOTD_ROOT` pointed at its prefix (usually
+`/usr`). On Debian/Ubuntu: `apt-get install g++ cmake make xrootd-dev
+liblzma-dev zlib1g-dev libzstd-dev liblz4-dev` (verify `xrootd-dev` ≥ 5.6). Any
+Linux with a C++17 compiler, CMake ≥ 3.20, and XRootD client ≥ 5.6 works.
+
+### For site administrators (optional)
+
+Each release also ships `xrd-ucache-<version>-1.el9.x86_64.rpm` for a system-wide
+install (`dnf install`, lands in `/usr/lib64` + `/usr/bin`; EPEL provides the
+xrootd dependency). Nothing about uCache *needs* this — it exists for admins
+who want one shared copy; users still activate per-user (§2). Maintainers:
+`scripts/package-el9.sh` builds both artifacts into `dist/` with the host
+toolchain (never an LCG shell), so they run on stock EL9 and inside CMSSW/LCG
+environments alike.
+
+## 2. Activate (one file, no root)
+
+uCache is activated **and** configured by a single file: an XRootD plugin
+config that tells XrdCl to load the plugin and carries all ucache settings —
+starting with where the cache lives. Write it yourself, or let `ucache setup`
+write the same file; nothing else is touched either way.
+
+### Write the file
+
+XrdCl scans `~/.xrootd/client.plugins.d/` automatically in every `root://`
+process — no environment variable, no shell startup file to edit, no shell
+to reload, and batch jobs pick it up too:
+
+```sh
+mkdir -p ~/.xrootd/client.plugins.d
+cat > ~/.xrootd/client.plugins.d/ucache.conf <<EOF
+url = *
+lib = $HOME/.local/lib64/libXrdClUCache.so
+enable = true
+
+# ucache settings (UCACHE_* env vars override — see §Configuration)
+dir = /data/$USER/ucache-cache
+EOF
+ucache doctor      # verify install, filesystem, activation; exits 0 when good
+```
+
+- `dir` — where the cached data lives. **Required, on purpose**: there is no
+  default location (a default would silently land in your home directory,
+  which on CERN machines is AFS — caching network data onto a network
+  filesystem defeats the purpose). Use a **local** disk. Until it is set,
+  `doctor` FAILs and the plugin runs uncached (fail-open).
+- `lib` — the absolute path to wherever §1 put the plugin:
+  `$HOME/.local/lib64/…` for the no-root tarball/source install (as shown;
+  the unquoted heredoc expands `$HOME` when writing — the conf itself needs
+  a literal absolute path, no `~`), or `/usr/lib64/libXrdClUCache.so` if an
+  admin installed the RPM. If unsure, `ucache doctor` prints the resolved
+  path on its `plugin loads` line.
+- `url = *` intercepts every `root://` URL. If a system config in
+  `/etc/xrootd/client.plugins.d/` already claims the `*` slot (`doctor`
+  warns), list your data hosts explicitly instead:
+  `url = eospublic.cern.ch:1094;xrootd.example.org:1094` (your experiment's
+  data servers or redirectors).
+- XrdCl resolves the `~` in `~/.xrootd/client.plugins.d` from the passwd
+  database, not `$HOME` — they differ on some batch systems.
+- Prefer the file elsewhere? XrdCl also processes `$XRD_PLUGINCONFDIR`
+  (after `/etc/xrootd/client.plugins.d` and the default dir — last wins for
+  the same `url`), so you can keep the conf in any directory and set that
+  variable in your shell startup file; that route only works in shells (and
+  jobs) where the variable is set.
+
+Deactivation is equally boring: delete the file (or set `enable = false`).
+
+However you configured things — this file, `XRD_PLUGINCONFDIR`, environment
+variables, `setup` — **`ucache doctor` is the one verification step**: it
+finds the governing conf exactly as XrdCl would, dlopens the very library
+that conf names, checks the cache filesystem, and exits nonzero if anything
+would stop caching (no conf, `enable = false`, a shadowed `url = *`, a stale
+`lib =` path, an unset or unsuitable cache dir).
+
+### Or: `ucache setup` (writes the same file)
+
+```sh
+ucache setup --host eospublic.cern.ch:1094 --dir /data/$USER/ucache-cache
+ucache doctor
+```
+
+`setup` writes exactly the file above — plugin path resolved, cache dir
+explicit — to `~/.xrootd/client.plugins.d/ucache.conf`, and touches nothing
+else: no shell startup files, no environment variables, no second config.
+`--dir` is required unless `UCACHE_DIR` or an existing conf already provides
+a location (there is deliberately no default). Activation is immediate for
+every `root://` process, batch jobs included.
+
+## 3. Verify it really works, then run your analysis
+
+**The standard self-test** — point it at any file your conf intercepts
+(pick one of your usual data files; the whole file is transferred, so not
+your biggest):
+
+```sh
+ucache test root://<your-host>//path/to/file.root
+```
+
+It uses your setup exactly as configured — no changes, no environment — and
+runs a cold pass then a warm pass through a real XRootD client, with
+progress shown. It PASSes only if the warm pass is served entirely from
+cache with **zero origin contact**, then removes the entry it created (a
+file that was already cached is verified warm-only and kept). Exit 0 = the
+whole chain works: conf → plugin loaded → interception → caching → warm
+serving.
+
+Then run your normal ROOT / RDataFrame / uproot job **twice**:
+
+```sh
+python my_analysis.py     # cold: fetches the working set from the origin
+python my_analysis.py     # warm: served from local cache
+ucache stats              # warm pass shows origin_bytes == 0
+```
+
+(Don't smoke-test with plain `xrdcp` — it transfers with PgRead, which the
+cache deliberately passes through, so `stats` stays at zero. If you must:
+`XRD_CPUSEPGWRTRD=0 xrdcp …` uses the cached read path.)
+
+`ucache status` shows where the cache lives, the disk budget, how much is cached,
+and aggregate counters.
+
+## How it works (briefly)
+
+- **Page cache, not file cache.** uCache stores the 4 KiB pages your analysis
+  actually reads (typically a small fraction of each file), each protected by a
+  CRC32C. It never stores data it wasn't asked for beyond page rounding.
+- **Validation.** A cached entry is trusted for a freshness window (default
+  7 days): inside it, opens don't contact the origin at all — warm passes work
+  even when the remote is down or flaky. When the window expires, the next
+  open re-checks the origin file's size (and, with
+  `UCACHE_VALIDATE=size+mtime`, its mtime); a changed file is re-cached. Set
+  `revalidate_seconds = 0` to re-check on every open.
+- **Fail-open.** Every failure path degrades to a normal uncached read.
+
+## Configuration
+
+Three levels, lowest to highest, each with its own job:
+
+1. **Your defaults** — `key = value` lines in the same `ucache.conf` that
+   activates the plugin (§2), next to `url`/`lib`/`enable`. Edited by hand,
+   by you; no `ucache` command ever writes this file.
+2. **Current values** — set from the CLI without touching your defaults:
+   `ucache set <key> <value>` / `ucache unset <key>` (kept in a small state
+   file inside the cache dir; applies to processes started from then on,
+   persists until unset).
+3. **Per-job override** — the `UCACHE_*` environment variable twins, for one
+   run: `UCACHE_REVALIDATE_S=0 ./my_job`.
+
+`ucache settings` prints every knob with its effective value **and where it
+came from** (default | conf | state | env); `doctor` flags any CLI-set values
+overriding your defaults. Common keys:
+
+| ucache.conf         | env                     | meaning |
+|---------------------|-------------------------|---------|
+| `dir = …`           | `UCACHE_DIR`            | cache location — **required** (no default; use a local disk). Unset ⇒ doctor FAILs, plugin runs uncached |
+| `max_bytes = 50g`   | `UCACHE_MAX_BYTES`      | hard cache-size cap; unset ⇒ no cap (use the disk, evict at the floor) |
+| `min_free_bytes = …`| `UCACHE_MIN_FREE_BYTES` | keep this much disk free (the default limit) |
+| `validate = size`   | `UCACHE_VALIDATE`       | `none` / `size` / `size+mtime` / `cksum`. **Caveat:** the plugin has no origin-checksum source yet, so `cksum` currently degrades to size-only (weaker than `size+mtime`) — prefer `size+mtime` until a checksum query lands |
+| `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
+| `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
+| `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read are transcoded to fast-to-decode replicas **automatically in the background** (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
+| `recompress_codecs = lzma` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
+| `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
+| `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
+| `trace_sample = 64` | `UCACHE_TRACE_SAMPLE` | record every Nth read-class trace op (`1` = everything; opens/flushes are always recorded) |
+| `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
+
+Sizes accept `k`/`m`/`g`/`t` suffixes.
+
+**Put the cache on local disk.** `dir` has **no default** — an unset cache
+location is a loud condition (`doctor` FAILs, the plugin passes through
+uncached), never a silent cache in your home directory, which on CERN
+machines is AFS/NFS. Point it at a local filesystem (`/data/$USER/…`, local
+scratch, `/tmp/$USER/…`); `doctor`'s sparse-files WARN flags network
+filesystems that slipped through.
+
+**Reliable reads under a flaky/loaded/WAN remote.** This is the default: once
+an entry has been validated, reads within the 7-day freshness window are
+served **entirely from local disk — the origin is never opened or statted**,
+and is contacted only if a genuine cache miss needs new bytes. Repeated
+analysis passes are independent of remote state (the origin can be down and
+warm reads still complete). Right for write-once physics data; a file changed
+in place at the origin isn't noticed until the window lapses — set
+`revalidate_seconds = 0` (re-check every open) if that ever matters for yours.
+
+**Reliable opens under a flaky/loaded remote.** Some servers intermittently fail
+individual file *opens* under load or over the WAN (a transient error — the same
+file opens on retry), and ROOT aborts the whole job on any single open failure, so
+a many-file job's success probability collapses with scale. Set
+`UCACHE_OPEN_RETRIES` (e.g. `3`) and the plugin retries a *transient* open failure
+with exponential full-jitter backoff (`UCACHE_OPEN_RETRY_BASE_MS`=200,
+`UCACHE_OPEN_RETRY_MAX_MS`=5000 cap) instead of letting it abort — genuine errors
+(missing or forbidden files) still fail fast. This rescues the initial (cold)
+fill; `UCACHE_REVALIDATE_S` then carries later warm passes with no remote contact.
+Off by default; for a large job over a flaky remote, 2–3 retries makes a transient
+per-open failure negligible.
+
+**Eviction is on by default.** With no `max_bytes` set, the cache uses the disk
+freely and evicts least-recently-used entries only to keep a free-space floor
+(`min(50 GiB, 10% of the volume)` free) — so a heavy session fills most of the
+disk and reclaims under pressure. Set `max_bytes` for a fixed-size cache instead.
+Protect a hot dataset from eviction with `ucache pin <url>`. To reclaim space
+yourself — by age, by size, per file, or all at once — see the cleanup commands
+below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
+
+## CLI reference
+
+| command            | what it does |
+|--------------------|--------------|
+| `ucache setup [--host H] [--dir PATH]` | write the single conf file (activation + settings, cache dir explicit) to `~/.xrootd/client.plugins.d` |
+| `ucache doctor`    | check install, filesystem (sparse/flock), and activation |
+| `ucache test <url>` | end-to-end self-test: cold + warm whole-file read via xrdcp against your setup as-is; warm must be origin-free; cleans up the entry it created (pre-existing entries kept) |
+| `ucache enable` / `disable` | turn caching on/off (flips the conf) |
+| `ucache status`    | cache location, budget, usage, aggregate stats |
+| `ucache ls [--sort age\|size]` | list cached entries (size, cached, coverage, last-used age, replica, pinned) |
+| `ucache stats`     | aggregate `stats/*.jsonl` across all processes, plus the derived **workflow picture**: opens per distinct file, bytes served per tier (RAM / disk / replica / origin / relay), disk-read count + mean size + sequential share, re-read factor, fill flush shape, and p50/p95/p99 latencies |
+| `ucache stats --files [--top N]` | per-file records (one per file per process), costliest first: which files were re-opened, re-read, served from which tier |
+| `ucache stats --reset` | delete the per-process stats files (counters, per-file records, traces): a fresh window for measuring **one** run against a specific cache state (run it between jobs — it warns if a file looks live). Counters only; the cache contents are untouched |
+| `ucache bench [PATH …] [--size SZ] [--seconds S]` | raw storage self-test of the cache dir (or of candidate dirs, to pick one): sequential read/write, scattered-write IOPS, random reads at 1/16 streams with latency percentiles, fsync/create/unlink — see `docs/CACHE_MANAGEMENT.md` §8 |
+| `ucache netbench <root://…> [--streams N,…] [--block KB] [--seconds S]` | origin random-read baseline at 1/16/64 streams: what the network side delivers, for a fair cache-vs-origin comparison |
+| `ucache evict [--older-than DUR \| --newer-than DUR \| --to-size SIZE] [--dry-run]` | reclaim space: no flags = one pass to the configured budget; `--older-than 30d` drops entries unused that long; `--newer-than 1h` drops entries used within the window (undo a polluting run); `--to-size 20g` LRU-evicts down to a total size; `--dry-run` previews |
+| `ucache rm <url> [url…]` | remove specific entries (byte cache + replica) |
+| `ucache clear [--yes] [--keep-pinned]` | empty the whole cache (prompts unless `--yes`) |
+| `ucache pin <url>` / `unpin <url>` | protect / unprotect an entry from eviction |
+| `ucache verify <url>` | CRC-scrub an entry; quarantine (not wipe) bad pages |
+| `ucache settings`  | every setting: effective value + where it comes from (default \| conf \| state \| env) |
+| `ucache set <key> <value>` / `unset <key>` | change / drop a **current** value without touching your defaults in the conf |
+| `ucache recompress [--jobs N] [--yes]` | transcode the cached files whose source codec is in `recompress_codecs`, in the foreground with live progress (`--jobs` default cores/2). Estimates disk growth first and asks for confirmation if the sweep would push the cache into eviction; `--yes` overrides (scripts) |
+| `ucache branches <url>` | which branches your analysis read: fully-cached branches with bytes + source codec, and the summary share |
+| `ucache untranspose <url>` | drop an entry's replica; the byte cache is kept |
+
+**Recompression (decompress-once replicas).** Tightly compressed (LZMA)
+ntuples spend most of a *warm* analysis just decompressing. uCache can rebuild
+the branches you actually read into replicas re-encoded once as ZSTD-1 — an
+order of magnitude cheaper to decode — and serve them transparently (same
+results, bit-identical). One switch controls it:
+
+```sh
+ucache set recompress on   # or `recompress = on` in ucache.conf as your default
+```
+
+With it on, each file's replica is built by a detached, nice'd background
+worker right after your job closes it — typically ready before your next run,
+with no commands ever typed and nothing printed to your terminal (log:
+`<cache-dir>/recompress.log`; totals: `ucache status`). With it off (the
+default), nothing is ever built in the background; `ucache recompress` runs
+one foreground sweep over what is already cached, with live progress. In both
+cases only branches whose source codec is in `recompress_codecs` (default
+`lzma`) are transcoded — recompressing already-fast codecs would waste CPU
+and disk — and only branches your runs actually read, fully cached, qualify.
+
+Replicas coexist with the byte cache by default (only the ranges the replica
+physically replaced are punched). If disk space is tight, make replicas the
+primary copy instead:
+
+```sh
+ucache set recompress_reclaim full
+ucache recompress            # also retroactively reclaims existing replicas
+```
+
+Every entry with a valid replica then gives back its whole byte-cache copy the
+moment the replica is available; anything the replica does not cover refetches
+from the origin on demand. See CACHE_MANAGEMENT §4 for details.
+
+Set expectations honestly: the replica removes *decompression* time only. A
+warm analysis that is 80% LZMA decode gets several× faster; one dominated by
+its own compute may gain 10%. One instrumented run with ROOT's
+`TTreePerfStats` tells you your ceiling before you spend the disk (~1.4× the
+cached bytes for LZMA ntuples; `ucache status` totals it, and superseded
+original pages are hole-punched so the data is not stored twice). `ucache
+branches <url>` shows exactly which branches you read and their codecs.
+Escape hatches: `ucache set transpose off` stops serving replicas; `ucache
+untranspose <url>` drops one (they are derived data, rebuildable from the
+byte cache).
+
+Stuck? See **`docs/TROUBLESHOOTING.md`**.
+
+---
+
+uCache is MIT-licensed (see `LICENSE`); copyright (c) 2026 Massachusetts
+Institute of Technology.
