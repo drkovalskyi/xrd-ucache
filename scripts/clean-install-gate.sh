@@ -94,7 +94,10 @@ URL="root://localhost:$PORT/$ORIGINDIR/probe.bin"
 # XrdCl finds the conf in the default user plugin dir, and the cache dir
 # comes from the conf's explicit `dir =` line.
 read_via_plugin() { # -> exit code of xrdcp
-  env -u XRD_PLUGINCONFDIR -u UCACHE_DIR \
+  # xrdcp >= 5.8 transfers via PgRead, which the plugin deliberately relays
+  # uncached (analysis clients use Read/ReadV, which cache). Disable xrdcp's
+  # pgread path so this smoke-test exercises the cached path.
+  env -u XRD_PLUGINCONFDIR -u UCACHE_DIR XRD_CPUSEPGWRTRD=0 \
     xrdcp -f "$URL" /tmp/ucache-gate/out.bin >/dev/null 2>&1
 }
 origin_bytes() { # sum origin_bytes across stats files
