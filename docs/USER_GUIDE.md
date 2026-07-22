@@ -291,6 +291,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 
 | command            | what it does |
 |--------------------|--------------|
+| `ucache --version` (`-V`) | print the version and exit |
 | `ucache setup [--host H] [--dir PATH]` | write the single conf file (activation + settings, cache dir explicit) to `~/.xrootd/client.plugins.d` |
 | `ucache doctor`    | check install, filesystem (sparse/flock), and activation |
 | `ucache test <url>` | end-to-end self-test: cold + warm whole-file read via xrdcp against your setup as-is; warm must be origin-free; cleans up the entry it created (pre-existing entries kept) |

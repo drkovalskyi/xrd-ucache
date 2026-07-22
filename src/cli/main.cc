@@ -49,6 +49,7 @@ namespace {
 void usage() {
   std::fputs(
       "usage: ucache <command> [args]\n"
+      "  --version | -V    print the version and exit\n"
       "  setup [--host H] [--dir PATH]  write the single conf file (activation +\n"
       "                    settings, cache dir explicit) to ~/.xrootd/client.plugins.d\n"
       "  doctor            check install, filesystem, and activation\n"
@@ -2361,7 +2362,16 @@ int cmdEnableDisable(bool enable) {
 
 } // namespace
 
+#ifndef UCACHE_VERSION
+#define UCACHE_VERSION "unknown"
+#endif
+
 int main(int argc, char** argv) {
+  if (argc >= 2 && (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-V") == 0 ||
+                    std::strcmp(argv[1], "version") == 0)) {
+    std::printf("ucache %s\n", UCACHE_VERSION);
+    return 0;
+  }
   if (argc < 2 || std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0 ||
       std::strcmp(argv[1], "help") == 0) {
     usage();
