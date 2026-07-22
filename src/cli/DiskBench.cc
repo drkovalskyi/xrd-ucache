@@ -253,7 +253,9 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     int bfd = ::open(tf.c_str(), O_WRONLY, 0600);
     std::vector<uint32_t> us;
     for (int i = 0; i < 5 && bfd >= 0; ++i) {
-      ::pwrite(bfd, small, kSmall, static_cast<off_t>((i * 977ull * kAlign) % fsz));
+      if (::pwrite(bfd, small, kSmall, static_cast<off_t>((i * 977ull * kAlign) % fsz)) !=
+          static_cast<ssize_t>(kSmall))
+        break; // nothing dirty to sync — the fdatasync sample would be a lie
       double t0 = nowS();
       ::fdatasync(bfd);
       us.push_back(static_cast<uint32_t>((nowS() - t0) * 1e6));
@@ -399,7 +401,8 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       int fd = ::open(nm, O_WRONLY | O_CREAT | O_TRUNC, 0600);
       if (fd < 0)
         break;
-      ::write(fd, small, kSmall);
+      if (::write(fd, small, kSmall) < 0) {
+      } // payload is optional — this leg times create/unlink metadata
       ::close(fd);
       names.push_back(nm);
     }

@@ -44,7 +44,9 @@ jobs:
       - name: plugin fuzz vs local origin (1e5 + 8-thread)
         run: |
           mkdir -p /bench/data && dd if=/dev/urandom of=/bench/data/f.bin bs=1M count=64
-          xrootd -b -p 10940 /bench/data
+          # xrootd refuses uid 0: the container runs as root, so drop privileges
+          useradd -m xrdsrv && chmod -R a+rX /bench/data
+          runuser -u xrdsrv -- xrootd -b -p 10940 -l /tmp/xrootd-origin.log /bench/data
           mkdir -p /tmp/conf /tmp/cache
           printf 'url = 127.0.0.1:10940\nlib = %s\nenable = true\n' "$PWD/build/src/plugin/libXrdClUCache.so" > /tmp/conf/u.conf
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 1 1

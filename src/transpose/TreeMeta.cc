@@ -402,8 +402,8 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
     return fail("cannot open " + path);
   off_t fsz = ::lseek(fd, 0, SEEK_END);
   std::vector<uint8_t> head(512);
-  ::pread(fd, head.data(), head.size(), 0);
-  if (std::memcmp(head.data(), "root", 4) != 0) {
+  if (::pread(fd, head.data(), head.size(), 0) < 4 ||
+      std::memcmp(head.data(), "root", 4) != 0) {
     ::close(fd);
     return fail("not a ROOT file");
   }

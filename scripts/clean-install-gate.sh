@@ -67,7 +67,16 @@ grep -q "^dir = $CACHE" "$CONF_FILE" || fail "conf lacks the explicit cache dir"
 
 say "4. start a self-contained local xrootd origin"
 head -c 4194304 /dev/urandom > "$ORIGINDIR/probe.bin"       # 4 MiB test object
-env -u LD_LIBRARY_PATH xrootd -b -p "$PORT" -l /tmp/ucache-gate/xrootd.log "$ORIGINDIR" || \
+# xrootd refuses to run as uid 0; in a root container (CI) hand the origin to
+# a scratch user. Everywhere else run it as the invoking (unprivileged) user.
+XRD=(env -u LD_LIBRARY_PATH xrootd)
+if [ "$(id -u)" = 0 ]; then
+  useradd -m xrdsrv 2>/dev/null || true
+  chmod 1777 /tmp/ucache-gate
+  chmod -R a+rX "$ORIGINDIR"
+  XRD=(env -u LD_LIBRARY_PATH runuser -u xrdsrv -- xrootd)
+fi
+"${XRD[@]}" -b -p "$PORT" -l /tmp/ucache-gate/xrootd.log "$ORIGINDIR" || \
   fail "could not start xrootd origin"
 sleep 2
 URL="root://localhost:$PORT//probe.bin"
