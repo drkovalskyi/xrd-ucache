@@ -1014,6 +1014,25 @@ static uint64_t punchPerReclaim(ReplicaStore& rs, FileEntry& entry, const Replic
   }
   return rs.punchSuperseded(entry, meta.superseded);
 }
+
+// Upper bound on the replica an entry's resident bytes will produce: the
+// measured ZSTD-1/LZMA footprint ratio. Deliberately an over-estimate — the
+// cost of guessing high is a build deferred, of guessing low an eviction storm.
+// Shared by the sweep's up-front pre-flight and the drainer's per-file budget so
+// the two can never disagree about what "will not fit" means.
+static uint64_t estimatedReplicaBytes(uint64_t cachedBytes) {
+  return cachedBytes + (cachedBytes * 2) / 5; // 1.4x
+}
+
+// Free bytes above the eviction floor: what a pass may consume before LRU
+// starts evicting. `~0ull` (unlimited) when eviction is disabled or the volume
+// cannot be queried — absent a floor there is nothing to protect.
+static uint64_t headroomToFloor(const Config& cfg, IOBackend& io) {
+  uint64_t avail = 0, total = 0;
+  if (cfg.minFreeBytes && io.spaceInfo(cfg.cacheDir, avail, total) == 0 && total)
+    return avail > cfg.minFreeBytes ? avail - cfg.minFreeBytes : 0;
+  return ~0ull;
+}
 #endif
 
 int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
@@ -1142,12 +1161,11 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       for (const auto& e : reclaimWork)
         reclaimCredit += e.cachedBytes;
     }
-    const uint64_t estReplicas = candBytes + (candBytes * 2) / 5; // 1.4x upper bound
+    const uint64_t estReplicas = estimatedReplicaBytes(candBytes);
     const uint64_t growth = estReplicas > reclaimCredit ? estReplicas - reclaimCredit : 0;
-    uint64_t headroom = ~0ull;
+    const uint64_t headroom = headroomToFloor(cfg, io);
     uint64_t avail = 0, total = 0;
-    if (cfg.minFreeBytes && io.spaceInfo(cfg.cacheDir, avail, total) == 0 && total)
-      headroom = avail > cfg.minFreeBytes ? avail - cfg.minFreeBytes : 0;
+    io.spaceInfo(cfg.cacheDir, avail, total); // for the arithmetic printed below
     if (growth > headroom) {
       std::fprintf(stderr,
                    "recompress: this sweep would NOT fit — LRU eviction would run mid-sweep "
@@ -1188,6 +1206,15 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     jobs = 1;
   if (static_cast<size_t>(jobs) > work.size())
     jobs = work.empty() ? 1 : static_cast<int>(work.size());
+  // Background capacity budget: how much this pass may add before LRU eviction
+  // would start. Measured once — within a pass the only writer that matters is
+  // this pass, and each claim is deducted below.
+  const uint64_t passHeadroom = drain ? headroomToFloor(cfg, io) : ~0ull;
+  const bool budgetGuard = passHeadroom != ~0ull;
+  std::atomic<uint64_t> budget{passHeadroom};
+  std::atomic<int> deferred{0};
+  std::atomic<uint64_t> deferBytes{0};
+  std::vector<std::string> requeue; // deferred keys, put back under outMu
   std::atomic<size_t> next{0};
   std::atomic<int> done{0}, skipped{preSkipped}, failed{0}, incomplete{0};
   std::atomic<uint64_t> totOverlay{0}, totPunched{0};
@@ -1228,6 +1255,34 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       if (!cm) {
         ++failed;
         continue;
+      }
+      // Capacity budget (background only): a replica this pass writes must fit
+      // in the headroom above the eviction floor. The sweep asks the user up
+      // front; the drainer has no tty by construction, so it decides for itself
+      // and declines — background recompression must never be the thing that
+      // pushes a volume into eviction. Deciding per file rather than per batch
+      // matters under `recompress_reclaim = full`, where each build hands back
+      // the v1 copy and so pays for the next one.
+      if (budgetGuard) {
+        const uint64_t cached = cm->cachedBytes();
+        const uint64_t est = estimatedReplicaBytes(cached);
+        // Under `full` the entry's own v1 copy is dropped once the replica
+        // validates, so only the difference is new space.
+        const uint64_t net = reclaimFull ? (est > cached ? est - cached : 0) : est;
+        uint64_t have = budget.load(std::memory_order_relaxed);
+        bool claimed = false;
+        while (net <= have)
+          if (budget.compare_exchange_weak(have, have - net, std::memory_order_relaxed)) {
+            claimed = true;
+            break;
+          }
+        if (!claimed) { // no room: leave it queued, a later pass may have space
+          ++deferred;
+          deferBytes += net;
+          std::lock_guard<std::mutex> g(outMu);
+          requeue.push_back(e.key);
+          continue;
+        }
       }
       // Parse + hot set once; gate before any transcode work.
       tp::FileMeta fm = tp::parseFile(key->dataPath(cfg.cacheDir), "Events");
@@ -1330,6 +1385,23 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     if (progress)
       std::fputs("\r\033[K", stderr);
   }
+  // Deferred for want of space: put the keys back, so a later pass builds them
+  // once room appears (eviction, a manual `rm`, or `reclaim = full` handing back
+  // v1 copies as it goes). Appended whole-line to the same queue the plugin
+  // appends to. Losing them would be defensible — an explicit sweep scans the
+  // whole cache anyway — but then background recompression would silently stop
+  // making progress on a volume that later has room.
+  if (!requeue.empty()) {
+    std::ofstream q(cfg.cacheDir + "/recompress.pending", std::ios::app);
+    for (const auto& k : requeue)
+      q << k << "\n";
+  }
+  if (deferred.load() && drainLog)
+    drainLog << "recompress: deferred " << deferred.load() << " file(s) for want of space — "
+             << "would add up to " << human(deferBytes.load()) << " with "
+             << human(passHeadroom) << " of headroom above the eviction floor. Left queued; "
+             << "free space (`ucache evict --to-size`, `ucache rm`) or set "
+             << "recompress_reclaim = full to replace byte copies instead of adding to them.\n";
   if (decNs.load() > 0) // calibrate from what we actually decoded
     writeCalibration(cfg, static_cast<double>(decB.load()) * 1000.0 /
                               static_cast<double>(decNs.load()));
@@ -1342,12 +1414,15 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   if (incomplete.load())
     std::snprintf(incompleteSeg, sizeof incompleteSeg, ", %d incomplete (bytes not cached)",
                   incomplete.load());
-  char summary[640];
+  char deferredSeg[96] = {0};
+  if (deferred.load())
+    std::snprintf(deferredSeg, sizeof deferredSeg, ", %d deferred (no space)", deferred.load());
+  char summary[768];
   std::snprintf(summary, sizeof summary,
                 "recompress: %d recompressed, %d nothing to do (no fully-cached %s content, "
-                "or already recompressed)%s, %d failed%s",
-                done.load(), skipped.load(), codecs.c_str(), incompleteSeg, failed.load(),
-                yielded.load() ? " — stopped early for a foreground sweep" : "");
+                "or already recompressed)%s%s, %d failed%s",
+                done.load(), skipped.load(), codecs.c_str(), incompleteSeg, deferredSeg,
+                failed.load(), yielded.load() ? " — stopped early for a foreground sweep" : "");
   if (!drain) {
     std::printf("%s\n", summary);
     if (done.load())
@@ -1395,7 +1470,12 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       drainLog << "punched " << punched
                << (reclaimFull ? " v1 bytes (reclaim full)\n" : " superseded v1 bytes\n");
     closeFds();
-    // Entries queued while this batch built: claim them too (fresh lock).
+    // Entries queued while this batch built: claim them too (fresh lock). NOT
+    // when this pass deferred any — those keys were just put back, so a
+    // follow-on pass would re-read them, defer them again, and recurse without
+    // end. A pass that ran out of space has nothing more to do this run.
+    if (deferred.load())
+      return failed.load() && !done.load() ? 1 : 0;
     return cmdRecompress(store, cfg, io, jobs, RecompressMode::kDrain) == 0 &&
                    !(failed.load() && !done.load())
                ? 0
