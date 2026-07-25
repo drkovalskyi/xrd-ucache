@@ -159,21 +159,46 @@ bool FileEntry::hasRange(uint64_t off, uint64_t len) {
   return true;
 }
 
-bool FileEntry::readVerifyPage(uint64_t i, uint32_t expectCrc, uint8_t* scratch) {
-  const uint32_t nbytes = meta_.pageBytes(i);
-  int64_t r = io_.preadFull(dataFd_, scratch, nbytes, i * meta_.pageSize);
-  bool ok = r == static_cast<int64_t>(nbytes) && crc32c(scratch, nbytes) == expectCrc;
-  if (!ok) {
-    std::lock_guard<std::mutex> g(mu_);
+void FileEntry::demoteRun(uint64_t firstPage, uint64_t lastPage, const char* why) {
+  std::lock_guard<std::mutex> g(mu_);
+  for (uint64_t i = firstPage; i <= lastPage; ++i) {
     meta_.bitmap.clear(i);
     meta_.pageCrcs[i] = 0;
-    meta_.flags &= ~MetaData::kFlagComplete;
-    dirty_ = true;
-    stats_.crcFailures.fetch_add(1, std::memory_order_relaxed);
-    UCACHE_WARN("CRC mismatch on page %llu of %s; marked absent",
-                static_cast<unsigned long long>(i), key_.key.c_str());
   }
-  return ok;
+  meta_.flags &= ~MetaData::kFlagComplete;
+  dirty_ = true;
+  stats_.crcFailures.fetch_add(1, std::memory_order_relaxed);
+  if (firstPage == lastPage)
+    UCACHE_WARN("%s on page %llu of %s; marked absent", why,
+                static_cast<unsigned long long>(firstPage), key_.key.c_str());
+  else
+    UCACHE_WARN("%s on pages %llu-%llu of %s; marked absent", why,
+                static_cast<unsigned long long>(firstPage),
+                static_cast<unsigned long long>(lastPage), key_.key.c_str());
+}
+
+bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint32_t* expect,
+                              uint8_t* dst) {
+  const uint64_t start = firstPage * uint64_t(meta_.pageSize);
+  const uint64_t bytes = runBytes(firstPage, lastPage);
+  const int64_t r = io_.preadFull(dataFd_, dst, bytes, start);
+  const uint64_t got = r > 0 ? static_cast<uint64_t>(r) : 0;
+  uint64_t o = 0;
+  for (uint64_t i = firstPage; i <= lastPage; ++i) {
+    const uint32_t nbytes = meta_.pageBytes(i);
+    if (o + nbytes > got) {
+      // Short read or IO error: this page and everything after it in the run
+      // was never delivered, so none of it can be trusted.
+      demoteRun(i, lastPage, "short read");
+      return false;
+    }
+    if (crc32c(dst + o, nbytes) != expect[i - firstPage]) {
+      demoteRun(i, i, "CRC mismatch");
+      return false;
+    }
+    o += nbytes;
+  }
+  return true;
 }
 
 bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
@@ -183,7 +208,6 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
     return false;
   const uint32_t P = meta_.pageSize;
   uint64_t first = off / P, last = (off + len - 1) / P;
-  std::vector<uint8_t> scratch(P);
   auto* out = static_cast<uint8_t*>(buf);
 
   // Accounted locally, published at every exit — partial work on a
@@ -208,22 +232,28 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
     }
   };
 
-  for (uint64_t i = first; i <= last; ++i) {
-    uint64_t pStart = i * P;
-    uint64_t cStart = std::max(off, pStart);
-    uint64_t cEnd = std::min(off + len, pStart + meta_.pageBytes(i));
-    uint32_t expect;
-    {
-      // Staged pages serve straight from RAM — during a fill the
-      // cache disk sees no random reads. Copy under the lock: a concurrent
-      // flush completion frees flushing_ payloads under this same mutex.
-      std::lock_guard<std::mutex> g(mu_);
-      // first_touch: page-granular, counted at the serving read's width. The
-      // disk branch marks it here too (before the pread) — a CRC-demoted
-      // page inflates it by one page width, a negligible skew (crc_failures
-      // is ~always 0) that keeps the update under the same lock take.
-      if (servedOnce_.npages() == 0)
-        servedOnce_.reset(meta_.npages());
+  // Plan under ONE lock take (it used to be one per page): staged pages are
+  // copied out here — a concurrent flush completion frees flushing_ payloads
+  // under this same mutex — while resident disk pages accumulate into
+  // maximal contiguous runs. Each run costs ONE pread below, whatever its
+  // page count: a 38 KiB request used to cost ten 4 KiB preads.
+  struct Run {
+    uint64_t firstPage, lastPage, crcBase;
+  };
+  std::vector<Run> runs;
+  std::vector<uint32_t> crcs;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    // first_touch: page-granular, counted at the serving read's width. The
+    // disk branch marks it here too (before the pread) — a CRC-demoted
+    // page inflates it by one page width, a negligible skew (crc_failures
+    // is ~always 0) that keeps the update under the same lock take.
+    if (servedOnce_.npages() == 0)
+      servedOnce_.reset(meta_.npages());
+    for (uint64_t i = first; i <= last; ++i) {
+      const uint64_t pStart = i * P;
+      const uint64_t cStart = std::max(off, pStart);
+      const uint64_t cEnd = std::min(off + len, pStart + meta_.pageBytes(i));
       if (!servedOnce_.get(i)) {
         servedOnce_.set(i);
         ftB += cEnd - cStart;
@@ -234,28 +264,59 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
       else if (auto it2 = flushing_.find(i); it2 != flushing_.end())
         staged = &it2->second;
       if (staged) {
+        // Staged pages serve straight from RAM — during a fill the cache
+        // disk sees no random reads. A RAM page also ends the current run.
         std::memcpy(out + (cStart - off), staged->data.get() + (cStart - pStart),
                     cEnd - cStart);
         ramB += cEnd - cStart;
         continue;
       }
       if (!meta_.bitmap.get(i)) {
-        publish();
+        publish(); // absent page: no disk read was issued for this request
         return false;
       }
-      expect = meta_.pageCrcs[i];
+      if (!runs.empty() && runs.back().lastPage + 1 == i &&
+          runBytes(runs.back().firstPage, i) <= kMaxCoalescedRead)
+        runs.back().lastPage = i;
+      else
+        runs.push_back({i, i, crcs.size()});
+      crcs.push_back(meta_.pageCrcs[i]);
     }
-    if (!readVerifyPage(i, expect, scratch.data())) {
+  }
+
+  std::vector<uint8_t> scratch;
+  for (const Run& r : runs) {
+    const uint64_t rStart = r.firstPage * uint64_t(P);
+    const uint64_t rBytes = runBytes(r.firstPage, r.lastPage);
+    // A run that lies entirely inside the request is read STRAIGHT into the
+    // caller's buffer — no scratch, no copy. Otherwise it goes through
+    // scratch, because a partially-requested edge page must still be
+    // checksummed whole. Either way the caller must treat the buffer as
+    // undefined when this returns false; every caller refetches the span.
+    const bool direct = rStart >= off && rStart + rBytes <= off + len;
+    uint8_t* dst;
+    if (direct) {
+      dst = out + (rStart - off);
+    } else {
+      if (scratch.size() < rBytes)
+        scratch.resize(rBytes);
+      dst = scratch.data();
+    }
+    if (!readVerifyRun(r.firstPage, r.lastPage, &crcs[r.crcBase], dst)) {
       publish();
       return false;
     }
-    const uint32_t rLen = meta_.pageBytes(i);
-    const uint64_t prevEnd = lastDiskEnd_.exchange(pStart + rLen, std::memory_order_relaxed);
+    if (!direct) {
+      const uint64_t cStart = std::max(off, rStart);
+      const uint64_t cEnd = std::min(off + len, rStart + rBytes);
+      std::memcpy(out + (cStart - off), dst + (cStart - rStart), cEnd - cStart);
+    }
+    const uint64_t prevEnd = lastDiskEnd_.exchange(rStart + rBytes, std::memory_order_relaxed);
     ++dReads;
-    dBytes += rLen;
-    if (pStart == prevEnd)
+    dBytes += rBytes;
+    if (rStart == prevEnd)
       ++dSeq;
-    std::memcpy(out + (cStart - off), scratch.data() + (cStart - pStart), cEnd - cStart);
+    stats_.hitReadSize.add(rBytes);
   }
   publish();
   touchAtime();
@@ -646,7 +707,9 @@ FileEntry::ScrubResult FileEntry::verifyAll() {
       expect = meta_.pageCrcs[i];
     }
     ++res.checked;
-    if (!readVerifyPage(i, expect, scratch.data()))
+    // One page at a time here on purpose: the scrub reports how many pages
+    // are bad, and a coalesced run would demote all of them together.
+    if (!readVerifyRun(i, i, &expect, scratch.data()))
       ++res.bad;
   }
   if (res.bad)

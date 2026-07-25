@@ -74,6 +74,12 @@ struct ReplicaMeta {
     uint64_t end = std::min<uint64_t>(start + kOverlayPageSize, tdataBytes);
     return static_cast<uint32_t>(end - start);
   }
+  // Byte span of pages [first, last] — exact, since only the tail page of
+  // .tdata is ever short. Used to size one coalesced pread over a run.
+  uint64_t runBytes(uint64_t first, uint64_t last) const {
+    return last * uint64_t(kOverlayPageSize) + pageBytes(last) -
+           first * uint64_t(kOverlayPageSize);
+  }
 };
 
 class ReplicaFile {

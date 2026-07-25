@@ -369,26 +369,32 @@ TEST(FileEntry, ObservabilityCountersTrackServeGeometry) {
   e->flushBuffer(true); // on disk: the reads below are the DISK tier
 
   std::vector<uint8_t> buf(16 * 4096);
-  // Sequential full read: 16 preads, 15 at the previous read's end.
+  // A contiguous run of resident pages costs ONE pread, whatever its page
+  // count: read granularity is independent of checksum granularity.
   ASSERT_TRUE(e->readCached(0, 16 * 4096, buf.data()));
-  EXPECT_EQ(fx.stats.hitDiskReads.load(), 16u);
-  EXPECT_EQ(fx.stats.hitDiskBytes.load(), 16u * 4096);
-  EXPECT_EQ(fx.stats.hitDiskSeq.load(), 15u);
+  EXPECT_EQ(fx.stats.hitDiskReads.load(), 1u);
+  EXPECT_EQ(fx.stats.hitDiskBytes.load(), 16u * 4096); // same bytes as before
+  EXPECT_EQ(fx.stats.hitDiskSeq.load(), 0u);           // nothing preceded it
   EXPECT_EQ(fx.stats.firstTouchBytes.load(), 16u * 4096);
   EXPECT_EQ(fx.stats.ramHitBytes.load(), 0u);
 
-  // Re-read the same range: disk reads double, first-touch does NOT move —
-  // the re-read factor (served/first_touch) now reads 2x.
+  // Re-read the same range: one more pread. It rewinds to offset 0 rather
+  // than continuing from the previous read's end, so it is not sequential;
+  // first-touch does NOT move — the re-read factor (served/first_touch) now
+  // reads 2x.
   ASSERT_TRUE(e->readCached(0, 16 * 4096, buf.data()));
-  EXPECT_EQ(fx.stats.hitDiskReads.load(), 32u);
+  EXPECT_EQ(fx.stats.hitDiskReads.load(), 2u);
+  EXPECT_EQ(fx.stats.hitDiskSeq.load(), 0u);
   EXPECT_EQ(fx.stats.firstTouchBytes.load(), 16u * 4096);
   EXPECT_EQ(fx.stats.hitBytes.load(), 2u * 16 * 4096);
 
-  // Scattered single-page reads (stride 2): none sequential beyond the first
-  // pair boundary — seq counter must not advance.
+  // Scattered single-page reads (stride 2): one pread each, none sequential —
+  // there is nothing to coalesce, so the op count is the page count.
+  uint64_t readsBefore = fx.stats.hitDiskReads.load();
   uint64_t seqBefore = fx.stats.hitDiskSeq.load();
   for (int i = 0; i < 16; i += 2)
     ASSERT_TRUE(e->readCached(static_cast<uint64_t>(i) * 4096, 4096, buf.data()));
+  EXPECT_EQ(fx.stats.hitDiskReads.load(), readsBefore + 8u);
   EXPECT_EQ(fx.stats.hitDiskSeq.load(), seqBefore);
 
   // Staged pages (not yet flushed) serve from RAM: ram_hit_bytes counts,
@@ -404,6 +410,88 @@ TEST(FileEntry, ObservabilityCountersTrackServeGeometry) {
   EXPECT_EQ(e->obs().ramBytes.load(), 4u * 4096);
   EXPECT_EQ(e->obs().firstTouchBytes.load(), 20u * 4096);
   EXPECT_EQ(e->obs().wireBytes.load(), 20u * 4096);
+}
+
+// Hit-path coalescing: ONE pread per contiguous run of resident pages, with
+// every page still verified against its own CRC. The op count is the point —
+// on op-priced storage it is the currency — so it is asserted directly, and
+// the served bytes must be byte-identical to the source either way.
+TEST(FileEntry, HitReadsCoalesceIntoOnePreadPerRun) {
+  Fixture fx(64 * 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 64 * 4096, fx.src.data());
+  e->flushBuffer(true);
+
+  // Unaligned request spanning 11 pages (the readv-chunk shape: partial page
+  // at each end) — one pread, and the caller gets exactly its bytes.
+  std::vector<uint8_t> buf(11 * 4096);
+  const uint64_t off = 3 * 4096 + 100, len = 10 * 4096 + 3000;
+  ASSERT_TRUE(e->readCached(off, len, buf.data()));
+  EXPECT_EQ(fx.stats.hitDiskReads.load(), 1u);
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + off, len));
+  // The pread covered whole pages: 11 of them, more bytes than were asked for.
+  EXPECT_EQ(fx.stats.hitDiskBytes.load(), 11u * 4096);
+
+  // Page-aligned request: read straight into the caller's buffer, still one op.
+  ASSERT_TRUE(e->readCached(8 * 4096, 4 * 4096, buf.data()));
+  EXPECT_EQ(fx.stats.hitDiskReads.load(), 2u);
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + 8 * 4096, 4 * 4096));
+
+  // A hole splits the run: punch page 4 out of an 8-page span and the request
+  // misses (page-granular presence is unchanged by coalescing).
+  e->releaseRanges({{4 * 4096, 4096}});
+  EXPECT_FALSE(e->readCached(0, 8 * 4096, buf.data()));
+}
+
+// Two runs separated by a RAM-staged page: the disk pages before and after it
+// cannot be one pread, and the staged page must not be read from disk at all.
+TEST(FileEntry, StagedPageSplitsACoalescedRun) {
+  Fixture fx(64 * 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 8 * 4096, fx.src.data());
+  e->flushBuffer(true);        // pages 0-7 on disk
+  e->releaseRanges({{3 * 4096, 4096}}); // page 3 gone from disk
+  e->writePages(3 * 4096, 4096, fx.src.data() + 3 * 4096); // page 3 staged in RAM
+
+  std::vector<uint8_t> buf(8 * 4096);
+  ASSERT_TRUE(e->readCached(0, 8 * 4096, buf.data()));
+  EXPECT_EQ(fx.stats.hitDiskReads.load(), 2u);          // [0-2] and [4-7]
+  EXPECT_EQ(fx.stats.hitDiskBytes.load(), 7u * 4096);   // page 3 came from RAM
+  EXPECT_EQ(fx.stats.ramHitBytes.load(), 4096u);
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data(), 8 * 4096));
+}
+
+// A corrupted page inside a coalesced run must be caught and demoted — the
+// whole point of verifying each page's CRC out of the shared buffer.
+TEST(FileEntry, CorruptPageInsideARunIsCaughtAndDemoted) {
+  Fixture fx(64 * 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 8 * 4096, fx.src.data());
+  e->flushAll();
+  e.reset(); // closes the entry: the .data file is complete on disk
+
+  // Flip a byte in the middle page of the run, behind the cache's back.
+  const std::string dataPath = fx.key.objectDir(fx.cfg.cacheDir) + "/" + fx.key.hashHex + ".data";
+  int fd = ::open(dataPath.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  uint8_t b = 0;
+  ASSERT_EQ(1, ::pread(fd, &b, 1, 5 * 4096 + 7));
+  b ^= 0xff;
+  ASSERT_EQ(1, ::pwrite(fd, &b, 1, 5 * 4096 + 7));
+  ::close(fd);
+
+  auto e2 = fx.open();
+  ASSERT_TRUE(e2);
+  std::vector<uint8_t> buf(8 * 4096);
+  EXPECT_FALSE(e2->readCached(0, 8 * 4096, buf.data())); // run read, page 5 rejected
+  EXPECT_EQ(fx.stats.crcFailures.load(), 1u);
+  // Only the bad page was demoted: its neighbours still serve.
+  EXPECT_TRUE(e2->readCached(0, 5 * 4096, buf.data()));
+  EXPECT_TRUE(e2->readCached(6 * 4096, 2 * 4096, buf.data()));
+  EXPECT_FALSE(e2->hasRange(5 * 4096, 4096));
 }
 
 // Write side: coalesced flush runs are counted with their sizes, and

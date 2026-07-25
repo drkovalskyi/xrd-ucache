@@ -17,6 +17,13 @@
 
 namespace ucache {
 
+// Upper bound on a single coalesced cache read. Read granularity and
+// checksum granularity are independent: a reader may pull a contiguous run
+// of pages with one pread and verify each page's crc32c out of that buffer.
+// The cap bounds the transient buffer (and the latency of one syscall) while
+// still amortizing the call over hundreds of pages.
+constexpr uint64_t kMaxCoalescedRead = 1ull << 20; // 1 MiB
+
 class IOBackend {
  public:
   virtual ~IOBackend() = default;

@@ -21,13 +21,16 @@ consumers together.
  "replica_crc_failures": 0, "replica_punched_bytes": 0, "replica_orphans_swept": 0,
  "files_opened": 0, "ram_hit_bytes": 0, "first_touch_bytes": 0,
  "hit_disk_reads": 0, "hit_disk_bytes": 0, "hit_disk_seq": 0,
- "replica_bytes_served": 0, "replica_reads": 0, "relay_bytes": 0,
- "readv_chunks": 0, "readv_mixed": 0,
+ "replica_bytes_served": 0, "replica_reads": 0, "replica_read_bytes": 0,
+ "relay_bytes": 0,
+ "readv_chunks": 0, "readv_calls": 0, "readv_mixed": 0,
  "flush_runs": 0, "flush_run_bytes": 0,
  "buffer_stalls": 0, "buffer_stall_us": 0,
  "hist_hit_read_us": [..], "hist_miss_read_us": [..], "hist_origin_rt_us": [..],
  "hist_open_us": [..], "hist_replica_read_us": [..],
  "hist_flush_write_us": [..], "hist_meta_flush_us": [..],
+ "hist_req_read_bytes": [..], "hist_hit_read_bytes": [..],
+ "hist_replica_read_bytes": [..],
  "entries": [{"key": "root://host:1094/path", "file_size": 0,
               "cached_bytes": 0, "page_size": 4096}]}
 ```
@@ -63,23 +66,39 @@ consumers together.
   `first_touch_bytes` — bytes served for the first time in the entry's
   in-process lifetime (the rest are re-reads); `hit_disk_reads` /
   `hit_disk_bytes` / `hit_disk_seq` — byte-tier disk reads, their bytes, and
-  how many continued sequentially from the previous read;
-  `replica_bytes_served` / `replica_reads` — bytes served from replica
-  overlays and the physical `.tdata` preads that delivered them (one per
-  overlay page touched, so a page read for two different user reads counts
-  twice — the replica-tier analogue of `hit_disk_reads`; divide bytes by reads
-  for the mean read size, and reads by wall time for the op rate the storage
-  device actually sees); `relay_bytes`
+  how many continued sequentially from the previous read. **One
+  `hit_disk_reads` is one pread covering a whole contiguous run of cached
+  pages, not one per page** — a request spanning ten adjacent pages costs one
+  read op — so `hit_disk_bytes / hit_disk_reads` is the mean size the device
+  sees and `hit_disk_reads` divided by wall time is the op rate it is charged
+  for (the currency on IOPS-quota storage). Bytes are counted at whole-page
+  granularity, since each page is still checksummed in full.
+  `replica_bytes_served` / `replica_reads` / `replica_read_bytes` — bytes
+  served from replica overlays, the physical `.tdata` preads that delivered
+  them, and the bytes those preads moved (the replica-tier analogue of the
+  byte-tier trio, coalesced the same way; `replica_read_bytes` ≥
+  `replica_bytes_served` because whole overlay pages are read and verified,
+  and a page read for two different user reads counts twice). `relay_bytes`
   — pure pass-through, the cache never touched them; `readv_chunks` /
-  `readv_mixed` — vector-read chunks seen / chunks in mixed hit+miss
-  vectors; `flush_runs` / `flush_run_bytes` — coalesced fill-buffer pwrite
+  `readv_calls` / `readv_mixed` — vector-read chunks seen, vector reads the
+  cache handled (`readv_chunks / readv_calls` = mean batch width), and
+  vectors mixing hits with misses; `flush_runs` / `flush_run_bytes` — coalesced fill-buffer pwrite
   runs and their bytes; `buffer_stalls` / `buffer_stall_us` — fills that had
   to drain synchronously at the buffer cap, and the wall time lost;
   `fetches_joined` — misses that joined an identical in-flight fetch instead
   of fetching again.
-- Histograms are log2 buckets of microseconds: bucket *i* counts samples
-  with `floor(log2(us)) == i` (bucket 0 = ≤1 µs); arrays are trimmed of
-  trailing zeros, 40 buckets max.
+- Histograms are log2 buckets: bucket *i* counts samples with
+  `floor(log2(v)) == i` (bucket 0 = ≤1); arrays are trimmed of trailing
+  zeros, 40 buckets max. The `_us` ones bucket microseconds; the
+  `_bytes` ones bucket bytes (bucket 12 = 4 KiB, 16 = 64 KiB).
+- Read-shape histograms answer "what is the storage actually asked for":
+  `hist_req_read_bytes` — sizes the client requested (one sample per read
+  and per vector-read chunk, before the cache decides how to serve them);
+  `hist_hit_read_bytes` / `hist_replica_read_bytes` — sizes of the preads
+  each tier issued. Requested sizes larger than issued sizes would mean the
+  cache is fragmenting the client's reads; the reverse (issued ≥ requested)
+  is the expected shape, since reads are coalesced across runs and rounded
+  out to page boundaries.
 - `entries` — per-entry page coverage of entries live in the process at dump
   time (`cached_bytes / file_size` = the coverage signal gating replica
   materialization). Closed entries' coverage persists in their

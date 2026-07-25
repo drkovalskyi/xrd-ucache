@@ -58,25 +58,53 @@ bool ReplicaView::read(uint64_t tdataOff, uint64_t len, void* buf) {
     return false; // caller bug or corrupt map — never guess
   }
   const uint32_t P = ReplicaMeta::kOverlayPageSize;
-  uint64_t first = tdataOff / P, last = (tdataOff + len - 1) / P;
-  std::vector<uint8_t> scratch(P);
+  const uint64_t first = tdataOff / P, last = (tdataOff + len - 1) / P;
   auto* out = static_cast<uint8_t*>(buf);
-  for (uint64_t i = first; i <= last; ++i) {
-    const uint32_t nbytes = meta_.pageBytes(i);
-    stats_.replicaReads.fetch_add(1, std::memory_order_relaxed);
-    int64_t r = io_.preadFull(fd_, scratch.data(), nbytes, i * uint64_t(P));
-    if (r != static_cast<int64_t>(nbytes) ||
-        crc32c(scratch.data(), nbytes) != meta_.pageCrcs[i]) {
-      stats_.replicaCrcFailures.fetch_add(1, std::memory_order_relaxed);
-      invalid_.store(true, std::memory_order_relaxed);
-      UCACHE_WARN("replica overlay page %llu bad for %s; view invalidated",
-                  static_cast<unsigned long long>(i), meta_.key.c_str());
-      return false;
+  // Every overlay page is present by construction, so the run is the whole
+  // requested page span, split only by the coalescing cap: ONE pread per run,
+  // each page's CRC verified out of that buffer.
+  std::vector<uint8_t> scratch;
+  for (uint64_t rf = first; rf <= last;) {
+    uint64_t rl = rf;
+    while (rl < last && meta_.runBytes(rf, rl + 1) <= kMaxCoalescedRead)
+      ++rl;
+    const uint64_t rStart = rf * uint64_t(P);
+    const uint64_t rBytes = meta_.runBytes(rf, rl);
+    // Read straight into the caller's buffer when the run lies entirely
+    // inside the request; otherwise via scratch, since a partially-requested
+    // edge page must still be checksummed whole.
+    const bool direct = rStart >= tdataOff && rStart + rBytes <= tdataOff + len;
+    uint8_t* dst;
+    if (direct) {
+      dst = out + (rStart - tdataOff);
+    } else {
+      if (scratch.size() < rBytes)
+        scratch.resize(rBytes);
+      dst = scratch.data();
     }
-    uint64_t pStart = i * uint64_t(P);
-    uint64_t cStart = std::max(tdataOff, pStart);
-    uint64_t cEnd = std::min(tdataOff + len, pStart + nbytes);
-    std::memcpy(out + (cStart - tdataOff), scratch.data() + (cStart - pStart), cEnd - cStart);
+    stats_.replicaReads.fetch_add(1, std::memory_order_relaxed);
+    stats_.replicaReadBytes.fetch_add(rBytes, std::memory_order_relaxed);
+    stats_.replicaReadSize.add(rBytes);
+    const int64_t r = io_.preadFull(fd_, dst, rBytes, rStart);
+    const uint64_t got = r > 0 ? static_cast<uint64_t>(r) : 0;
+    uint64_t o = 0;
+    for (uint64_t i = rf; i <= rl; ++i) {
+      const uint32_t nbytes = meta_.pageBytes(i);
+      if (o + nbytes > got || crc32c(dst + o, nbytes) != meta_.pageCrcs[i]) {
+        stats_.replicaCrcFailures.fetch_add(1, std::memory_order_relaxed);
+        invalid_.store(true, std::memory_order_relaxed);
+        UCACHE_WARN("replica overlay page %llu bad for %s; view invalidated",
+                    static_cast<unsigned long long>(i), meta_.key.c_str());
+        return false;
+      }
+      o += nbytes;
+    }
+    if (!direct) {
+      const uint64_t cStart = std::max(tdataOff, rStart);
+      const uint64_t cEnd = std::min(tdataOff + len, rStart + rBytes);
+      std::memcpy(out + (cStart - tdataOff), dst + (cStart - rStart), cEnd - cStart);
+    }
+    rf = rl + 1;
   }
   return true;
 }
@@ -239,17 +267,29 @@ std::shared_ptr<ReplicaView> ReplicaStore::openView(const UrlKey& key, uint64_t 
   // is skipped when the advisory verify-once marker matches (header comment);
   // per-read page CRCs stay on either way.
   if (!tokMatches(io_, tokPath(key, cfg_.cacheDir), m->tdataBytes, mtimeNs(dst), *m)) {
-    std::vector<uint8_t> scratch(ReplicaMeta::kOverlayPageSize);
-    for (uint64_t i = 0; i < m->npages(); ++i) {
-      const uint32_t nbytes = m->pageBytes(i);
-      int64_t r = io_.preadFull(fd, scratch.data(), nbytes,
-                                i * uint64_t(ReplicaMeta::kOverlayPageSize));
-      if (r != static_cast<int64_t>(nbytes) ||
-          crc32c(scratch.data(), nbytes) != m->pageCrcs[i]) {
-        stats_.replicaCrcFailures.fetch_add(1, std::memory_order_relaxed);
-        io_.close(fd);
-        return quarantine("overlay CRC failure at open");
+    // A sequential scan of the whole overlay: read it in coalesced spans and
+    // verify each page's CRC out of the buffer, rather than one pread per page.
+    const uint64_t npages = m->npages();
+    std::vector<uint8_t> scratch(kMaxCoalescedRead);
+    for (uint64_t rf = 0; rf < npages;) {
+      uint64_t rl = rf;
+      while (rl + 1 < npages && m->runBytes(rf, rl + 1) <= kMaxCoalescedRead)
+        ++rl;
+      const uint64_t rBytes = m->runBytes(rf, rl);
+      const int64_t r =
+          io_.preadFull(fd, scratch.data(), rBytes, rf * uint64_t(ReplicaMeta::kOverlayPageSize));
+      const uint64_t got = r > 0 ? static_cast<uint64_t>(r) : 0;
+      uint64_t o = 0;
+      for (uint64_t i = rf; i <= rl; ++i) {
+        const uint32_t nbytes = m->pageBytes(i);
+        if (o + nbytes > got || crc32c(scratch.data() + o, nbytes) != m->pageCrcs[i]) {
+          stats_.replicaCrcFailures.fetch_add(1, std::memory_order_relaxed);
+          io_.close(fd);
+          return quarantine("overlay CRC failure at open");
+        }
+        o += nbytes;
       }
+      rf = rl + 1;
     }
     tokWrite(io_, tokPath(key, cfg_.cacheDir), m->tdataBytes, mtimeNs(dst), *m);
   }

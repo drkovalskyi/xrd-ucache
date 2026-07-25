@@ -14,8 +14,9 @@ namespace ucache {
 
 class Tracer; // sampled IO tracer (Trace.h)
 
-// log2-bucketed histogram of microsecond durations: bucket i holds samples
-// with floor(log2(us)) == i (bucket 0: us <= 1); 40 buckets cover ~13 days.
+// log2-bucketed histogram of a magnitude — microsecond durations, or bytes:
+// bucket i holds samples with floor(log2(v)) == i (bucket 0: v <= 1);
+// 40 buckets cover ~13 days, or 1 TiB.
 struct Histogram {
   static constexpr int kBuckets = 40;
   std::atomic<uint64_t> b[kBuckets] = {};
@@ -64,15 +65,21 @@ struct Stats {
                                               // served/first_touch = within-open re-read
                                               // factor; reopen loops show in opens/file
   std::atomic<uint64_t> hitDiskReads{0};      // physical .data preads on the hit path
+                                              // (one per COALESCED run of resident
+                                              // pages, not one per page)
   std::atomic<uint64_t> hitDiskBytes{0};
   std::atomic<uint64_t> hitDiskSeq{0};        // preads starting at the previous pread's end
   std::atomic<uint64_t> replicaBytesServed{0}; // stitched bytes served from .tdata
   std::atomic<uint64_t> replicaReads{0};      // physical .tdata preads (one per
-                                              // overlay page touched, so re-reads
-                                              // of a page count again — the byte
-                                              // tier's hitDiskReads analogue)
+                                              // coalesced run of overlay pages, so
+                                              // re-reads of a page count again — the
+                                              // byte tier's hitDiskReads analogue)
+  std::atomic<uint64_t> replicaReadBytes{0};  // bytes those preads moved (>= served:
+                                              // whole overlay pages are checksummed)
   std::atomic<uint64_t> relayBytes{0};        // pass-through serves (cache never touched)
   std::atomic<uint64_t> readvChunks{0};       // chunks across all vector reads
+  std::atomic<uint64_t> readvCalls{0};        // vector reads the cache handled
+                                              // (chunks/calls = batch width)
   std::atomic<uint64_t> readvMixed{0};        // vector reads containing hits AND misses
   // Write side:
   std::atomic<uint64_t> flushRuns{0};         // coalesced pwrite runs
@@ -86,6 +93,12 @@ struct Stats {
   Histogram replicaReadUs; // stitched serve spans
   Histogram flushWriteUs;  // per coalesced flush pwrite
   Histogram metaFlushUs;   // sidecar store spans
+  // Size histograms (log2 BYTES, same bucketing as the µs ones). The pair
+  // that makes read shape visible: what the client asks for vs what the
+  // cache disk is actually asked for.
+  Histogram reqReadBytes;     // per request arriving at the plugin (Read, readv chunk)
+  Histogram hitReadSize;      // per byte-tier pread
+  Histogram replicaReadSize;  // per replica-tier pread
 
   // Set once at store init when `trace = io`; null = off.
   // Not dumped; carried here so every path that has Stats& can trace.
@@ -110,11 +123,13 @@ struct StatsTotals {
   // Workflow counters:
   uint64_t filesOpened = 0, ramHitBytes = 0, firstTouchBytes = 0, hitDiskReads = 0,
            hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
-           relayBytes = 0,
-           readvChunks = 0, readvMixed = 0, flushRuns = 0, flushRunBytes = 0,
+           replicaReadBytes = 0, relayBytes = 0,
+           readvChunks = 0, readvCalls = 0, readvMixed = 0, flushRuns = 0, flushRunBytes = 0,
            bufferStalls = 0, bufferStallUs = 0;
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite;
+  // … and log2 bytes, for the read-shape block:
+  std::vector<uint64_t> histReqRead, histHitReadSize, histReplicaReadSize;
 };
 // Sums the last JSON line of every <statsDir>/*.jsonl. Missing dir => zeros.
 StatsTotals aggregateStats(const std::string& statsDir);

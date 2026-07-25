@@ -37,6 +37,10 @@ TEST(Stats, JsonBodyHasAllCounters) {
   s.hitBytes = 12345;
   s.crcFailures = 1;
   s.hitReadUs.add(7);
+  s.replicaReadBytes = 65536;
+  s.readvCalls = 9;
+  s.reqReadBytes.add(4096);
+  s.hitReadSize.add(4096);
   std::string j = "{" + s.toJsonBody() + "}";
   // Spot-check names and values (schema is docs/STATS.md and load-bearing).
   EXPECT_NE(j.find("\"opens\":3"), std::string::npos);
@@ -46,6 +50,12 @@ TEST(Stats, JsonBodyHasAllCounters) {
   EXPECT_NE(j.find("\"failopen_events\":0"), std::string::npos);
   EXPECT_NE(j.find("\"disabled_handles\":0"), std::string::npos);
   EXPECT_NE(j.find("\"hist_hit_read_us\":[0,0,1]"), std::string::npos);
+  // Read-shape surface: sizes are histogrammed in log2 BYTES (4096 => bucket 12).
+  EXPECT_NE(j.find("\"replica_read_bytes\":65536"), std::string::npos);
+  EXPECT_NE(j.find("\"readv_calls\":9"), std::string::npos);
+  EXPECT_NE(j.find("\"hist_req_read_bytes\":[0,0,0,0,0,0,0,0,0,0,0,0,1]"), std::string::npos);
+  EXPECT_NE(j.find("\"hist_hit_read_bytes\":[0,0,0,0,0,0,0,0,0,0,0,0,1]"), std::string::npos);
+  EXPECT_NE(j.find("\"hist_replica_read_bytes\":[]"), std::string::npos);
   // Braces balanced, no trailing comma before '}'.
   EXPECT_EQ(j.find(",}"), std::string::npos);
 }

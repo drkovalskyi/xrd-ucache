@@ -96,8 +96,10 @@ std::string Stats::toJsonBody() const {
   f("hit_disk_seq", hitDiskSeq);
   f("replica_bytes_served", replicaBytesServed);
   f("replica_reads", replicaReads);
+  f("replica_read_bytes", replicaReadBytes);
   f("relay_bytes", relayBytes);
   f("readv_chunks", readvChunks);
+  f("readv_calls", readvCalls);
   f("readv_mixed", readvMixed);
   f("flush_runs", flushRuns);
   f("flush_run_bytes", flushRunBytes);
@@ -109,7 +111,10 @@ std::string Stats::toJsonBody() const {
   os << "\"hist_open_us\":" << openUs.toJson() << ',';
   os << "\"hist_replica_read_us\":" << replicaReadUs.toJson() << ',';
   os << "\"hist_flush_write_us\":" << flushWriteUs.toJson() << ',';
-  os << "\"hist_meta_flush_us\":" << metaFlushUs.toJson();
+  os << "\"hist_meta_flush_us\":" << metaFlushUs.toJson() << ',';
+  os << "\"hist_req_read_bytes\":" << reqReadBytes.toJson() << ',';
+  os << "\"hist_hit_read_bytes\":" << hitReadSize.toJson() << ',';
+  os << "\"hist_replica_read_bytes\":" << replicaReadSize.toJson();
   return os.str();
 }
 
@@ -169,8 +174,10 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.hitDiskSeq += extractU64(last, "hit_disk_seq");
     t.replicaBytesServed += extractU64(last, "replica_bytes_served");
     t.replicaReads += extractU64(last, "replica_reads");
+    t.replicaReadBytes += extractU64(last, "replica_read_bytes");
     t.relayBytes += extractU64(last, "relay_bytes");
     t.readvChunks += extractU64(last, "readv_chunks");
+    t.readvCalls += extractU64(last, "readv_calls");
     t.readvMixed += extractU64(last, "readv_mixed");
     t.flushRuns += extractU64(last, "flush_runs");
     t.flushRunBytes += extractU64(last, "flush_run_bytes");
@@ -181,6 +188,9 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     extractHist(last, "hist_open_us", t.histOpen);
     extractHist(last, "hist_replica_read_us", t.histReplicaRead);
     extractHist(last, "hist_flush_write_us", t.histFlushWrite);
+    extractHist(last, "hist_req_read_bytes", t.histReqRead);
+    extractHist(last, "hist_hit_read_bytes", t.histHitReadSize);
+    extractHist(last, "hist_replica_read_bytes", t.histReplicaReadSize);
   }
   ::closedir(d);
   return t;

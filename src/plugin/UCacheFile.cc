@@ -367,6 +367,27 @@ static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n) {
     st->store->stats().relayBytes.fetch_add(n, std::memory_order_relaxed);
 }
 
+// Request shape as the CLIENT asked for it, before the cache decides how to
+// serve it: one sample per Read and per vector-read chunk. Read against the
+// physical read-size histograms, this is what shows whether reads arrive
+// basket-sized or page-sized.
+static void noteRequestBytes(const std::shared_ptr<HandleState>& st, uint64_t n) {
+  if (st->store)
+    st->store->stats().reqReadBytes.add(n);
+}
+
+// One cache-handled vector read: its width, its chunks, and their shapes.
+static void noteVectorRequest(const std::shared_ptr<HandleState>& st,
+                              const XrdCl::ChunkList& chunks) {
+  if (!st->store)
+    return;
+  auto& s = st->store->stats();
+  s.readvCalls.fetch_add(1, std::memory_order_relaxed);
+  s.readvChunks.fetch_add(chunks.size(), std::memory_order_relaxed);
+  for (const auto& c : chunks)
+    s.reqReadBytes.add(c.length);
+}
+
 template <typename Issue>
 static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
                                         XrdCl::ResponseHandler* user, Issue issue) {
@@ -1406,6 +1427,8 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
                                      ResponseHandler* handler, uint16_t timeout) {
   auto entry = ensureEntry();
+  if (entry)
+    noteRequestBytes(st_, size);
   if (auto view = currentView(); entry && view) {
     // Stitched entry: serve on the executor — overlay + v1
     // cache locally, residual original sub-ranges via the miss machinery.
@@ -1597,8 +1620,7 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
         });
       }
     auto st = st_;
-    if (st_->store)
-      st_->store->stats().readvChunks.fetch_add(chunks.size(), std::memory_order_relaxed);
+    noteVectorRequest(st_, chunks);
     ChunkList userChunks = chunks;
     Executor::instance().post(
         [st, entry, view, userChunks = std::move(userChunks), handler]() mutable {
@@ -1620,12 +1642,10 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
   for (size_t i = 0; i < chunks.size(); ++i)
     if (!entry->hasRange(chunks[i].offset, chunks[i].length))
       missIdx.push_back(i);
-  if (st_->store) {
-    auto& stats = st_->store->stats();
-    stats.readvChunks.fetch_add(chunks.size(), std::memory_order_relaxed);
-    if (!missIdx.empty() && missIdx.size() != chunks.size())
-      stats.readvMixed.fetch_add(1, std::memory_order_relaxed); // the serial hit+wire shape
-  }
+  noteVectorRequest(st_, chunks);
+  if (st_->store && !missIdx.empty() && missIdx.size() != chunks.size())
+    st_->store->stats().readvMixed.fetch_add(1,
+                                             std::memory_order_relaxed); // serial hit+wire shape
 
   if (missIdx.size() == chunks.size()) {
     // All-miss: no disk stage; issue the wire read from this thread.

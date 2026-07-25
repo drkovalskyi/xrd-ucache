@@ -167,9 +167,21 @@ class FileEntry {
   FileEntry(IOBackend& io, const Config& cfg, Stats& stats, UrlKey key)
       : io_(io), cfg_(cfg), stats_(stats), key_(std::move(key)) {}
 
-  // Reads page i fully and verifies its CRC; on mismatch marks it absent.
-  // scratch must hold pageSize bytes. Returns false on mismatch/IO error.
-  bool readVerifyPage(uint64_t i, uint32_t expectCrc, uint8_t* scratch);
+  // Reads pages [firstPage, lastPage] with ONE pread into dst (which must
+  // hold the run's byte span) and verifies each page's CRC out of that
+  // buffer; expect[] holds the run's per-page CRCs. Pages that could not be
+  // verified are marked absent. Returns false on mismatch/short read/IO error.
+  bool readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint32_t* expect,
+                     uint8_t* dst);
+  // Marks [firstPage, lastPage] absent and the entry incomplete: their
+  // content could not be trusted. Counts ONE crc_failure for the run.
+  void demoteRun(uint64_t firstPage, uint64_t lastPage, const char* why);
+  // Byte span of pages [firstPage, lastPage] (only the file's final page is
+  // ever short, so this is exact for any run).
+  uint64_t runBytes(uint64_t firstPage, uint64_t lastPage) const {
+    return lastPage * uint64_t(meta_.pageSize) + meta_.pageBytes(lastPage) -
+           firstPage * uint64_t(meta_.pageSize);
+  }
   void touchAtime();
   // Legacy immediate write path (fill_buffer_mb = 0), byte-identical to the
   // pre-buffering behavior; also the fallback if staging is disabled at runtime.

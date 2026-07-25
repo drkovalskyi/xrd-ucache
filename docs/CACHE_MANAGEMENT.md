@@ -415,7 +415,7 @@ Reported (raw numbers; interpretation guidance will come later):
 |---|---|
 | sequential write / read MB/s | replica (recompressed) builds and serving |
 | scattered 4 KiB write IOPS | the cold-fill page writes |
-| random 4 KiB read IOPS + latency (1 stream) | warm hit serving |
+| random 4 KiB read IOPS + latency (1 stream) | warm hit serving, worst case: hits too scattered to coalesce |
 | random 4 KiB read IOPS (16 streams) | multi-threaded jobs; **flat scaling vs 1 stream exposes an IOPS quota** |
 | read-under-writeback latency | warm reads while a fill is running — the common mixed mode |
 | fdatasync / create / unlink rates | sidecar flushes, eviction, `clear` |
@@ -425,13 +425,19 @@ performance problems. Rules of thumb from the machines measured so far:
 random-read latency in *microseconds* = healthy local disk; *milliseconds*
 = network-backed storage where warm reads may not beat the origin — on
 such storage `recompress on` (sequential replica reads) matters far more,
-and a genuinely slow cache dir can be worse than no cache at all. The gap is
-about read COUNT, not bytes: serving the same analysis from the byte cache took
-about 15× more read operations than serving it from replicas (measured, 4 KiB
-vs ~60 KiB per read), which is exactly the cost an IOPS-priced volume charges
-for. Where operations are the scarce resource, complete the recompression —
-a partly-replicated dataset still pays the byte-tier op count on whatever is
-left.
+and a genuinely slow cache dir can be worse than no cache at all. What such
+storage charges for is read COUNT, not bytes, so both tiers serve a contiguous
+run of cached pages with a single read rather than one read per page: a
+request is one operation whatever its page count.
+
+That leaves a difference the two tiers cannot share. The byte cache stores the
+file in its original layout, so a read can only be as large as the client's
+request — and the next thing that analysis wants usually sits elsewhere in the
+file, behind data it did not ask for. A replica stores each branch's data
+contiguously, so consecutive reads land next to each other and one operation
+can cover several of them. Where operations are the scarce resource, that is
+the reason to complete the recompression — and a partly-replicated dataset
+still reads the remainder out of the original layout.
 
 ### Choosing a location: reference grades (from the 2026-07 fleet survey)
 

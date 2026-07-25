@@ -286,6 +286,38 @@ TEST(ReplicaStore, PublishOpenMapRead) {
   EXPECT_FALSE(v->read(overlay.size() - 10, 20, got.data()));
 }
 
+// Overlay reads coalesce too: a span covering many overlay pages costs one
+// pread per run, not one per page, with every page's CRC still checked. Same
+// currency as the byte tier — read operations, not just bytes.
+TEST(ReplicaStore, OverlayReadsCoalesceIntoOnePreadPerRun) {
+  Fixture f;
+  const uint64_t originSize = 1 << 20;
+  auto overlay = test::randomBytes(40 * kP, 77); // 40 pages: 2.5 MiB
+  ASSERT_EQ(f.rs->publish(key(), sampleMeta(originSize, overlay.size()), overlay.data(),
+                          overlay.size()),
+            0);
+  auto v = f.rs->openView(key(), originSize);
+  ASSERT_TRUE(v);
+
+  // 8 pages, unaligned at both ends: ONE pread (the run fits the cap).
+  std::vector<uint8_t> got(8 * kP);
+  const uint64_t off = 2 * kP + 77, len = 7 * kP + 1000;
+  f.stats.replicaReads.store(0);
+  f.stats.replicaReadBytes.store(0);
+  ASSERT_TRUE(v->read(off, len, got.data()));
+  EXPECT_EQ(f.stats.replicaReads.load(), 1u);
+  EXPECT_EQ(f.stats.replicaReadBytes.load(), 8u * kP); // whole pages checksummed
+  EXPECT_EQ(0, std::memcmp(got.data(), overlay.data() + off, len));
+
+  // The cap splits a longer run: 40 pages = 2.5 MiB spans three 1 MiB preads.
+  std::vector<uint8_t> all(overlay.size());
+  f.stats.replicaReads.store(0);
+  ASSERT_TRUE(v->read(0, all.size(), all.data()));
+  EXPECT_EQ(f.stats.replicaReads.load(),
+            (overlay.size() + kMaxCoalescedRead - 1) / kMaxCoalescedRead);
+  EXPECT_EQ(0, std::memcmp(all.data(), overlay.data(), all.size()));
+}
+
 TEST(ReplicaStore, RepublishReplacesAtomically) {
   Fixture f;
   auto o1 = test::randomBytes(kP, 49);

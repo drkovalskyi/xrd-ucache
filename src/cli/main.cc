@@ -232,37 +232,58 @@ const char* flagValue(int argc, char** argv, int& i, size_t flagLen) {
 // Approximate percentile from a log2-µs histogram: the value is the bucket
 // midpoint (1.5 * 2^i), rendered human. Good to ~±50% — regimes, not lab
 // timing.
-std::string histPctile(const std::vector<uint64_t>& h, double q) {
+// Representative value of the bucket holding quantile q — log2 buckets, so
+// the midpoint 1.5*2^i. Negative if the histogram is empty.
+double histQuantile(const std::vector<uint64_t>& h, double q) {
   uint64_t total = 0;
   for (uint64_t c : h)
     total += c;
   if (total == 0)
-    return "-";
+    return -1.0;
   uint64_t target = static_cast<uint64_t>(q * static_cast<double>(total));
   if (target == 0)
     target = 1;
   uint64_t cum = 0;
   for (size_t i = 0; i < h.size(); ++i) {
     cum += h[i];
-    if (cum >= target) {
-      double us = i == 0 ? 1.0 : 1.5 * static_cast<double>(1ull << i);
-      char buf[32];
-      if (us < 1000)
-        std::snprintf(buf, sizeof buf, "%.0fus", us);
-      else if (us < 1e6)
-        std::snprintf(buf, sizeof buf, "%.1fms", us / 1e3);
-      else
-        std::snprintf(buf, sizeof buf, "%.1fs", us / 1e6);
-      return buf;
-    }
+    if (cum >= target)
+      return i == 0 ? 1.0 : 1.5 * static_cast<double>(1ull << i);
   }
-  return "-";
+  return -1.0;
+}
+
+std::string histPctile(const std::vector<uint64_t>& h, double q) {
+  const double us = histQuantile(h, q);
+  if (us < 0)
+    return "-";
+  char buf[32];
+  if (us < 1000)
+    std::snprintf(buf, sizeof buf, "%.0fus", us);
+  else if (us < 1e6)
+    std::snprintf(buf, sizeof buf, "%.1fms", us / 1e3);
+  else
+    std::snprintf(buf, sizeof buf, "%.1fs", us / 1e6);
+  return buf;
 }
 
 std::string pctiles(const std::vector<uint64_t>& h) {
   if (h.empty())
     return "-";
   return histPctile(h, 0.50) + " / " + histPctile(h, 0.95) + " / " + histPctile(h, 0.99);
+}
+
+// Same, for the log2-BYTE histograms.
+std::string pctilesB(const std::vector<uint64_t>& h) {
+  if (h.empty())
+    return "-";
+  std::string out;
+  for (double q : {0.50, 0.95, 0.99}) {
+    const double v = histQuantile(h, q);
+    if (!out.empty())
+      out += " / ";
+    out += v < 0 ? "-" : human(static_cast<uint64_t>(v));
+  }
+  return out;
 }
 
 void printStats(const StatsTotals& t) {
@@ -310,14 +331,21 @@ void printStats(const StatsTotals& t) {
   if (t.replicaReads)
     std::printf("  replica reads      %llu (mean %s)\n",
                 (unsigned long long)t.replicaReads,
-                human(t.replicaBytesServed / t.replicaReads).c_str());
+                human((t.replicaReadBytes ? t.replicaReadBytes : t.replicaBytesServed) /
+                      t.replicaReads)
+                    .c_str());
   if (t.firstTouchBytes && t.hitBytes)
     std::printf("  re-read factor     %.1fx (first touch %s of %s byte-tier serves)\n",
                 static_cast<double>(t.hitBytes) / static_cast<double>(t.firstTouchBytes),
                 human(t.firstTouchBytes).c_str(), human(t.hitBytes).c_str());
-  if (t.readvChunks)
+  if (t.readvChunks) {
     std::printf("  vector reads       %llu chunks, %llu mixed hit+miss vectors\n",
                 (unsigned long long)t.readvChunks, (unsigned long long)t.readvMixed);
+    if (t.readvCalls)
+      std::printf("  vector width       %llu calls (mean %.1f chunks/call)\n",
+                  (unsigned long long)t.readvCalls,
+                  static_cast<double>(t.readvChunks) / static_cast<double>(t.readvCalls));
+  }
   if (t.flushRuns)
     std::printf("  fill flushes       %llu runs (mean %s)\n",
                 (unsigned long long)t.flushRuns,
@@ -326,6 +354,18 @@ void printStats(const StatsTotals& t) {
     std::printf("  fill stalls        %llu (%.1f s waiting on the cache disk)\n",
                 (unsigned long long)t.bufferStalls,
                 static_cast<double>(t.bufferStallUs) / 1e6);
+  if (!t.histReqRead.empty() || !t.histHitReadSize.empty() ||
+      !t.histReplicaReadSize.empty()) {
+    // Read shape: what the client asked for, next to what the cache disk was
+    // asked for. The second should be >= the first, never a fraction of it.
+    std::printf("read size p50/p95/p99:\n");
+    if (!t.histReqRead.empty())
+      std::printf("  requested          %s\n", pctilesB(t.histReqRead).c_str());
+    if (!t.histHitReadSize.empty())
+      std::printf("  byte-tier pread    %s\n", pctilesB(t.histHitReadSize).c_str());
+    if (!t.histReplicaReadSize.empty())
+      std::printf("  replica pread      %s\n", pctilesB(t.histReplicaReadSize).c_str());
+  }
   std::printf("latency p50/p95/p99:\n");
   std::printf("  hit read           %s\n", pctiles(t.histHitRead).c_str());
   std::printf("  origin rt          %s\n", pctiles(t.histOriginRt).c_str());
