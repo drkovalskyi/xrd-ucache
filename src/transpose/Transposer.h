@@ -48,6 +48,12 @@ struct Overlay {
   // the size actually stored at rest (ROOT-compressed, or raw on fallback).
   uint64_t metaRawBytes = 0, metaStoredBytes = 0;
   std::string error; // non-empty => build failed (fail open)
+  // Set with `error` when the build stopped because the SOURCE could not vouch
+  // for bytes it was asked for — not yet cached, or reclaimed/rotted under the
+  // build. Such a build is retryable and self-heals once the entry is complete
+  // again; it says nothing about the file being malformed, and callers should
+  // not report it as a failure. A parse or codec error leaves this false.
+  bool transient = false;
 };
 
 // Append `name`'s counter leaves so the hot set is loop-complete — the same

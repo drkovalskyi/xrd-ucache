@@ -10,6 +10,7 @@
 #include "DiskBench.h"
 #include "UrlKey.h"
 #ifdef UCACHE_HAVE_TRANSPOSE
+#include "CacheSource.h"
 #include "Transposer.h"
 #endif
 
@@ -663,22 +664,6 @@ struct FdSource : tp::Source {
   }
   bool has(uint64_t off, uint64_t n) override { return off + n <= size; }
 };
-struct CacheSource : tp::Source {
-  int fd = -1;
-  const MetaData* meta = nullptr;
-  bool read(void* dst, uint64_t n, uint64_t off) override {
-    return ::pread(fd, dst, n, off) == static_cast<ssize_t>(n);
-  }
-  bool has(uint64_t off, uint64_t n) override {
-    if (n == 0 || off + n > meta->fileSize)
-      return false;
-    uint64_t first = off / meta->pageSize, last = (off + n - 1) / meta->pageSize;
-    for (uint64_t i = first; i <= last; ++i)
-      if (!meta->bitmap.get(i))
-        return false;
-    return true;
-  }
-};
 
 // Native overlay build: parse + transcode from `srcPath` (bitmap-
 // gated when it is the cache image). Returns 0 and fills meta/tdata.
@@ -1044,16 +1029,62 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   return 2;
 #else
   const bool drain = mode == RecompressMode::kDrain;
-  int drainFd = -1;
+  // ONE recompression pass at a time per cache. A pass punches the v1 pages
+  // its replicas supersede; a concurrent pass reading those pages works from a
+  // bitmap snapshot that predates the punch, so its builds hit holes (caught,
+  // but wasted — see CacheSource.h) and the two passes duplicate each other's
+  // work besides. Only the drainer used to lock, which left the recommended
+  // workflow — background builds plus one explicit sweep — running exactly
+  // that race. The lock file keeps its name: a drainer from an older build may
+  // be holding THIS path right now, and must still exclude a new sweep.
+  int lockFd = ::open((cfg.cacheDir + "/recompress.drain.lock").c_str(),
+                      O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  // Held by a foreground sweep for its whole run, and only probed by a
+  // drainer. It is how the sweep says "stop claiming files" to a drainer that
+  // already holds the pass lock: waiting the drainer out instead would hand
+  // the corpus to a nice'd 2-job background worker when the user just asked
+  // for a foreground sweep. Being a lock and not a flag file, it cannot go
+  // stale — if the sweep dies, the kernel drops it.
+  const std::string sweepLockPath = cfg.cacheDir + "/recompress.sweep.lock";
+  int sweepFd = ::open(sweepLockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  auto closeFds = [&] {
+    if (lockFd >= 0)
+      ::close(lockFd);
+    if (sweepFd >= 0)
+      ::close(sweepFd);
+  };
+  if (!drain && sweepFd >= 0)
+    ::flock(sweepFd, LOCK_EX); // serialize sweeps, and announce this one
+  if (lockFd >= 0 && ::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+    if (drain) {
+      closeFds();
+      return 0; // another pass is active; it will claim this queue
+    }
+    std::fputs("recompress: waiting for the background worker to stop (it finishes the file "
+               "it is on)\n",
+               stderr);
+    if (::flock(lockFd, LOCK_EX) != 0) { // interrupted: run unlocked rather than refuse
+      ::close(lockFd);
+      lockFd = -1;
+    }
+  }
+  // Probe, never hold: a drainer asks "is a sweep waiting for me?". Serialized
+  // because flock is per open-file-description — two threads probing the same
+  // fd, or two fds in one process, would see each other's momentary hold as a
+  // waiting sweep and stop for no reason.
+  std::mutex probeMu;
+  auto sweepWants = [&] {
+    if (sweepFd < 0)
+      return false;
+    std::lock_guard<std::mutex> g(probeMu);
+    if (::flock(sweepFd, LOCK_EX | LOCK_NB) == 0) {
+      ::flock(sweepFd, LOCK_UN);
+      return false;
+    }
+    return true;
+  };
   std::ofstream drainLog;
   if (drain) {
-    const std::string lockPath = cfg.cacheDir + "/recompress.drain.lock";
-    drainFd = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (drainFd < 0 || ::flock(drainFd, LOCK_EX | LOCK_NB) != 0) {
-      if (drainFd >= 0)
-        ::close(drainFd);
-      return 0; // another drainer is active
-    }
     ::setpriority(PRIO_PROCESS, 0, 10);
     drainLog.open(cfg.cacheDir + "/recompress.log", std::ios::app);
   }
@@ -1090,7 +1121,7 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     }
   }
   if (drain && work.empty()) {
-    ::close(drainFd);
+    closeFds();
     return 0;
   }
   // Capacity pre-flight (sweep only): estimate the sweep's net disk
@@ -1141,12 +1172,14 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         char buf[16] = {0};
         if (!std::fgets(buf, sizeof buf, stdin) || (buf[0] != 'y' && buf[0] != 'Y')) {
           std::fputs("recompress: aborted (nothing built)\n", stderr);
+          closeFds();
           return 2;
         }
       } else {
         std::fputs("recompress: refusing on a non-interactive stdin — rerun with --yes to "
                    "override\n",
                    stderr);
+        closeFds();
         return 2;
       }
     }
@@ -1156,15 +1189,24 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   if (static_cast<size_t>(jobs) > work.size())
     jobs = work.empty() ? 1 : static_cast<int>(work.size());
   std::atomic<size_t> next{0};
-  std::atomic<int> done{0}, skipped{preSkipped}, failed{0};
+  std::atomic<int> done{0}, skipped{preSkipped}, failed{0}, incomplete{0};
   std::atomic<uint64_t> totOverlay{0}, totPunched{0};
   std::atomic<uint64_t> decB{0}, decNs{0};
   std::atomic<size_t> processed{0};
+  std::atomic<bool> yielded{false};
   std::mutex outMu;
   const bool progress = mode == RecompressMode::kSweep && ::isatty(2);
   auto worker = [&] {
     ReplicaStore rs(io, cfg, store.stats());
     for (size_t i = next.fetch_add(1); i < work.size(); i = next.fetch_add(1)) {
+      // A sweep is waiting for this pass: stop claiming files. The remainder of
+      // the queue is dropped on purpose — the sweep about to run scans the
+      // whole cache, so it covers everything this batch had left, and the
+      // plugin re-queues at the next close regardless.
+      if (drain && sweepWants()) {
+        yielded = true;
+        break;
+      }
       size_t nDone = processed.fetch_add(1) + 1;
       if (progress)
         std::fprintf(stderr, "\rrecompress: %zu/%zu — %d recompressed, %d nothing to do, %d failed",
@@ -1210,9 +1252,18 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       tp::Overlay ov = tp::buildOverlay(fm, csrc, hot);
       ::close(fd);
       if (!ov.error.empty()) {
+        // "Not available" is not a failure: the entry is incompletely cached,
+        // or bytes were reclaimed under the build. It retries for free on the
+        // next pass, and calling it `build failed` in the log makes a run that
+        // in fact succeeded read like a broken one.
         std::lock_guard<std::mutex> g(outMu);
-        std::fprintf(stderr, "recompress: build failed: %s\n", ov.error.c_str());
-        ++failed;
+        if (ov.transient) {
+          std::fprintf(stderr, "recompress: not built yet, will retry: %s\n", ov.error.c_str());
+          ++incomplete;
+        } else {
+          std::fprintf(stderr, "recompress: build failed: %s\n", ov.error.c_str());
+          ++failed;
+        }
         continue;
       }
       ReplicaMeta meta = ov.meta;
@@ -1285,11 +1336,18 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   std::string codecs;
   for (const auto& codec : cfg.recompressCodecs)
     codecs += (codecs.empty() ? "" : ",") + codec;
-  char summary[512];
+  // `incomplete` is reported apart from both buckets: unlike "nothing to do"
+  // it may become work later, and unlike "failed" it is nobody's bug.
+  char incompleteSeg[96] = {0};
+  if (incomplete.load())
+    std::snprintf(incompleteSeg, sizeof incompleteSeg, ", %d incomplete (bytes not cached)",
+                  incomplete.load());
+  char summary[640];
   std::snprintf(summary, sizeof summary,
                 "recompress: %d recompressed, %d nothing to do (no fully-cached %s content, "
-                "or already recompressed), %d failed",
-                done.load(), skipped.load(), codecs.c_str(), failed.load());
+                "or already recompressed)%s, %d failed%s",
+                done.load(), skipped.load(), codecs.c_str(), incompleteSeg, failed.load(),
+                yielded.load() ? " — stopped early for a foreground sweep" : "");
   if (!drain) {
     std::printf("%s\n", summary);
     if (done.load())
@@ -1303,10 +1361,19 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   }
   if (drain && drainLog)
     drainLog << summary << "\n";
+  if (drain && yielded.load()) {
+    // Yielding: hand the lock over now. The punch below and the follow-on pass
+    // are both work the waiting sweep does itself, with the user's --jobs.
+    if (drainLog)
+      drainLog << "recompress: yielded to a foreground sweep\n";
+    closeFds();
+    return 0;
+  }
   if (drain) {
-    // Deferred punch: reclaim superseded v1 pages of replicas
-    // built by EARLIER drains — safe now (their runs have moved on; punching
-    // is crash-safe and v1 readers fail open to origin).
+    // Deferred punch: reclaim the superseded v1 pages of every replica in the
+    // cache, this pass's builds included — deferred to here, after the workers
+    // have joined, so that no build in this pass can be reading the pages it
+    // frees. Punching is crash-safe and v1 readers fail open to origin.
     uint64_t punched = 0;
     ReplicaStore rs(io, cfg, store.stats());
     for (const auto& e : store.listEntries()) {
@@ -1327,13 +1394,14 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     if (punched && drainLog)
       drainLog << "punched " << punched
                << (reclaimFull ? " v1 bytes (reclaim full)\n" : " superseded v1 bytes\n");
-    ::close(drainFd);
+    closeFds();
     // Entries queued while this batch built: claim them too (fresh lock).
     return cmdRecompress(store, cfg, io, jobs, RecompressMode::kDrain) == 0 &&
                    !(failed.load() && !done.load())
                ? 0
                : 1;
   }
+  closeFds();
   return failed.load() && !done.load() ? 1 : 0;
 #endif
 }
