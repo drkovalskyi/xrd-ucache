@@ -408,6 +408,7 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
     return fail("not a ROOT file");
   }
   fm.large = beGet<int32_t>(head.data() + 4) > 1000000;
+  fm.headerSeekWidth = fm.large ? 8 : 4;
   fm.fend = fm.large ? beGet<int64_t>(head.data() + 12) : beGet<int32_t>(head.data() + 12);
 
   // Root directory record at fBEGIN=100: key, TNamed payload, TDirectory
@@ -460,11 +461,9 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
     }
     fm.keyslistSeek = wide ? beGet<int64_t>(head.data() + q) : beGet<int32_t>(head.data() + q);
     fm.dirSeekKeysOff = q;
-    fm.seekWidth = wide ? 8 : 4;
-    if ((wide ? 8 : 4) != (fm.large ? 8 : 4)) {
-      ::close(fd);
-      return fail("directory/header width disagree");
-    }
+    // A narrow directory record under a 64-bit header is a valid layout, not a
+    // corrupt file: each width is used only where it applies (see FileMeta).
+    fm.dirSeekWidth = wide ? 8 : 4;
   }
 
   // Keys list: pick the live (highest-cycle) key named `tree`.

@@ -52,11 +52,19 @@ struct BranchInfo {
 };
 
 struct FileMeta {
-  bool large = false;
+  bool large = false; // 64-bit header layout (file version > 1000000)
   int64_t fend = 0;
   int64_t keyslistSeek = 0;
   uint64_t dirSeekKeysOff = 0; // file offset of the directory's fSeekKeys
-  int seekWidth = 8;           // 8 (large) or 4 — width of the two patch sites
+  // The file header and the root-directory record carry INDEPENDENT seek
+  // widths, and they are not required to agree. The header goes 64-bit once
+  // fEND passes 2 GB; the root directory record goes 64-bit only if its own
+  // three seeks (fSeekDir/fSeekParent/fSeekKeys) need it. A file that grew
+  // past 2 GB after its keys list had already been written keeps a narrow
+  // directory record pointing at an early keys list — a legitimate in-the-wild
+  // layout. Each width is therefore only valid at its own site.
+  int headerSeekWidth = 8; // fEND/fSeekFree in the header
+  int dirSeekWidth = 8;    // fSeekDir/fSeekParent/fSeekKeys in the directory
   KeyInfo treeKey;                // the live (highest-cycle) tree key
   std::vector<uint8_t> treeBlob;  // decompressed tree metadata
   std::vector<BranchInfo> branches;

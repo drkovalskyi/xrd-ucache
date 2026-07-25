@@ -1,8 +1,8 @@
 // Native overlay builder: re-encodes a hot branch
 // set's baskets to ZSTD-1 in an extension region, relocates the (patched)
-// tree metadata and keys list, and emits the replica overlay — byte-for-byte
-// the artifact the uproot-based reference builder produces (the differential
-// gate), ready for ReplicaStore::publish.
+// tree metadata, repoints the keys list at it in place, and emits the replica
+// overlay — byte-for-byte the artifact the uproot-based reference builder
+// produces (the differential gate), ready for ReplicaStore::publish.
 //
 // Sources: a plain file, or a v1 cache .data image where every range the
 // build touches must be PRESENT in the entry's bitmap (deriveHotBranches

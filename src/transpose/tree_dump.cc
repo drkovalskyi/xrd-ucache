@@ -29,9 +29,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "parse failed: %s\n", fm.error.c_str());
     return 1;
   }
-  std::printf("{\"file\":{\"large\":%s,\"fend\":%lld,\"keyslist_seek\":%lld},",
-              fm.large ? "true" : "false", static_cast<long long>(fm.fend),
-              static_cast<long long>(fm.keyslistSeek));
+  std::printf("{\"file\":{\"large\":%s,\"header_seek_width\":%d,\"dir_seek_width\":%d,"
+              "\"fend\":%lld,\"keyslist_seek\":%lld},",
+              fm.large ? "true" : "false", fm.headerSeekWidth, fm.dirSeekWidth,
+              static_cast<long long>(fm.fend), static_cast<long long>(fm.keyslistSeek));
   std::printf("\"tree_key\":{\"seek\":%lld,\"nbytes\":%d,\"objlen\":%d,\"keylen\":%d},",
               static_cast<long long>(fm.treeKey.seekkey), fm.treeKey.nbytes,
               fm.treeKey.objlen, fm.treeKey.keylen);

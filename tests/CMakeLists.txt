@@ -33,8 +33,8 @@ add_executable(ucache-unit-tests
 )
 target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing gtest gtest_main)
 target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin)
-if (TARGET ucache-transpose) # learner contract tests
-  target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc)
+if (TARGET ucache-transpose) # learner + seek-width contract tests
+  target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc)
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)
 endif()
 

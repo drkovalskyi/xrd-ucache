@@ -286,7 +286,8 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
     ext.insert(ext.end(), metaPayload.begin(), metaPayload.end());
     superseded.push_back({static_cast<uint64_t>(fm.treeKey.seekkey),
                           static_cast<uint64_t>(fm.treeKey.nbytes)});
-    // Keys-list record: patch the live tree entry + own fSeekKey, relocate.
+    // Keys-list record: repoint the live tree entry at the relocated metadata
+    // key, in place (same size, same offset — see below).
     // Probe clamped at fend: in a small file the record can sit closer than
     // 512 bytes to EOF (a strict Source fails a past-EOF read).
     std::vector<uint8_t> klHead(512);
@@ -330,35 +331,39 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
     }
     if (!patched)
       return fail("live tree entry not found in keys list");
-    const int64_t newKlSeek = extBase + static_cast<int64_t>(ext.size());
-    patchSeek(klist.data(), kl->ver, newKlSeek, ov.error);
-    if (!ov.error.empty())
-      return ov;
-    ext.insert(ext.end(), klist.begin(), klist.end());
-    superseded.push_back({static_cast<uint64_t>(fm.keyslistSeek),
-                          static_cast<uint64_t>(kl->nbytes)});
+    // The keys-list record stays WHERE IT IS: patching it never changes its
+    // size (only the live tree entry's fNbytes/fSeekKey), so it is served as an
+    // in-place patch window rather than relocated into the extension. Moving it
+    // would have to be published through the root directory's fSeekKeys, and
+    // that field is 32 bits wide whenever the directory record's own seeks fit
+    // in 32 bits — precisely the layout of a file that grew past 2 GB after its
+    // keys list was written, where the extension necessarily starts past 2 GiB
+    // and a 4-byte field cannot address it. Left in place, the directory record
+    // is never written at all and its width cannot matter.
+    if (fm.keyslistSeek < 100 || static_cast<uint64_t>(fm.keyslistSeek) + klist.size() >
+                                     static_cast<uint64_t>(extBase))
+      return fail("keys-list record does not lie inside the original file");
 
-    // The two in-place patch windows + the extension = the overlay.
-    const int w = fm.seekWidth;
+    // The in-place patch windows + the extension = the overlay. fEND is a
+    // HEADER field, so it is written at the header's width — never the
+    // directory's, which is independent (see FileMeta).
+    const int hw = fm.headerSeekWidth;
     const int64_t newFend = extBase + static_cast<int64_t>(ext.size());
-    if (w == 4 && newFend >= (1ll << 31))
+    if (hw == 4 && newFend >= (1ll << 31))
       return fail("small-layout file would grow past 2 GiB");
-    std::vector<uint8_t> hdrWin(w), dirWin(w);
-    if (w == 8) {
+    std::vector<uint8_t> hdrWin(hw);
+    if (hw == 8)
       bePut<int64_t>(hdrWin.data(), newFend);
-      bePut<int64_t>(dirWin.data(), newKlSeek);
-    } else {
+    else
       bePut<int32_t>(hdrWin.data(), static_cast<int32_t>(newFend));
-      bePut<int32_t>(dirWin.data(), static_cast<int32_t>(newKlSeek));
-    }
-    ov.tdata.reserve(2 * w + ext.size());
+    ov.tdata.reserve(hdrWin.size() + klist.size() + ext.size());
     ov.tdata.insert(ov.tdata.end(), hdrWin.begin(), hdrWin.end());
-    ov.tdata.insert(ov.tdata.end(), dirWin.begin(), dirWin.end());
+    ov.tdata.insert(ov.tdata.end(), klist.begin(), klist.end());
     ov.tdata.insert(ov.tdata.end(), ext.begin(), ext.end());
     ov.meta.extents = {
-        {12, static_cast<uint64_t>(w), 0},
-        {fm.dirSeekKeysOff, static_cast<uint64_t>(w), static_cast<uint64_t>(w)},
-        {static_cast<uint64_t>(extBase), ext.size(), static_cast<uint64_t>(2 * w)}};
+        {12, static_cast<uint64_t>(hw), 0},
+        {static_cast<uint64_t>(fm.keyslistSeek), klist.size(), static_cast<uint64_t>(hw)},
+        {static_cast<uint64_t>(extBase), ext.size(), static_cast<uint64_t>(hw) + klist.size()}};
     ov.meta.virtualSize = static_cast<uint64_t>(newFend);
   }
 
