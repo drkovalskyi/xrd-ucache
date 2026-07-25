@@ -352,9 +352,11 @@ ucache recompress          # complete coverage; prints what it did
 The background pass is still worth having: it costs the running analysis
 nothing measurable and does a useful fraction for free, which shortens the
 sweep. Check where you stand with `ucache status` (the `recompressed:` line) or
-per file with `ucache ls` (the `RECOMP` column), and read the sweep's own
-summary — if it says `0 recompressed … nothing to do`, your data's source codec
-is probably not in `recompress_codecs` (see Troubleshooting).
+per file with `ucache ls` (the `RECOMP` column). The sweep's own summary gives
+each outcome its own words — `recompressed`, `declined` (with the codec it found
+and the one-line fix), `already recompressed`, `incomplete`, `deferred`,
+`failed` — and `ucache doctor` will tell you why nothing is being built if that
+is what you are seeing (see Troubleshooting).
 
 Replicas coexist with the byte cache by default (only the ranges the replica
 physically replaced are punched). If disk space is tight, make replicas the
