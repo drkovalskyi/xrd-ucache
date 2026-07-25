@@ -67,6 +67,10 @@ struct Stats {
   std::atomic<uint64_t> hitDiskBytes{0};
   std::atomic<uint64_t> hitDiskSeq{0};        // preads starting at the previous pread's end
   std::atomic<uint64_t> replicaBytesServed{0}; // stitched bytes served from .tdata
+  std::atomic<uint64_t> replicaReads{0};      // physical .tdata preads (one per
+                                              // overlay page touched, so re-reads
+                                              // of a page count again — the byte
+                                              // tier's hitDiskReads analogue)
   std::atomic<uint64_t> relayBytes{0};        // pass-through serves (cache never touched)
   std::atomic<uint64_t> readvChunks{0};       // chunks across all vector reads
   std::atomic<uint64_t> readvMixed{0};        // vector reads containing hits AND misses
@@ -105,7 +109,8 @@ struct StatsTotals {
            replicaPunchedBytes = 0, replicaOrphansSwept = 0;
   // Workflow counters:
   uint64_t filesOpened = 0, ramHitBytes = 0, firstTouchBytes = 0, hitDiskReads = 0,
-           hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, relayBytes = 0,
+           hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
+           relayBytes = 0,
            readvChunks = 0, readvMixed = 0, flushRuns = 0, flushRunBytes = 0,
            bufferStalls = 0, bufferStallUs = 0;
   // Histogram bucket sums (log2 µs), for CLI percentile rendering:

@@ -63,6 +63,7 @@ bool ReplicaView::read(uint64_t tdataOff, uint64_t len, void* buf) {
   auto* out = static_cast<uint8_t*>(buf);
   for (uint64_t i = first; i <= last; ++i) {
     const uint32_t nbytes = meta_.pageBytes(i);
+    stats_.replicaReads.fetch_add(1, std::memory_order_relaxed);
     int64_t r = io_.preadFull(fd_, scratch.data(), nbytes, i * uint64_t(P));
     if (r != static_cast<int64_t>(nbytes) ||
         crc32c(scratch.data(), nbytes) != meta_.pageCrcs[i]) {

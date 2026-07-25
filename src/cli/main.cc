@@ -307,6 +307,10 @@ void printStats(const StatsTotals& t) {
                 human(t.hitDiskBytes / t.hitDiskReads).c_str(),
                 100.0 * static_cast<double>(t.hitDiskSeq) /
                     static_cast<double>(t.hitDiskReads));
+  if (t.replicaReads)
+    std::printf("  replica reads      %llu (mean %s)\n",
+                (unsigned long long)t.replicaReads,
+                human(t.replicaBytesServed / t.replicaReads).c_str());
   if (t.firstTouchBytes && t.hitBytes)
     std::printf("  re-read factor     %.1fx (first touch %s of %s byte-tier serves)\n",
                 static_cast<double>(t.hitBytes) / static_cast<double>(t.firstTouchBytes),

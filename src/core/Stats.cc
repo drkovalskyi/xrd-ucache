@@ -95,6 +95,7 @@ std::string Stats::toJsonBody() const {
   f("hit_disk_bytes", hitDiskBytes);
   f("hit_disk_seq", hitDiskSeq);
   f("replica_bytes_served", replicaBytesServed);
+  f("replica_reads", replicaReads);
   f("relay_bytes", relayBytes);
   f("readv_chunks", readvChunks);
   f("readv_mixed", readvMixed);
@@ -167,6 +168,7 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.hitDiskBytes += extractU64(last, "hit_disk_bytes");
     t.hitDiskSeq += extractU64(last, "hit_disk_seq");
     t.replicaBytesServed += extractU64(last, "replica_bytes_served");
+    t.replicaReads += extractU64(last, "replica_reads");
     t.relayBytes += extractU64(last, "relay_bytes");
     t.readvChunks += extractU64(last, "readv_chunks");
     t.readvMixed += extractU64(last, "readv_mixed");

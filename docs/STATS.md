@@ -21,7 +21,7 @@ consumers together.
  "replica_crc_failures": 0, "replica_punched_bytes": 0, "replica_orphans_swept": 0,
  "files_opened": 0, "ram_hit_bytes": 0, "first_touch_bytes": 0,
  "hit_disk_reads": 0, "hit_disk_bytes": 0, "hit_disk_seq": 0,
- "replica_bytes_served": 0, "relay_bytes": 0,
+ "replica_bytes_served": 0, "replica_reads": 0, "relay_bytes": 0,
  "readv_chunks": 0, "readv_mixed": 0,
  "flush_runs": 0, "flush_run_bytes": 0,
  "buffer_stalls": 0, "buffer_stall_us": 0,
@@ -64,7 +64,12 @@ consumers together.
   in-process lifetime (the rest are re-reads); `hit_disk_reads` /
   `hit_disk_bytes` / `hit_disk_seq` — byte-tier disk reads, their bytes, and
   how many continued sequentially from the previous read;
-  `replica_bytes_served` — bytes served from replica overlays; `relay_bytes`
+  `replica_bytes_served` / `replica_reads` — bytes served from replica
+  overlays and the physical `.tdata` preads that delivered them (one per
+  overlay page touched, so a page read for two different user reads counts
+  twice — the replica-tier analogue of `hit_disk_reads`; divide bytes by reads
+  for the mean read size, and reads by wall time for the op rate the storage
+  device actually sees); `relay_bytes`
   — pure pass-through, the cache never touched them; `readv_chunks` /
   `readv_mixed` — vector-read chunks seen / chunks in mixed hit+miss
   vectors; `flush_runs` / `flush_run_bytes` — coalesced fill-buffer pwrite
