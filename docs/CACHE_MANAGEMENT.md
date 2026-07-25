@@ -425,7 +425,13 @@ performance problems. Rules of thumb from the machines measured so far:
 random-read latency in *microseconds* = healthy local disk; *milliseconds*
 = network-backed storage where warm reads may not beat the origin — on
 such storage `recompress on` (sequential replica reads) matters far more,
-and a genuinely slow cache dir can be worse than no cache at all.
+and a genuinely slow cache dir can be worse than no cache at all. The gap is
+about read COUNT, not bytes: serving the same analysis from the byte cache took
+about 15× more read operations than serving it from replicas (measured, 4 KiB
+vs ~60 KiB per read), which is exactly the cost an IOPS-priced volume charges
+for. Where operations are the scarce resource, complete the recompression —
+a partly-replicated dataset still pays the byte-tier op count on whatever is
+left.
 
 ### Choosing a location: reference grades (from the 2026-07 fleet survey)
 
@@ -442,7 +448,7 @@ client; the origin scales, quota-capped volumes do not):
 | grade | test | action |
 |---|---|---|
 | GOOD | rand read (1 thr) p50 ≤ 0.5 ms | everything works at any core count; `recompress on` optional (CPU win) |
-| REPLICA-ONLY | 16-thr IOPS below ~3,000 BUT sequential read ≥ 300 MB/s | byte-cache hits LOSE to direct reads at full concurrency; usable only with `recompress on` (replicas serve sequentially and dodge the IOPS quota) |
+| REPLICA-ONLY | 16-thr IOPS below ~3,000 BUT sequential read ≥ 300 MB/s | byte-cache hits LOSE to direct reads at full concurrency; usable only with `recompress on` **and full coverage** (replicas serve sequentially and dodge the IOPS quota — but any file left unreplicated is still read at the quota-capped rate and paces the job, so finish with an explicit `ucache recompress`) |
 | BAD | 16-thr IOPS below ~3,000 AND sequential read < 300 MB/s | do not cache here — pick another disk or run uncached |
 
 Sanity checks at any grade: read-under-writeback p99 > 50 ms means fills

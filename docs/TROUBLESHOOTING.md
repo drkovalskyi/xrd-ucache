@@ -131,6 +131,59 @@ By default uCache uses the disk and evicts LRU to keep a free-space floor
 Note the byte cap is best-effort under extreme concurrent write rates; the
 free-disk floor is the hard guard against actually filling the volume.
 
+## `recompress = on` but no replicas ever appear
+
+The background builder is deliberately silent, so all three common causes look
+identical from the outside: nothing printed, no error, and `ucache status`
+showing `recompressed: none`. **Its only voice is `<cache-dir>/recompress.log`
+— read that file first.** In order of likelihood:
+
+1. **The source codec is not in `recompress_codecs`.** The default is `lzma`
+   only, so a ZLIB- or ZSTD-compressed dataset is declined in full, and the log
+   (or a foreground `ucache recompress`) says
+   `0 recompressed, N nothing to do (no fully-cached <codec> content, or already
+   recompressed)`. Check what your data actually uses with
+   `ucache branches <url>`, then add it:
+
+   ```sh
+   ucache set recompress_codecs zlib      # or lzma,zlib to cover both
+   ucache recompress
+   ```
+
+2. **The `ucache` CLI is not on `PATH`.** The plugin builds replicas by
+   spawning `ucache` itself, resolved from `PATH`. If it cannot be found, the
+   spawn still appears to succeed, so nothing is reported: `recompress.log`
+   stays **empty (0 bytes)** while `recompress.pending` keeps growing and no
+   replica is built. Make the CLI reachable by the process running your
+   analysis — `which ucache` from the same shell — or point at it explicitly
+   with `UCACHE_RECOMPRESS_HELPER=/path/to/ucache`.
+
+3. **Nothing qualifies yet.** Only branches your jobs actually read, fully
+   cached, are eligible. A first pass that was interrupted, or a file whose
+   needed baskets were never completely fetched, is skipped until the gaps fill.
+
+If replicas exist but you see no speedup, coverage is probably partial — see
+the recompression section of the User Guide: unreplicated files pace the loop,
+so finish with an explicit `ucache recompress`.
+
+## `build failed` lines in `recompress.log`
+
+Harmless in one specific case, and self-healing: an entry can be queued more
+than once (a program that opens each file twice queues it twice), and a later
+build attempt on an entry that is *already* replicated may try to read source
+bytes that the first build already reclaimed. It reports
+`build failed: <branch>: basket decompression failed` or `unexpected basket
+key`, then a subsequent pass or an explicit `ucache recompress` completes the
+work.
+
+Confirm rather than assume: check that coverage is complete
+(`ucache status` → `recompressed:`) and that serving is clean — `ucache stats`
+must show `crc_failures 0`, `failopen_events 0`, `validations_failed 0`. A
+replica is only ever served after it has been verified, so a failed *build*
+cannot produce wrong data. If instead the failures persist and coverage never
+completes, the file itself is likely unusual — report it with the branch name
+from the log.
+
 ## Corruption / CRC
 
 Every cached page carries a CRC32C, verified on read; a mismatch quarantines that

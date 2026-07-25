@@ -325,14 +325,36 @@ ucache set recompress on   # or `recompress = on` in ucache.conf as your default
 ```
 
 With it on, each file's replica is built by a detached, nice'd background
-worker right after your job closes it — typically ready before your next run,
-with no commands ever typed and nothing printed to your terminal (log:
-`<cache-dir>/recompress.log`; totals: `ucache status`). With it off (the
-default), nothing is ever built in the background; `ucache recompress` runs
-one foreground sweep over what is already cached, with live progress. In both
-cases only branches whose source codec is in `recompress_codecs` (default
-`lzma`) are transcoded — recompressing already-fast codecs would waste CPU
-and disk — and only branches your runs actually read, fully cached, qualify.
+worker right after your job closes it, with no commands ever typed and nothing
+printed to your terminal (log: `<cache-dir>/recompress.log`; totals:
+`ucache status`). With it off (the default), nothing is ever built in the
+background; `ucache recompress` runs one foreground sweep over what is already
+cached, with live progress. In both cases only branches whose source codec is
+in `recompress_codecs` (default `lzma`) are transcoded — recompressing
+already-fast codecs would waste CPU and disk — and only branches your runs
+actually read, fully cached, qualify.
+
+**On a large dataset, finish the job with one explicit sweep.** Background
+building is deliberately unobtrusive — nice'd, two jobs at a time — so it is
+opportunistic, not a guarantee: measured over a 787-file dataset, only about a
+quarter of the replicas existed by the time the analysis pass ended. That
+matters because **partial coverage buys little or nothing**: the files that
+still lack a replica are read from the byte cache and pace the whole loop, so a
+half-recompressed dataset can run no faster than an unrecompressed one. The
+reliable recipe is therefore both halves:
+
+```sh
+ucache set recompress on   # build opportunistically while jobs run
+# … run your analysis once (fills the cache) …
+ucache recompress          # complete coverage; prints what it did
+```
+
+The background pass is still worth having: it costs the running analysis
+nothing measurable and does a useful fraction for free, which shortens the
+sweep. Check where you stand with `ucache status` (the `recompressed:` line) or
+per file with `ucache ls` (the `RECOMP` column), and read the sweep's own
+summary — if it says `0 recompressed … nothing to do`, your data's source codec
+is probably not in `recompress_codecs` (see Troubleshooting).
 
 Replicas coexist with the byte cache by default (only the ranges the replica
 physically replaced are punched). If disk space is tight, make replicas the
