@@ -838,7 +838,20 @@ TEST(CacheStore, EvictNowDropsListedArtifactsWithEntry) {
 // the configuration almost every user runs. That is not hypothetical: it shipped.
 TEST(CacheStoreBudget, EffectiveFloorIsAnswerableBeforeResolution) {
   ucache::test::TempDir td;
-  ucache::RealIO io;
+  // The automatic floor is clamped by the volume's FREE space, so asking twice
+  // on a live disk can legitimately give two different answers — and the
+  // assertion below is about the two code paths computing the same thing from
+  // the same inputs, not about the disk holding still. Freezing the answer is
+  // what makes that assertion mean something: it failed on a busy CI runner
+  // with the two samples 4 KiB apart.
+  struct FrozenSpaceIO : ucache::RealIO {
+    int spaceInfo(const std::string&, uint64_t& availBytes,
+                  uint64_t& totalBytes) override {
+      availBytes = 40ull << 30;
+      totalBytes = 100ull << 30;
+      return 0;
+    }
+  } io;
   ucache::Config cfg;
   cfg.cacheDir = td.path();
   cfg.budgetAuto = true; // what Config::fromEnv sets when max_bytes is unset

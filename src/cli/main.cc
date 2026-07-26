@@ -596,9 +596,15 @@ struct InFlightClaim {
 // cost of guessing high is a build deferred, of guessing low an eviction storm.
 // Shared by the sweep's up-front pre-flight and the drainer's per-file budget so
 // the two can never disagree about what "will not fit" means.
+// Guarded because both callers are: a build without the codec libraries has no
+// transposer, nothing to estimate for, and -Werror=unused-function turns an
+// unused helper into a hard build failure. That configuration is what the
+// sanitizer, coverage, crash-suite and clean-install jobs build.
+#ifdef UCACHE_HAVE_TRANSPOSE
 static uint64_t estimatedReplicaBytes(uint64_t cachedBytes) {
   return cachedBytes + (cachedBytes * 2) / 5; // 1.4x
 }
+#endif
 
 // Free bytes above the eviction floor: what a pass may consume before LRU
 // starts evicting. `~0ull` (unlimited) when eviction is disabled or the volume
