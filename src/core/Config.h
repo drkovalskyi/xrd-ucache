@@ -99,6 +99,11 @@ struct Config {
   // demand (fail-open). For space-tight replica-primary setups.
   enum class Reclaim { kSuperseded, kFull };
   Reclaim recompressReclaim = Reclaim::kSuperseded; // UCACHE_RECOMPRESS_RECLAIM
+  // Background transcode jobs during a fill pass. 0 = auto, which is
+  // min(cores/2, threads/2) of the process doing the reading; a fixed small
+  // number reached only 8-18% coverage on a large corpus, and the right share
+  // depends on how much of the machine the analysis is actually using.
+  int recompressDrainJobs = 0;                   // UCACHE_RECOMPRESS_DRAIN_JOBS
   // `trace = io` writes a sampled per-operation JSON trace
   // next to the process's stats file; `trace_sample = N` records every Nth
   // read-class op (1 = everything). Off ("") by default — zero cost.

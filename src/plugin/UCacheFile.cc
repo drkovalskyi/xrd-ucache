@@ -19,6 +19,8 @@ extern char** environ; // POSIX (glibc: not declared without _GNU_SOURCE)
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <algorithm>
+#include <dirent.h>
 #include <thread>
 
 namespace ucache {
@@ -1268,6 +1270,33 @@ std::shared_ptr<ReplicaView> UCacheFile::currentView() const {
 // --drain`) is spawned, rate-limited per process. The helper is our own CLI:
 // found via UCACHE_RECOMPRESS_HELPER (tests) or PATH.
 // Runs on the executor, never on the Close path itself.
+// Background transcode jobs: min(cores/2, threads/2), overridable.
+// `threads` is this process's own thread count -- /proc/self/task on Linux,
+// where the analysis's worker pool is visible. Without that we can only see the
+// machine, and a 4-thread job on a 384-thread host would size itself as if it
+// owned the box. Falls back to the core count where /proc is absent.
+int drainJobs(const Config& cfg) {
+  if (cfg.recompressDrainJobs > 0)
+    return cfg.recompressDrainJobs; // explicit override wins, including "1"
+  unsigned cores = std::thread::hardware_concurrency();
+  if (cores == 0)
+    cores = 2;
+  unsigned threads = cores;
+#ifdef __linux__
+  if (DIR* d = ::opendir("/proc/self/task")) {
+    unsigned n = 0;
+    while (struct dirent* e = ::readdir(d))
+      if (e->d_name[0] != '.')
+        ++n;
+    ::closedir(d);
+    if (n > 0)
+      threads = n;
+  }
+#endif
+  unsigned jobs = std::min(cores / 2, threads / 2);
+  return static_cast<int>(jobs < 1 ? 1 : jobs);
+}
+
 void queueRecompress(const std::string& url, const Config& cfg) {
   auto key = UrlKey::parse(url, cfg.keepCgi);
   if (!key)
@@ -1319,7 +1348,21 @@ void queueRecompress(const std::string& url, const Config& cfg) {
     return;
   const std::string& exe = *helperExe; // resolved and checked above; outlives exit
   pid_t pid = 0;
-  const char* argv[] = {exe.c_str(), "recompress", "--drain", nullptr};
+  // How many transcodes the background drainer may run. A fixed two was far too
+  // few at scale: measured on a 1456-file corpus it reached only 8-18% coverage
+  // by the end of the fill pass, pushing the remainder into a ~400 s foreground
+  // sweep -- the "build it while you work" model barely functioning.
+  //
+  // A fill pass is origin-bound, not CPU-bound: sampling a 384-thread host
+  // during remote-read legs showed only 12-20 threads running. So roughly half
+  // the thread budget is genuinely idle exactly when replicas need building,
+  // and that is what we claim: min(cores/2, threads/2), where `threads` is THIS
+  // process's own thread count (the analysis we are running inside).
+  // Deliberately a share of the caller, not of the machine -- a small job on a
+  // big host must not spawn a machine-sized drainer.
+  const std::string jobsArg = std::to_string(drainJobs(cfg));
+  const char* argv[] = {exe.c_str(), "recompress", "--drain",
+                        "--jobs", jobsArg.c_str(), nullptr};
   // Fully detach the drainer from the user's terminal: stdin from
   // /dev/null, stdout+stderr appended to recompress.log — a background worker
   // must never print onto whatever the user is doing. Spawn proceeds without

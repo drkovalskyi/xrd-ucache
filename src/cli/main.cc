@@ -3123,8 +3123,15 @@ int main(int argc, char** argv) {
     }
     if (jobs < 1)
       jobs = 1;
-    if (mode == RecompressMode::kDrain)
-      jobs = std::min(jobs, 2); // background: bounded
+    if (mode == RecompressMode::kDrain) {
+      // The spawning plugin sizes this from its own thread count
+      // (min(cores/2, threads/2)); a fixed clamp of 2 here was what limited
+      // background coverage to 8-18% of a large corpus. Still bounded, so a
+      // hand-typed --drain cannot oversubscribe the machine.
+      unsigned hw = std::thread::hardware_concurrency();
+      int cap = hw ? static_cast<int>(hw) : 4;
+      jobs = std::min(jobs, cap);
+    }
     return cmdRecompress(store, cfg, io, jobs, mode, yes);
   }
   std::fprintf(stderr, "unknown command: %s\n", cmd.c_str());

@@ -170,6 +170,16 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompress = truthy(v);
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
+  else if (k == "recompress_drain_jobs") {
+    // 0 (or unset) = auto: min(cores/2, threads/2) of the reading process.
+    long n = std::strtol(v.c_str(), nullptr, 10);
+    if (n < 0) {
+      UCACHE_WARN("%s: recompress_drain_jobs '%s' must be >= 0 (0 = auto); ignored", src,
+                  v.c_str());
+      return false;
+    }
+    c.recompressDrainJobs = static_cast<int>(n);
+  }
   else if (k == "recompress_reclaim") {
     if (v == "superseded")
       c.recompressReclaim = Config::Reclaim::kSuperseded;
@@ -336,6 +346,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
+      {"recompress_drain_jobs", "UCACHE_RECOMPRESS_DRAIN_JOBS"},
       {"trace", "UCACHE_TRACE"},
       {"trace_sample", "UCACHE_TRACE_SAMPLE"},
       {"keep_cgi", "UCACHE_KEEP_CGI"},
@@ -418,6 +429,8 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(transpose);
   if (key == "recompress")
     return onoff(recompress);
+  if (key == "recompress_drain_jobs")
+    return std::to_string(recompressDrainJobs);
   if (key == "recompress_codecs")
     return join(recompressCodecs);
   if (key == "recompress_reclaim")
