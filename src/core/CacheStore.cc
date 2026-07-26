@@ -59,6 +59,17 @@ CacheStore::CacheStore(IOBackend& io, Config cfg) : io_(io), cfg_(std::move(cfg)
   resolveBudget();
 }
 
+uint64_t CacheStore::effectiveMinFree(const Config& cfg, IOBackend& io) {
+  if (cfg.minFreeBytes)
+    return cfg.minFreeBytes; // explicit, or already resolved
+  if (!cfg.budgetAuto)
+    return 0; // eviction off, or a byte cap governs instead
+  uint64_t avail = 0, total = 0;
+  if (io.spaceInfo(cfg.cacheDir, avail, total) == 0 && avail > 0 && total > 0)
+    return std::min<uint64_t>(std::min<uint64_t>(50ull << 30, total / 10), avail / 2);
+  return 10ull << 30; // statvfs unavailable: the same fixed floor eviction uses
+}
+
 void CacheStore::resolveBudget() {
   // Default policy: use the disk, evict at a free-space floor — no
   // fixed byte cap unless the user set UCACHE_MAX_BYTES. A heavy active session
@@ -66,19 +77,16 @@ void CacheStore::resolveBudget() {
   // fromEnv only when UCACHE_MAX_BYTES is unset; programmatic Config keeps full
   // manual control.
   if (cfg_.budgetAuto && cfg_.minFreeBytes == 0) {
+    // Leave min(50 GiB, 10% of total) free: a fixed cap so big disks stay
+    // mostly usable, a proportion so small disks keep sane headroom. Clamped
+    // to <= half of free-at-init so a shared/near-full FS doesn't thrash
+    // (evicting our own contribution can always get back above the floor).
     uint64_t avail = 0, total = 0;
-    if (io_.spaceInfo(cfg_.cacheDir, avail, total) == 0 && avail > 0 && total > 0) {
-      // Leave min(50 GiB, 10% of total) free: a fixed cap so big disks stay
-      // mostly usable, a proportion so small disks keep sane headroom. Clamped
-      // to <= half of free-at-init so a shared/near-full FS doesn't thrash
-      // (evicting our own contribution can always get back above the floor).
-      uint64_t headroom = std::min<uint64_t>(50ull << 30, total / 10);
-      cfg_.minFreeBytes = std::min<uint64_t>(headroom, avail / 2);
-    } else {
-      cfg_.minFreeBytes = 10ull << 30; // statvfs unavailable/full: fixed floor
+    const bool haveSpace = io_.spaceInfo(cfg_.cacheDir, avail, total) == 0 && avail > 0 && total > 0;
+    cfg_.minFreeBytes = effectiveMinFree(cfg_, io_);
+    if (!haveSpace)
       UCACHE_WARN("statvfs unavailable at init; using fixed %llu-byte free-disk floor",
                   static_cast<unsigned long long>(cfg_.minFreeBytes));
-    }
     UCACHE_INFO("auto eviction: free-disk floor minFreeBytes=%llu (no byte cap)",
                 static_cast<unsigned long long>(cfg_.minFreeBytes));
   }

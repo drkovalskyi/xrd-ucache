@@ -33,9 +33,11 @@ add_executable(ucache-unit-tests
 )
 target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing gtest gtest_main)
 target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin)
-if (TARGET ucache-transpose) # learner + seek-width contract tests
-  target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc)
+if (TARGET ucache-transpose) # learner + seek-width + hole-verification contracts
+  target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc
+                 unit/transpose_hole_test.cc)
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)
+  target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/cli) # CacheSource.h
 endif()
 
 add_executable(ucache-crash-harness crash/crash_harness.cc)

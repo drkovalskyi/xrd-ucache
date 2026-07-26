@@ -133,56 +133,73 @@ free-disk floor is the hard guard against actually filling the volume.
 
 ## `recompress = on` but no replicas ever appear
 
-The background builder is deliberately silent, so all three common causes look
-identical from the outside: nothing printed, no error, and `ucache status`
-showing `recompressed: none`. **Its only voice is `<cache-dir>/recompress.log`
-— read that file first.** In order of likelihood:
+**Ask the tools first — they diagnose this for you:**
+
+```sh
+ucache doctor      # names the cause, and exits nonzero on it
+ucache status      # queue depth + the reason, cheaply
+```
+
+`doctor` reports `recompress = on but no replicas exist (N queued)` together with
+the specific cause. Full detail always lands in `<cache-dir>/recompress.log`, but
+you should no longer need to read it to find out *why* nothing happened. The
+causes, in order of likelihood:
 
 1. **The source codec is not in `recompress_codecs`.** The default is `lzma`
-   only, so a ZLIB- or ZSTD-compressed dataset is declined in full, and the log
-   (or a foreground `ucache recompress`) says
-   `0 recompressed, N nothing to do (no fully-cached <codec> content, or already
-   recompressed)`. Check what your data actually uses with
-   `ucache branches <url>`, then add it:
+   only, so a ZLIB- or ZSTD-compressed dataset is declined in full. A sweep says
+   so in as many words, naming the codec it actually found and the fix:
 
-   ```sh
-   ucache set recompress_codecs zlib      # or lzma,zlib to cover both
-   ucache recompress
+   ```
+   recompress: 0 recompressed, 9 declined (source codec zlib, not in recompress_codecs = lzma), 0 nothing to do (nothing cached), 0 failed
+     nothing was recompressed: this cache holds zlib content, but recompress_codecs = lzma.
+     to transcode it:  ucache set recompress_codecs zlib
    ```
 
-2. **The `ucache` CLI is not on `PATH`.** The plugin builds replicas by
-   spawning `ucache` itself, resolved from `PATH`. If it cannot be found, the
-   spawn still appears to succeed, so nothing is reported: `recompress.log`
-   stays **empty (0 bytes)** while `recompress.pending` keeps growing and no
-   replica is built. Make the CLI reachable by the process running your
-   analysis — `which ucache` from the same shell — or point at it explicitly
-   with `UCACHE_RECOMPRESS_HELPER=/path/to/ucache`.
+   `ucache branches <url>` shows the codec per branch if you want to look first.
 
-3. **Nothing qualifies yet.** Only branches your jobs actually read, fully
+2. **The `ucache` CLI is not reachable.** The plugin builds replicas by spawning
+   `ucache` itself, resolved from `PATH`. When it cannot be found you get one
+   warning — ``recompress is on but the `ucache` helper is not executable`` — and
+   nothing is queued, since nothing could drain it. Either make the CLI reachable
+   by the process running your analysis (`which ucache` from the same shell), or
+   point at it explicitly with `UCACHE_RECOMPRESS_HELPER=/path/to/ucache`. An
+   explicit `ucache recompress` needs no helper and works regardless.
+
+3. **There is no headroom above the eviction floor.** Background builds are
+   declined rather than pushing your cache into eviction, and the log records
+   what was deferred and by how much. Free some space, or set
+   `recompress_reclaim = full` so replicas replace byte copies instead of adding
+   to them. See "The cache is filling my disk".
+
+4. **Nothing qualifies yet.** Only branches your jobs actually read, fully
    cached, are eligible. A first pass that was interrupted, or a file whose
-   needed baskets were never completely fetched, is skipped until the gaps fill.
+   needed baskets were never completely fetched, is reported as `incomplete` and
+   retried on a later pass.
 
 If replicas exist but you see no speedup, coverage is probably partial — see
 the recompression section of the User Guide: unreplicated files pace the loop,
 so finish with an explicit `ucache recompress`.
 
-## `build failed` lines in `recompress.log`
+## `failed` vs `incomplete` vs `deferred` in `recompress.log`
 
-Harmless in one specific case, and self-healing: an entry can be queued more
-than once (a program that opens each file twice queues it twice), and a later
-build attempt on an entry that is *already* replicated may try to read source
-bytes that the first build already reclaimed. It reports
-`build failed: <branch>: basket decompression failed` or `unexpected basket
-key`, then a subsequent pass or an explicit `ucache recompress` completes the
-work.
+Only `failed` means something is wrong. The others are ordinary states with
+their own words, because conflating them made healthy runs look broken:
 
-Confirm rather than assume: check that coverage is complete
-(`ucache status` → `recompressed:`) and that serving is clean — `ucache stats`
-must show `crc_failures 0`, `failopen_events 0`, `validations_failed 0`. A
-replica is only ever served after it has been verified, so a failed *build*
-cannot produce wrong data. If instead the failures persist and coverage never
-completes, the file itself is likely unusual — report it with the branch name
-from the log.
+- **`incomplete (bytes not cached)`** — the builder wanted basket bytes the cache
+  could not vouch for: not fetched yet, or reclaimed while the build was running.
+  It retries for free on the next pass and needs no action. The message reads
+  `not built yet, will retry`.
+- **`deferred (no space)`** — no headroom above the eviction floor; the entry
+  stays queued for a pass that has room. See cause 3 above.
+- **`declined (source codec …)`** — working as configured; see cause 1 above.
+- **`failed`** — a real build failure: a malformed file, a cache entry whose
+  bytes no longer match their checksum (the message then points at
+  `ucache verify`), or an entry that has gone missing. The message names the
+  branch when the failure is specific to one. A failed *build* cannot produce wrong data: a replica
+  is only ever served after it has been verified. Confirm serving is clean with
+  `ucache stats` — `crc_failures 0`, `failopen_events 0`, `validations_failed 0`.
+  If failures persist for the same file and coverage never completes, report it
+  with the branch name from the log.
 
 ## Corruption / CRC
 

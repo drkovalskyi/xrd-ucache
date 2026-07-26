@@ -185,6 +185,13 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
     ov.error = std::move(why);
     return ov;
   };
+  // The source could not vouch for bytes we need: retryable, not a verdict on
+  // the file (see Overlay::transient).
+  auto unavailable = [&](std::string why) {
+    ov.transient = true;
+    ov.error = std::move(why);
+    return ov;
+  };
   if (!fm.error.empty())
     return fail("parse: " + fm.error);
 
@@ -206,10 +213,12 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
       const uint64_t off = static_cast<uint64_t>(b->basketSeek[i]);
       const uint64_t nb = static_cast<uint64_t>(b->basketBytes[i]);
       if (!src.has(off, nb))
-        return fail(name + ": basket " + std::to_string(i) + " not available");
+        return unavailable(name + ": basket " + std::to_string(i) + " not available");
       std::vector<uint8_t> rec(nb);
+      // A verifying source also fails here when the bytes were reclaimed or
+      // rotted after the coverage check above — same retryable condition.
       if (!src.read(rec.data(), nb, off))
-        return fail(name + ": basket read failed");
+        return unavailable(name + ": basket " + std::to_string(i) + " no longer readable");
       auto k = parseKey(rec.data(), rec.size(), 0);
       if (!k || k->cls != "TBasket" || k->name != name)
         return fail(name + ": unexpected basket key");
@@ -229,8 +238,9 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
         ov.decodeNs += static_cast<uint64_t>(t1.tv_sec - t0.tv_sec) * 1000000000ull +
                        static_cast<uint64_t>(t1.tv_nsec - t0.tv_nsec);
         auto pay = zstdFrames(raw.data(), raw.size(), 1);
-        if (pay.empty())
-          return fail(name + ": zstd encode failed");
+        if (pay.empty()) // an encoder failure is environmental (e.g. OOM), so
+                         // the file is still buildable on a later pass
+          return unavailable(name + ": zstd encode failed");
         if (pay.size() >= raw.size()) { // must shrink below fObjlen, else raw
           pay = std::move(raw);
           ++ov.fallbackRaw;
@@ -270,7 +280,7 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
     std::vector<uint8_t> mkey(fm.treeKey.keylen);
     if (!src.has(fm.treeKey.seekkey, fm.treeKey.nbytes) ||
         !src.read(mkey.data(), mkey.size(), fm.treeKey.seekkey))
-      return fail("tree key header not available");
+      return unavailable("tree key header not available");
     ov.metaRawBytes = blob.size();
     std::vector<uint8_t> metaPayload = zstdFrames(blob.data(), blob.size(), kMetaZstdLevel);
     if (metaPayload.empty() || metaPayload.size() >= blob.size())
@@ -295,8 +305,11 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
                          ? std::min<uint64_t>(klHead.size(),
                                               static_cast<uint64_t>(fm.fend - fm.keyslistSeek))
                          : 0;
-    if (probe == 0 || !src.read(klHead.data(), probe, fm.keyslistSeek))
-      return fail("keys-list header read failed");
+    if (probe == 0) // geometry, not availability: fEND lies at or below the
+                    // keys list, so no later pass can make this file buildable
+      return fail("keys-list lies at or past the end of the file");
+    if (!src.read(klHead.data(), probe, fm.keyslistSeek))
+      return unavailable("keys-list header not readable");
     auto kl = parseKey(klHead.data(), probe, 0);
     if (!kl)
       return fail("keys-list key parse failed");
@@ -307,7 +320,7 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
     std::vector<uint8_t> klist(kl->nbytes);
     if (!src.has(fm.keyslistSeek, kl->nbytes) ||
         !src.read(klist.data(), klist.size(), fm.keyslistSeek))
-      return fail("keys-list not available");
+      return unavailable("keys-list not available");
     size_t at = kl->keylen;
     int32_t nkeys = 0;
     std::memcpy(&nkeys, klist.data() + at, 4);

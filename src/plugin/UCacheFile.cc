@@ -1,5 +1,6 @@
 #include "UCacheFile.h"
 
+#include "HelperPath.h"
 #include "Executor.h"
 #include "Log.h"
 #include "OpenRetry.h"
@@ -1265,13 +1266,34 @@ std::shared_ptr<ReplicaView> UCacheFile::currentView() const {
 // At Close, an entry with cached data and no replica gets its URL appended to
 // <dir>/recompress.pending, and a nice'd drainer helper (`ucache recompress
 // --drain`) is spawned, rate-limited per process. The helper is our own CLI:
-// found via UCACHE_RECOMPRESS_HELPER (tests) or PATH; absent helper = the
-// queue simply waits for the next `ucache recompress` (fail-open, as ever).
+// found via UCACHE_RECOMPRESS_HELPER (tests) or PATH.
 // Runs on the executor, never on the Close path itself.
 void queueRecompress(const std::string& url, const Config& cfg) {
   auto key = UrlKey::parse(url, cfg.keepCgi);
   if (!key)
     return;
+  // No helper, no queueing: nothing in this process could ever drain the queue,
+  // so appending to it would only grow a file nobody reads. An explicit
+  // `ucache recompress` does not read the queue either — it scans the cache — so
+  // no work is lost by declining to record it. Warn once, with the remedy.
+  static std::atomic<bool> warned{false};
+  // Resolved once per process, and the path is deliberately LEAKED. This runs on
+  // the executor, so it can run while the process is tearing down — after a
+  // destructible static would have been destroyed. argv[0] points into this
+  // string, and a dangling argv[0] makes the exec fail in a detached child that
+  // nobody waits for: silently, which is the exact failure the check below
+  // exists to report. Same rule as the other cross-shutdown singletons here.
+  static std::string* helperExe = new std::string();
+  static const bool haveHelper = recompressHelperResolvable(*helperExe);
+  if (!haveHelper) {
+    if (!warned.exchange(true))
+      UCACHE_WARN("recompress is on but the `ucache` helper is not executable "
+                  "(%s): no replicas will be built in the background. Put ucache on PATH, "
+                  "or set UCACHE_RECOMPRESS_HELPER to its full path. "
+                  "`ucache recompress` still works by hand.",
+                  helperExe->c_str());
+    return;
+  }
   struct ::stat st;
   if (::stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir).c_str(), &st) == 0)
     return; // replica already exists
@@ -1295,8 +1317,7 @@ void queueRecompress(const std::string& url, const Config& cfg) {
     return;
   if (!lastSpawn.compare_exchange_strong(prev, now))
     return;
-  const char* helper = ::getenv("UCACHE_RECOMPRESS_HELPER");
-  std::string exe = helper && *helper ? helper : "ucache";
+  const std::string& exe = *helperExe; // resolved and checked above; outlives exit
   pid_t pid = 0;
   const char* argv[] = {exe.c_str(), "recompress", "--drain", nullptr};
   // Fully detach the drainer from the user's terminal: stdin from

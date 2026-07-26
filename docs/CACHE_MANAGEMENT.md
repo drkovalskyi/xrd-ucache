@@ -312,6 +312,22 @@ asks for confirmation when it would not fit (`--yes` to override in scripts;
 on a non-tty it refuses without it). Check where you stand any time with the
 `headroom` line in `ucache status`.
 
+**Background recompression never evicts.** With `recompress = on` the builds
+run in a detached worker while your job is reading, so there is nobody to ask:
+that worker checks each file against the same headroom and simply declines the
+ones that would not fit, leaving them queued for a later pass — one that has
+room because you freed some, or because `recompress_reclaim = full` handed a
+byte copy back. It records what it deferred, and why, in
+`<cache dir>/recompress.log`. So `recompress = on` cannot be the reason a
+volume crosses its free-disk floor; if you want the coverage that a tight volume
+will not give you, free space first and then run `ucache recompress` explicitly.
+
+One exception, stated plainly: the check is against the **free-disk floor**. If
+you cap the cache with `max_bytes` and set no `min_free_bytes`, eviction runs on
+the byte cap instead, which this check cannot see — background builds are then
+ungoverned, and the worker says so once in its log. Set `min_free_bytes` as well
+if you want background recompression bounded on such a cache.
+
 With `recompress_reclaim = full`, every pass that builds or finds a valid
 replica drops that entry's **entire** byte-cache copy (holes are punched, so
 the space is back immediately — watch the `cached` line in `ucache status`
