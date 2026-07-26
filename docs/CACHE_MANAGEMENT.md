@@ -434,10 +434,14 @@ That leaves a difference the two tiers cannot share. The byte cache stores the
 file in its original layout, so a read can only be as large as the client's
 request — and the next thing that analysis wants usually sits elsewhere in the
 file, behind data it did not ask for. A replica stores each branch's data
-contiguously, so consecutive reads land next to each other and one operation
-can cover several of them. Where operations are the scarce resource, that is
-the reason to complete the recompression — and a partly-replicated dataset
-still reads the remainder out of the original layout.
+contiguously, so consecutive reads land next to each other and one operation can
+cover several of them. Measured on the same analysis over the same 787-file
+dataset, serving it warm from each tier: the byte cache issued **2.38 M reads
+averaging 42 KiB**, the replica tier **170 k averaging 563 KiB** — about **14×
+more operations for the same work**, which is exactly the cost an IOPS-priced
+volume charges for. Where operations are the scarce resource, that is the reason
+to complete the recompression — and a partly-replicated dataset still reads the
+remainder out of the original layout.
 
 ### Choosing a location: reference grades (from the 2026-07 fleet survey)
 
