@@ -444,6 +444,81 @@ TEST(FileEntry, HitReadsCoalesceIntoOnePreadPerRun) {
   EXPECT_FALSE(e->readCached(0, 8 * 4096, buf.data()));
 }
 
+// The coalescing cap splits a long run: a 3 MiB contiguous read cannot be one
+// pread, and the pieces must be cap-sized (the byte tier's own cap arithmetic —
+// the replica tier has a separate test for its side).
+TEST(FileEntry, CoalescedRunsAreCappedAtOneMiB) {
+  const uint64_t kCap = 1u << 20;
+  Fixture fx(3 * kCap);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 3 * kCap, fx.src.data());
+  e->flushAll();
+
+  std::vector<uint8_t> buf(3 * kCap);
+  ASSERT_TRUE(e->readCached(0, 3 * kCap, buf.data()));
+  EXPECT_EQ(fx.stats.hitDiskReads.load(), 3u); // not 1, not 768
+  EXPECT_EQ(fx.stats.hitDiskBytes.load(), 3u * kCap);
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data(), 3 * kCap));
+}
+
+// A truncated .data file must cost only the pages that were really lost. A
+// coalesced read cannot tell which page came up short, so it re-reads the run
+// page by page rather than discarding the whole megabyte — the pre-coalescing
+// blast radius, and one crc_failure per genuinely bad page.
+TEST(FileEntry, ShortReadDemotesOnlyThePagesItLost) {
+  Fixture fx(16 * 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 16 * 4096, fx.src.data());
+  e->flushAll();
+  e.reset();
+
+  // Truncate the .data file after page 9: pages 10-15 are gone.
+  const std::string dataPath = fx.key.objectDir(fx.cfg.cacheDir) + "/" + fx.key.hashHex + ".data";
+  ASSERT_EQ(0, ::truncate(dataPath.c_str(), 10 * 4096));
+
+  auto e2 = fx.open();
+  ASSERT_TRUE(e2);
+  std::vector<uint8_t> buf(16 * 4096);
+  EXPECT_FALSE(e2->readCached(0, 16 * 4096, buf.data()));
+  // Pages 0-9 survive and still serve; only the 6 lost pages were demoted.
+  EXPECT_TRUE(e2->hasRange(0, 10 * 4096));
+  EXPECT_FALSE(e2->hasRange(10 * 4096, 4096));
+  EXPECT_EQ(fx.stats.crcFailures.load(), 6u); // one per lost page, not one per run
+  EXPECT_TRUE(e2->readCached(0, 10 * 4096, buf.data()));
+}
+
+// A request that fails must not consume first-touch attribution for bytes it
+// never served: the refetch that follows is what serves them first.
+TEST(FileEntry, FailedReadDoesNotConsumeFirstTouch) {
+  Fixture fx(16 * 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 8 * 4096, fx.src.data());
+  e->flushAll();
+  e.reset();
+
+  // Corrupt page 3 of the 8-page run.
+  const std::string dataPath = fx.key.objectDir(fx.cfg.cacheDir) + "/" + fx.key.hashHex + ".data";
+  int fd = ::open(dataPath.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  uint8_t b = 0;
+  ASSERT_EQ(1, ::pread(fd, &b, 1, 3 * 4096 + 11));
+  b ^= 0xff;
+  ASSERT_EQ(1, ::pwrite(fd, &b, 1, 3 * 4096 + 11));
+  ::close(fd);
+
+  auto e2 = fx.open();
+  ASSERT_TRUE(e2);
+  std::vector<uint8_t> buf(8 * 4096);
+  EXPECT_FALSE(e2->readCached(0, 8 * 4096, buf.data()));
+  EXPECT_EQ(fx.stats.firstTouchBytes.load(), 0u); // nothing was served
+  // The surviving pages are first-touched by the read that actually serves them.
+  ASSERT_TRUE(e2->readCached(0, 3 * 4096, buf.data()));
+  EXPECT_EQ(fx.stats.firstTouchBytes.load(), 3u * 4096);
+}
+
 // Two runs separated by a RAM-staged page: the disk pages before and after it
 // cannot be one pread, and the staged page must not be read from disk at all.
 TEST(FileEntry, StagedPageSplitsACoalescedRun) {

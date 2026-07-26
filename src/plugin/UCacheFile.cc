@@ -1432,7 +1432,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   if (auto view = currentView(); entry && view) {
     // Stitched entry: serve on the executor — overlay + v1
     // cache locally, residual original sub-ranges via the miss machinery.
-    if (size == 0 || offset + size > view->virtualSize()) {
+    if (size == 0 || offset + size < offset || offset + size > view->virtualSize()) {
       noteRelayBytes(st_, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->Read(offset, size, buffer, rh, timeout); // garbage in, origin's answer out
@@ -1446,7 +1446,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
     });
     return XRootDStatus();
   }
-  if (!entry || size == 0 || offset + size > entry->fileSize()) {
+  if (!entry || size == 0 || offset + size < offset || offset + size > entry->fileSize()) {
     noteRelayBytes(st_, size);
     return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
       return f->Read(offset, size, buffer, rh, timeout);
@@ -1541,7 +1541,7 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
                                        ResponseHandler* handler, uint16_t timeout) {
   auto entry = ensureEntry();
   if (auto view = currentView(); entry && view) {
-    if (size == 0 || offset + size > view->virtualSize()) {
+    if (size == 0 || offset + size < offset || offset + size > view->virtualSize()) {
       noteRelayBytes(st_, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->PgRead(offset, size, buffer, rh, timeout);

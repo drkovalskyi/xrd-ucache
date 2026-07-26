@@ -95,10 +95,12 @@ consumers together.
   `hist_req_read_bytes` — sizes the client requested (one sample per read
   and per vector-read chunk, before the cache decides how to serve them);
   `hist_hit_read_bytes` / `hist_replica_read_bytes` — sizes of the preads
-  each tier issued. Requested sizes larger than issued sizes would mean the
-  cache is fragmenting the client's reads; the reverse (issued ≥ requested)
-  is the expected shape, since reads are coalesced across runs and rounded
-  out to page boundaries.
+  each tier issued. Issued sizes *smaller* than requested are normal on a
+  partially cached entry, because a read stops at any page that is absent or
+  still staged in RAM, and at the coalescing cap; issued sizes *larger* than
+  requested come from rounding out to whole pages. What the pair is for is the
+  shape of the tail: many issued reads far smaller than the requests they serve
+  means the entry is fragmented, and on op-priced storage that is what costs.
 - `entries` — per-entry page coverage of entries live in the process at dump
   time (`cached_bytes / file_size` = the coverage signal gating replica
   materialization). Closed entries' coverage persists in their

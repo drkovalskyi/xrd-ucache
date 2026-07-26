@@ -3,7 +3,12 @@
 // The contract the plugin builds on:
 //   hasRange()   — atomic-chunk classification (all pages present?)
 //   readCached() — HIT path; per-page CRC verified; false => fall back to
-//                  origin (pages marked absent, crc_failures counted)
+//                  origin (bad pages marked absent, crc_failures counted).
+//                  On false the caller's buffer holds UNDEFINED bytes: a
+//                  contiguous run of pages is read with ONE pread and
+//                  verified afterwards, so unverified bytes may already have
+//                  landed there. The caller must treat the whole request as
+//                  unserved and overwrite the entire span.
 //   writePages() — MISS path; persists every *full* page inside the span
 //                  (tail page special-cased), data-before-bit ordering,
 //                  UCACHE_FSYNC honored; backend errors fail open (page
@@ -176,6 +181,10 @@ class FileEntry {
   // Marks [firstPage, lastPage] absent and the entry incomplete: their
   // content could not be trusted. Counts ONE crc_failure for the run.
   void demoteRun(uint64_t firstPage, uint64_t lastPage, const char* why);
+  // Re-reads [firstPage, lastPage] one page at a time and demotes only the
+  // pages that are genuinely bad (one crc_failure each). Always returns false:
+  // the request that hit the failure is unserved either way.
+  bool demoteBadPages(uint64_t firstPage, uint64_t lastPage, const uint32_t* expect);
   // Byte span of pages [firstPage, lastPage] (only the file's final page is
   // ever short, so this is exact for any run).
   uint64_t runBytes(uint64_t firstPage, uint64_t lastPage) const {

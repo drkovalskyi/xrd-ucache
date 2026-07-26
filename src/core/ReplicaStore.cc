@@ -82,23 +82,30 @@ bool ReplicaView::read(uint64_t tdataOff, uint64_t len, void* buf) {
         scratch.resize(rBytes);
       dst = scratch.data();
     }
-    stats_.replicaReads.fetch_add(1, std::memory_order_relaxed);
-    stats_.replicaReadBytes.fetch_add(rBytes, std::memory_order_relaxed);
-    stats_.replicaReadSize.add(rBytes);
     const int64_t r = io_.preadFull(fd_, dst, rBytes, rStart);
     const uint64_t got = r > 0 ? static_cast<uint64_t>(r) : 0;
     uint64_t o = 0;
     for (uint64_t i = rf; i <= rl; ++i) {
       const uint32_t nbytes = meta_.pageBytes(i);
-      if (o + nbytes > got || crc32c(dst + o, nbytes) != meta_.pageCrcs[i]) {
+      const bool short_ = o + nbytes > got;
+      if (short_ || crc32c(dst + o, nbytes) != meta_.pageCrcs[i]) {
         stats_.replicaCrcFailures.fetch_add(1, std::memory_order_relaxed);
         invalid_.store(true, std::memory_order_relaxed);
-        UCACHE_WARN("replica overlay page %llu bad for %s; view invalidated",
-                    static_cast<unsigned long long>(i), meta_.key.c_str());
+        // Distinguish a truncated/unreadable .tdata from corrupt content —
+        // they point at different causes.
+        UCACHE_WARN("replica overlay page %llu %s for %s; view invalidated",
+                    static_cast<unsigned long long>(i),
+                    short_ ? "unreadable (short read)" : "failed its checksum",
+                    meta_.key.c_str());
         return false;
       }
       o += nbytes;
     }
+    // Counted after the run verifies, so a failed pread is not reported as
+    // work delivered — the same convention as the byte tier's hit_disk_reads.
+    stats_.replicaReads.fetch_add(1, std::memory_order_relaxed);
+    stats_.replicaReadBytes.fetch_add(rBytes, std::memory_order_relaxed);
+    stats_.replicaReadSize.add(rBytes);
     if (!direct) {
       const uint64_t cStart = std::max(tdataOff, rStart);
       const uint64_t cEnd = std::min(tdataOff + len, rStart + rBytes);
@@ -270,7 +277,9 @@ std::shared_ptr<ReplicaView> ReplicaStore::openView(const UrlKey& key, uint64_t 
     // A sequential scan of the whole overlay: read it in coalesced spans and
     // verify each page's CRC out of the buffer, rather than one pread per page.
     const uint64_t npages = m->npages();
-    std::vector<uint8_t> scratch(kMaxCoalescedRead);
+    // Sized to the overlay, not to the cap: this runs on the application's
+    // thread at open, and most overlays are far smaller than 1 MiB.
+    std::vector<uint8_t> scratch(std::min<uint64_t>(kMaxCoalescedRead, m->tdataBytes));
     for (uint64_t rf = 0; rf < npages;) {
       uint64_t rl = rf;
       while (rl + 1 < npages && m->runBytes(rf, rl + 1) <= kMaxCoalescedRead)

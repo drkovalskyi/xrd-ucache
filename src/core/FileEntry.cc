@@ -146,7 +146,9 @@ void FileEntry::ObsSink::append(const std::string& line) {
 }
 
 bool FileEntry::hasRange(uint64_t off, uint64_t len) {
-  if (len == 0 || off + len > meta_.fileSize)
+  // off + len can WRAP on a hostile or buggy caller; an unchecked wrap used to
+  // pass the range test and then index the bitmap out of bounds.
+  if (len == 0 || off + len < off || off + len > meta_.fileSize)
     return false;
   uint64_t first = off / meta_.pageSize;
   uint64_t last = (off + len - 1) / meta_.pageSize;
@@ -177,6 +179,26 @@ void FileEntry::demoteRun(uint64_t firstPage, uint64_t lastPage, const char* why
                 static_cast<unsigned long long>(lastPage), key_.key.c_str());
 }
 
+// A coalesced read that comes up short cannot say WHICH page is bad, and
+// discarding the whole run would throw away up to a megabyte of good cache
+// because of one transient error. Re-read the remainder one page at a time to
+// demote exactly the pages that really are bad — the same blast radius, and the
+// same per-page crc_failures accounting, as before reads were coalesced. A
+// transient error that has already cleared costs nothing but the re-reads.
+bool FileEntry::demoteBadPages(uint64_t firstPage, uint64_t lastPage, const uint32_t* expect) {
+  std::vector<uint8_t> page(meta_.pageSize);
+  for (uint64_t i = firstPage; i <= lastPage; ++i) {
+    const uint32_t nbytes = meta_.pageBytes(i);
+    const int64_t r =
+        io_.preadFull(dataFd_, page.data(), nbytes, i * uint64_t(meta_.pageSize));
+    if (r != static_cast<int64_t>(nbytes))
+      demoteRun(i, i, "short read");
+    else if (crc32c(page.data(), nbytes) != expect[i - firstPage])
+      demoteRun(i, i, "CRC mismatch");
+  }
+  return false;
+}
+
 bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint32_t* expect,
                               uint8_t* dst) {
   const uint64_t start = firstPage * uint64_t(meta_.pageSize);
@@ -186,14 +208,10 @@ bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint3
   uint64_t o = 0;
   for (uint64_t i = firstPage; i <= lastPage; ++i) {
     const uint32_t nbytes = meta_.pageBytes(i);
-    if (o + nbytes > got) {
-      // Short read or IO error: this page and everything after it in the run
-      // was never delivered, so none of it can be trusted.
-      demoteRun(i, lastPage, "short read");
-      return false;
-    }
+    if (o + nbytes > got) // short read or IO error: localize it page by page
+      return demoteBadPages(i, lastPage, expect + (i - firstPage));
     if (crc32c(dst + o, nbytes) != expect[i - firstPage]) {
-      demoteRun(i, i, "CRC mismatch");
+      demoteRun(i, i, "CRC mismatch"); // this one page is provably bad
       return false;
     }
     o += nbytes;
@@ -204,7 +222,7 @@ bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint3
 bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
   if (len == 0)
     return true;
-  if (off + len > meta_.fileSize)
+  if (off + len < off || off + len > meta_.fileSize) // wrap, then range
     return false;
   const uint32_t P = meta_.pageSize;
   uint64_t first = off / P, last = (off + len - 1) / P;
@@ -244,20 +262,12 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
   std::vector<uint32_t> crcs;
   {
     std::lock_guard<std::mutex> g(mu_);
-    // first_touch: page-granular, counted at the serving read's width. The
-    // disk branch marks it here too (before the pread) — a CRC-demoted
-    // page inflates it by one page width, a negligible skew (crc_failures
-    // is ~always 0) that keeps the update under the same lock take.
     if (servedOnce_.npages() == 0)
       servedOnce_.reset(meta_.npages());
     for (uint64_t i = first; i <= last; ++i) {
       const uint64_t pStart = i * P;
       const uint64_t cStart = std::max(off, pStart);
       const uint64_t cEnd = std::min(off + len, pStart + meta_.pageBytes(i));
-      if (!servedOnce_.get(i)) {
-        servedOnce_.set(i);
-        ftB += cEnd - cStart;
-      }
       const BufPage* staged = nullptr;
       if (auto it = buf_.find(i); it != buf_.end())
         staged = &it->second;
@@ -269,6 +279,12 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
         std::memcpy(out + (cStart - off), staged->data.get() + (cStart - pStart),
                     cEnd - cStart);
         ramB += cEnd - cStart;
+        // first_touch: page-granular, at the serving read's width. Marked here
+        // because these bytes ARE served, now, under this lock.
+        if (!servedOnce_.get(i)) {
+          servedOnce_.set(i);
+          ftB += cEnd - cStart;
+        }
         continue;
       }
       if (!meta_.bitmap.get(i)) {
@@ -317,6 +333,20 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
     if (rStart == prevEnd)
       ++dSeq;
     stats_.hitReadSize.add(rBytes);
+  }
+
+  // first_touch for the disk pages, once every run has verified: a request
+  // that failed served nothing, so it must not consume the attribution (the
+  // refetch that follows will). One lock take for the whole request.
+  if (!runs.empty()) {
+    std::lock_guard<std::mutex> g(mu_);
+    for (const Run& r : runs)
+      for (uint64_t i = r.firstPage; i <= r.lastPage; ++i)
+        if (!servedOnce_.get(i)) {
+          servedOnce_.set(i);
+          const uint64_t pStart = i * P;
+          ftB += std::min(off + len, pStart + meta_.pageBytes(i)) - std::max(off, pStart);
+        }
   }
   publish();
   touchAtime();

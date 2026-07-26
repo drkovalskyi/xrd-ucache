@@ -427,8 +427,10 @@ random-read latency in *microseconds* = healthy local disk; *milliseconds*
 such storage `recompress on` (sequential replica reads) matters far more,
 and a genuinely slow cache dir can be worse than no cache at all. What such
 storage charges for is read COUNT, not bytes, so both tiers serve a contiguous
-run of cached pages with a single read rather than one read per page: a
-request is one operation whatever its page count.
+run of cached pages with a single read rather than one read per page. A fully
+cached request is usually one operation whatever its page count; it splits only
+where the data does — at a page that is not cached, at a page still being
+written, and at a 1 MiB ceiling.
 
 That leaves a difference the two tiers cannot share. The byte cache stores the
 file in its original layout, so a read can only be as large as the client's
@@ -437,7 +439,7 @@ file, behind data it did not ask for. A replica stores each branch's data
 contiguously, so consecutive reads land next to each other and one operation can
 cover several of them. Measured on the same analysis over the same 787-file
 dataset, serving it warm from each tier: the byte cache issued **2.38 M reads
-averaging 42 KiB**, the replica tier **170 k averaging 563 KiB** — about **14×
+averaging 42 KiB**, the replica tier **170 k averaging 599 KiB** — about **14×
 more operations for the same work**, which is exactly the cost an IOPS-priced
 volume charges for. Where operations are the scarce resource, that is the reason
 to complete the recompression — and a partly-replicated dataset still reads the

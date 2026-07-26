@@ -62,7 +62,13 @@ class ReplicaView {
 
   // Read overlay bytes [tdataOff, +len), verifying every touched overlay
   // page's CRC. false => bad page or IO error: replica_crc_failures counted,
-  // invalid() latched, no bytes delivered. Never returns unverified data.
+  // invalid() latched.
+  //
+  // CALLER CONTRACT: on false, `buf` holds UNDEFINED bytes — a contiguous run
+  // of pages is read in one pread and verified afterwards, so bytes that
+  // failed verification may already have landed there. Treat the whole
+  // request as unserved and overwrite the entire span (every caller in this
+  // tree either errors the request or refetches it in full).
   bool read(uint64_t tdataOff, uint64_t len, void* buf);
 
   bool invalid() const { return invalid_.load(std::memory_order_relaxed); }
