@@ -238,8 +238,9 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
         ov.decodeNs += static_cast<uint64_t>(t1.tv_sec - t0.tv_sec) * 1000000000ull +
                        static_cast<uint64_t>(t1.tv_nsec - t0.tv_nsec);
         auto pay = zstdFrames(raw.data(), raw.size(), 1);
-        if (pay.empty())
-          return fail(name + ": zstd encode failed");
+        if (pay.empty()) // an encoder failure is environmental (e.g. OOM), so
+                         // the file is still buildable on a later pass
+          return unavailable(name + ": zstd encode failed");
         if (pay.size() >= raw.size()) { // must shrink below fObjlen, else raw
           pay = std::move(raw);
           ++ov.fallbackRaw;
@@ -304,7 +305,10 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
                          ? std::min<uint64_t>(klHead.size(),
                                               static_cast<uint64_t>(fm.fend - fm.keyslistSeek))
                          : 0;
-    if (probe == 0 || !src.read(klHead.data(), probe, fm.keyslistSeek))
+    if (probe == 0) // geometry, not availability: fEND lies at or below the
+                    // keys list, so no later pass can make this file buildable
+      return fail("keys-list lies at or past the end of the file");
+    if (!src.read(klHead.data(), probe, fm.keyslistSeek))
       return unavailable("keys-list header not readable");
     auto kl = parseKey(klHead.data(), probe, 0);
     if (!kl)

@@ -150,7 +150,7 @@ causes, in order of likelihood:
    so in as many words, naming the codec it actually found and the fix:
 
    ```
-   recompress: 0 recompressed, 9 declined (source codec zlib, not in recompress_codecs = lzma), 0 failed
+   recompress: 0 recompressed, 9 declined (source codec zlib, not in recompress_codecs = lzma), 0 nothing to do (nothing cached), 0 failed
      nothing was recompressed: this cache holds zlib content, but recompress_codecs = lzma.
      to transcode it:  ucache set recompress_codecs zlib
    ```
@@ -159,7 +159,7 @@ causes, in order of likelihood:
 
 2. **The `ucache` CLI is not reachable.** The plugin builds replicas by spawning
    `ucache` itself, resolved from `PATH`. When it cannot be found you get one
-   warning — `recompress is on but the ucache helper is not executable` — and
+   warning — ``recompress is on but the `ucache` helper is not executable`` — and
    nothing is queued, since nothing could drain it. Either make the CLI reachable
    by the process running your analysis (`which ucache` from the same shell), or
    point at it explicitly with `UCACHE_RECOMPRESS_HELPER=/path/to/ucache`. An
@@ -192,8 +192,10 @@ their own words, because conflating them made healthy runs look broken:
 - **`deferred (no space)`** — no headroom above the eviction floor; the entry
   stays queued for a pass that has room. See cause 3 above.
 - **`declined (source codec …)`** — working as configured; see cause 1 above.
-- **`failed`** — a real build failure, e.g. a malformed or unusual file. The
-  message names the branch. A failed *build* cannot produce wrong data: a replica
+- **`failed`** — a real build failure: a malformed file, a cache entry whose
+  bytes no longer match their checksum (the message then points at
+  `ucache verify`), or an entry that has gone missing. The message names the
+  branch when the failure is specific to one. A failed *build* cannot produce wrong data: a replica
   is only ever served after it has been verified. Confirm serving is clean with
   `ucache stats` — `crc_failures 0`, `failopen_events 0`, `validations_failed 0`.
   If failures persist for the same file and coverage never completes, report it

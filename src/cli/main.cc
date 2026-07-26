@@ -512,6 +512,37 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
   return runDiskBench(paths, opts);
 }
 
+// A promise of disk space that has not been written yet, released however the
+// build ends. Without this every `continue` in the worker (declined by codec,
+// unparseable, publish failed) would leak its claim, and a pass over content it
+// declines outright would talk itself into "no space" having written nothing.
+struct InFlightClaim {
+  std::atomic<uint64_t>* ledger = nullptr;
+  uint64_t bytes = 0;
+  InFlightClaim() = default;
+  InFlightClaim(std::atomic<uint64_t>* l, uint64_t b) : ledger(l), bytes(b) {}
+  InFlightClaim(InFlightClaim&& o) noexcept : ledger(o.ledger), bytes(o.bytes) {
+    o.ledger = nullptr;
+  }
+  InFlightClaim& operator=(InFlightClaim&& o) noexcept {
+    if (this != &o) {
+      release();
+      ledger = o.ledger;
+      bytes = o.bytes;
+      o.ledger = nullptr;
+    }
+    return *this;
+  }
+  InFlightClaim(const InFlightClaim&) = delete;
+  InFlightClaim& operator=(const InFlightClaim&) = delete;
+  void release() {
+    if (ledger)
+      ledger->fetch_sub(bytes, std::memory_order_relaxed);
+    ledger = nullptr;
+  }
+  ~InFlightClaim() { release(); }
+};
+
 // Upper bound on the replica an entry's resident bytes will produce: the
 // measured ZSTD-1/LZMA footprint ratio. Deliberately an over-estimate — the
 // cost of guessing high is a build deferred, of guessing low an eviction storm.
@@ -525,10 +556,18 @@ static uint64_t estimatedReplicaBytes(uint64_t cachedBytes) {
 // starts evicting. `~0ull` (unlimited) when eviction is disabled or the volume
 // cannot be queried — absent a floor there is nothing to protect.
 static uint64_t headroomToFloor(const Config& cfg, IOBackend& io) {
+  // Ask the store for the floor rather than reading cfg.minFreeBytes: the
+  // automatic floor is resolved into the STORE's copy of the Config, so a
+  // caller holding the pre-resolution one reads 0 and would conclude there is
+  // nothing to protect — silently disabling every check gated on headroom.
+  const uint64_t floor = CacheStore::effectiveMinFree(cfg, io);
+  if (!floor)
+    return ~0ull; // eviction genuinely off: nothing to stay clear of
   uint64_t avail = 0, total = 0;
-  if (cfg.minFreeBytes && io.spaceInfo(cfg.cacheDir, avail, total) == 0 && total)
-    return avail > cfg.minFreeBytes ? avail - cfg.minFreeBytes : 0;
-  return ~0ull;
+  if (io.spaceInfo(cfg.cacheDir, avail, total) != 0 || !total)
+    return 0; // eviction IS on but free space is unknowable: decline rather
+              // than gamble — a deferred build is retried, a storm is not.
+  return avail > floor ? avail - floor : 0;
 }
 // Does the cache hold ANY replica? `doctor` has no cache store by design (it
 // must report on a cacheDir that cannot be opened), and the question only needs
@@ -572,13 +611,18 @@ bool anyReplicaExists(const std::string& cacheDir) {
 // cheap and leaves that to `doctor`.
 std::string recompressStall(const Config& cfg, IOBackend& io, size_t queued, size_t replicaN,
                             bool deep) {
-  if (!cfg.recompress || replicaN > 0 || queued == 0)
+  if (!cfg.recompress || replicaN > 0)
     return "";
+  // Helper resolvability is asked FIRST and independently of the queue: when the
+  // helper is missing the plugin deliberately queues nothing, so a check gated on
+  // queue depth would go silent in precisely the state it exists to explain.
   std::string exe;
   if (!recompressHelperResolvable(exe))
     return "the `ucache` helper is not executable (" + exe +
-           "), so the background worker never runs — put ucache on PATH, or set "
-           "UCACHE_RECOMPRESS_HELPER to its full path";
+           "), so the background worker never runs and nothing is queued — put ucache on "
+           "PATH, or set UCACHE_RECOMPRESS_HELPER to its full path";
+  if (queued == 0)
+    return ""; // helper fine and nothing waiting: nothing to explain
   if (headroomToFloor(cfg, io) == 0)
     return "there is no headroom above the eviction floor, so background builds are "
            "declined rather than evicting your cache — free space, or set "
@@ -1168,64 +1212,77 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   return 2;
 #else
   const bool drain = mode == RecompressMode::kDrain;
-  // ONE recompression pass at a time per cache. A pass punches the v1 pages
-  // its replicas supersede; a concurrent pass reading those pages works from a
-  // bitmap snapshot that predates the punch, so its builds hit holes (caught,
-  // but wasted — see CacheSource.h) and the two passes duplicate each other's
-  // work besides. Only the drainer used to lock, which left the recommended
-  // workflow — background builds plus one explicit sweep — running exactly
-  // that race. The lock file keeps its name: a drainer from an older build may
-  // be holding THIS path right now, and must still exclude a new sweep.
+  // ONE recompression pass at a time per cache. A pass punches the v1 pages its
+  // replicas supersede; a concurrent pass reading those pages works from a
+  // bitmap snapshot that predates the punch. Those reads are CAUGHT rather than
+  // trusted (CacheSource verifies every page), so this lock is not what makes
+  // the feature correct — it stops two passes wasting effort on the same files
+  // and keeps "will retry" noise out of the log. Only the background worker used
+  // to take it, which left the recommended workflow — background builds plus one
+  // explicit sweep — racing itself. The file keeps its name: a worker from an
+  // older build may be holding THIS path right now and must still exclude us.
+  //
+  // The background pass is BOUNDED IN TIME (kDrainBudget below) and requeues
+  // whatever it does not reach, so a foreground sweep's wait is bounded by
+  // construction. That bound is what lets this be one plain lock: an earlier
+  // design added a second "a sweep is waiting" lock, a probe between files and a
+  // yield, purely because an unbounded batch could hold the cache for hours —
+  // and every one of those moving parts was a way to lose the queue or stall.
   int lockFd = ::open((cfg.cacheDir + "/recompress.drain.lock").c_str(),
                       O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-  // Held by a foreground sweep for its whole run, and only probed by a
-  // drainer. It is how the sweep says "stop claiming files" to a drainer that
-  // already holds the pass lock: waiting the drainer out instead would hand
-  // the corpus to a nice'd 2-job background worker when the user just asked
-  // for a foreground sweep. Being a lock and not a flag file, it cannot go
-  // stale — if the sweep dies, the kernel drops it.
-  const std::string sweepLockPath = cfg.cacheDir + "/recompress.sweep.lock";
-  int sweepFd = ::open(sweepLockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
   auto closeFds = [&] {
     if (lockFd >= 0)
       ::close(lockFd);
-    if (sweepFd >= 0)
-      ::close(sweepFd);
+    lockFd = -1;
   };
-  if (!drain && sweepFd >= 0)
-    ::flock(sweepFd, LOCK_EX); // serialize sweeps, and announce this one
-  if (lockFd >= 0 && ::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
-    if (drain) {
+  if (lockFd < 0) {
+    // A background worker has no business running unprotected; a user who asked
+    // for a sweep gets it, with the reason stated.
+    if (drain)
+      return 0;
+    std::fprintf(stderr, "recompress: cannot open the pass lock (%s); proceeding without it\n",
+                 std::strerror(errno));
+  } else if (::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+    // Distinguish "someone holds it" from "this filesystem cannot lock".
+    // Treating every failure as contention made background recompression stop
+    // for good, and silently, wherever flock is unimplemented.
+    const int err = errno;
+    if (err == EWOULDBLOCK || err == EAGAIN || err == EACCES) {
+      if (drain) {
+        closeFds();
+        return 0; // another pass owns the cache; it will claim this queue
+      }
+      std::fputs("recompress: waiting for the background worker to finish its batch\n", stderr);
+      if (::flock(lockFd, LOCK_EX) != 0) {
+        std::fprintf(stderr, "recompress: lock wait failed (%s); proceeding without it\n",
+                     std::strerror(errno));
+        closeFds();
+      }
+    } else {
+      if (drain) {
+        std::ofstream log(cfg.cacheDir + "/recompress.log", std::ios::app);
+        log << "recompress: advisory locking unavailable on this filesystem (" << std::strerror(err)
+            << "); not running unprotected — use `ucache recompress` explicitly\n";
+        closeFds();
+        return 0;
+      }
+      std::fprintf(stderr, "recompress: advisory locking unavailable (%s); proceeding without it\n",
+                   std::strerror(err));
       closeFds();
-      return 0; // another pass is active; it will claim this queue
-    }
-    std::fputs("recompress: waiting for the background worker to stop (it finishes the file "
-               "it is on)\n",
-               stderr);
-    if (::flock(lockFd, LOCK_EX) != 0) { // interrupted: run unlocked rather than refuse
-      ::close(lockFd);
-      lockFd = -1;
     }
   }
-  // Probe, never hold: a drainer asks "is a sweep waiting for me?". Serialized
-  // because flock is per open-file-description — two threads probing the same
-  // fd, or two fds in one process, would see each other's momentary hold as a
-  // waiting sweep and stop for no reason.
-  std::mutex probeMu;
-  auto sweepWants = [&] {
-    if (sweepFd < 0)
-      return false;
-    std::lock_guard<std::mutex> g(probeMu);
-    if (::flock(sweepFd, LOCK_EX | LOCK_NB) == 0) {
-      ::flock(sweepFd, LOCK_UN);
-      return false;
-    }
-    return true;
-  };
   std::ofstream drainLog;
   if (drain) {
-    ::setpriority(PRIO_PROCESS, 0, 10);
+    ::setpriority(PRIO_PROCESS, 0, 10); // background work yields the CPU
     drainLog.open(cfg.cacheDir + "/recompress.log", std::ios::app);
+    // Be explicit when the capacity guard is inert. It protects the free-disk
+    // floor; a cache governed by an explicit `max_bytes` evicts on its own
+    // trigger, which this guard cannot see. Saying so beats a silent exception
+    // to "background recompression never evicts".
+    if (headroomToFloor(cfg, io) == ~0ull && drainLog)
+      drainLog << "recompress: no free-disk floor is configured, so background builds are "
+                  "not capacity-guarded (a max_bytes cache still evicts on its own "
+                  "trigger); set min_free_bytes to bound them\n";
   }
   const bool reclaimFull = cfg.recompressReclaim == Config::Reclaim::kFull;
   std::vector<CacheStore::EntryInfo> work;
@@ -1234,9 +1291,13 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   if (drain) {
     const std::string pending = cfg.cacheDir + "/recompress.pending";
     const std::string batch = cfg.cacheDir + "/recompress.working";
-    if (::rename(pending.c_str(), batch.c_str()) == 0) {
-      std::ifstream in(batch);
-      std::set<std::string> seen;
+    // A batch left behind by a pass that was killed mid-flight: nothing ever
+    // read this file again, so those keys were lost until someone ran an
+    // explicit sweep. Fold it into this batch instead. Safe under the pass lock:
+    // only the holder can be looking at it.
+    std::set<std::string> seen;
+    auto absorb = [&](const std::string& path) {
+      std::ifstream in(path);
       std::string line;
       while (std::getline(in, line))
         if (!line.empty() && seen.insert(line).second) {
@@ -1244,8 +1305,14 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
           e.key = line;
           work.push_back(e);
         }
-      ::unlink(batch.c_str());
-    }
+    };
+    struct ::stat wst;
+    const bool orphan = io.stat(batch, &wst) == 0;
+    if (orphan)
+      absorb(batch); // recovered from a previous pass that died
+    if (::rename(pending.c_str(), batch.c_str()) == 0)
+      absorb(batch);
+    ::unlink(batch.c_str());
   } else {
     for (const auto& e : store.listEntries()) {
       if (e.cachedBytes == 0 || e.replicaBytes > 0) {
@@ -1329,12 +1396,14 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     jobs = 1;
   if (static_cast<size_t>(jobs) > work.size())
     jobs = work.empty() ? 1 : static_cast<int>(work.size());
-  // Background capacity budget: how much this pass may add before LRU eviction
-  // would start. Measured once — within a pass the only writer that matters is
-  // this pass, and each claim is deducted below.
-  const uint64_t passHeadroom = drain ? headroomToFloor(cfg, io) : ~0ull;
-  const bool budgetGuard = passHeadroom != ~0ull;
-  std::atomic<uint64_t> budget{passHeadroom};
+  // Background capacity budget. Headroom is re-measured per file rather than
+  // seeded once: the drainer is spawned BY a live job that is still filling the
+  // same volume, so "this pass is the only writer" is false exactly when it
+  // matters. What the pass must track itself is only the bytes it has promised
+  // but not yet written — once a build lands, statvfs sees it.
+  // Guard applies whenever eviction is enabled at all; ~0ull means it is off.
+  const bool budgetGuard = drain && headroomToFloor(cfg, io) != ~0ull;
+  std::atomic<uint64_t> inFlight{0};
   std::atomic<int> deferred{0};
   std::atomic<uint64_t> deferBytes{0};
   std::vector<std::string> requeue; // deferred keys, put back under outMu
@@ -1345,20 +1414,35 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   std::atomic<uint64_t> totOverlay{0}, totPunched{0};
   std::atomic<uint64_t> decB{0}, decNs{0};
   std::atomic<size_t> processed{0};
-  std::atomic<bool> yielded{false};
+  // 30 s: long enough that a batch makes real progress at ~2 s/file, short
+  // enough that a user's sweep is never left guessing. The plugin respawns a
+  // worker every 15 s while a job is running, so continuity does not depend on
+  // one pass draining everything.
+  static constexpr time_t kDrainBudget = 30;
+  // Test hook: a gate cannot wait 30 s per leg, and the property under test —
+  // "the remainder is requeued, never dropped" — is independent of the value.
+  time_t budgetS = kDrainBudget;
+  if (const char* b = ::getenv("UCACHE_TEST_DRAIN_BUDGET_S"); b && *b)
+    budgetS = static_cast<time_t>(std::strtoll(b, nullptr, 10));
+  const time_t deadline = ::time(nullptr) + budgetS;
+  std::atomic<bool> overBudget{false};
   std::mutex outMu;
   const bool progress = mode == RecompressMode::kSweep && ::isatty(2);
   auto worker = [&] {
     ReplicaStore rs(io, cfg, store.stats());
-    for (size_t i = next.fetch_add(1); i < work.size(); i = next.fetch_add(1)) {
-      // A sweep is waiting for this pass: stop claiming files. The remainder of
-      // the queue is dropped on purpose — the sweep about to run scans the
-      // whole cache, so it covers everything this batch had left, and the
-      // plugin re-queues at the next close regardless.
-      if (drain && sweepWants()) {
-        yielded = true;
+    for (;;) {
+      // The background pass gives itself a deadline. Whatever it does not reach
+      // goes back on the queue, so a foreground sweep never waits longer than
+      // one budget plus the file in flight — the property that makes a single
+      // plain lock sufficient. Checked BEFORE claiming an index, so every index
+      // handed out is processed and the untouched tail is exactly [next, end).
+      if (drain && ::time(nullptr) >= deadline) {
+        overBudget = true;
         break;
       }
+      const size_t i = next.fetch_add(1);
+      if (i >= work.size())
+        break;
       size_t nDone = processed.fetch_add(1) + 1;
       if (progress)
         std::fprintf(stderr, "\rrecompress: %zu/%zu — %d recompressed, %d nothing to do, %d failed",
@@ -1366,6 +1450,9 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       const auto& e = work[i];
       auto key = UrlKey::parse(e.key, cfg.keepCgi);
       if (!key) {
+        std::lock_guard<std::mutex> g(outMu);
+        std::fprintf(stderr, "recompress: build failed: not a usable cache key: %s\n",
+                     e.key.c_str());
         ++failed;
         continue;
       }
@@ -1378,6 +1465,11 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       }
       auto cm = MetaFile::load(io, key->metaPath(cfg.cacheDir));
       if (!cm) {
+        std::lock_guard<std::mutex> g(outMu);
+        std::fprintf(stderr,
+                     "recompress: build failed: %s has no readable cache sidecar "
+                     "(evicted, or never cached)\n",
+                     key->key.c_str());
         ++failed;
         continue;
       }
@@ -1388,22 +1480,29 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       // pushes a volume into eviction. Deciding per file rather than per batch
       // matters under `recompress_reclaim = full`, where each build hands back
       // the v1 copy and so pays for the next one.
+      // Charge the FULL estimate, with no credit for the byte copy that
+      // `reclaim = full` will hand back: a background pass punches nothing until
+      // after its workers have joined, so that space is not free during the very
+      // window this guard exists to bound.
+      const uint64_t est = budgetGuard ? estimatedReplicaBytes(cm->cachedBytes()) : 0;
+      InFlightClaim claim; // releases on every exit from this iteration
       if (budgetGuard) {
-        const uint64_t cached = cm->cachedBytes();
-        const uint64_t est = estimatedReplicaBytes(cached);
-        // Under `full` the entry's own v1 copy is dropped once the replica
-        // validates, so only the difference is new space.
-        const uint64_t net = reclaimFull ? (est > cached ? est - cached : 0) : est;
-        uint64_t have = budget.load(std::memory_order_relaxed);
+        uint64_t promised = inFlight.load(std::memory_order_relaxed);
         bool claimed = false;
-        while (net <= have)
-          if (budget.compare_exchange_weak(have, have - net, std::memory_order_relaxed)) {
+        for (;;) {
+          const uint64_t head = headroomToFloor(cfg, io); // live, per file
+          if (est + promised > head || est + promised < est)
+            break; // no room now; a later pass may have it
+          if (inFlight.compare_exchange_weak(promised, promised + est,
+                                             std::memory_order_relaxed)) {
+            claim = InFlightClaim{&inFlight, est};
             claimed = true;
             break;
           }
-        if (!claimed) { // no room: leave it queued, a later pass may have space
+        }
+        if (!claimed) { // leave it queued rather than evict the user's cache
           ++deferred;
-          deferBytes += net;
+          deferBytes += est;
           std::lock_guard<std::mutex> g(outMu);
           requeue.push_back(e.key);
           continue;
@@ -1412,11 +1511,31 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       // Parse + hot set once; gate before any transcode work.
       tp::FileMeta fm = tp::parseFile(key->dataPath(cfg.cacheDir), "Events");
       if (!fm.error.empty()) {
-        ++failed;
+        // The parser reads the header, keys list and tree key from the sparse
+        // image DIRECTLY, without the bitmap gate and checksum that basket reads
+        // go through, so on a partially cached entry a hole surfaces here as
+        // "not a ROOT file" or similar. Coverage tells the two apart: on a fully
+        // cached entry the file really is malformed. Either way SAY so — this
+        // path used to increment `failed` and print nothing at all.
+        const bool complete = cm->bitmap.count() == cm->npages();
+        std::lock_guard<std::mutex> g(outMu);
+        if (complete) {
+          std::fprintf(stderr, "recompress: build failed: parse: %s\n", fm.error.c_str());
+          ++failed;
+        } else {
+          std::fprintf(stderr,
+                       "recompress: not built yet, will retry: parse: %s "
+                       "(entry only partially cached)\n",
+                       fm.error.c_str());
+          ++incomplete;
+        }
         continue;
       }
       int fd = ::open(key->dataPath(cfg.cacheDir).c_str(), O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
+        std::lock_guard<std::mutex> g(outMu);
+        std::fprintf(stderr, "recompress: build failed: cannot open %s (%s)\n",
+                     key->dataPath(cfg.cacheDir).c_str(), std::strerror(errno));
         ++failed;
         continue;
       }
@@ -1456,7 +1575,15 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         // next pass, and calling it `build failed` in the log makes a run that
         // in fact succeeded read like a broken one.
         std::lock_guard<std::mutex> g(outMu);
-        if (ov.transient) {
+        if (ov.transient && csrc.sawRot) {
+          // Present-but-corrupt bytes: waiting cannot fix this one, so it is a
+          // failure with a remedy rather than a retry.
+          std::fprintf(stderr,
+                       "recompress: build failed: %s — cached bytes failed their checksum "
+                       "(run `ucache verify %s`)\n",
+                       ov.error.c_str(), e.key.c_str());
+          ++failed;
+        } else if (ov.transient) {
           std::fprintf(stderr, "recompress: not built yet, will retry: %s\n", ov.error.c_str());
           ++incomplete;
         } else {
@@ -1491,10 +1618,32 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       }
     }
   };
+  // A throw escaping a std::thread terminates the process, and this worker
+  // allocates (strings, set/vector inserts). For the detached background pass
+  // that would abort mid-batch; for a sweep it would kill the user's command.
+  // Count it and carry on — the pass is fail-open by design.
+  auto guardedWorker = [&] {
+    try {
+      worker();
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> g(outMu);
+      std::fprintf(stderr, "recompress: worker aborted: %s\n", e.what());
+      ++failed;
+    } catch (...) {
+      std::lock_guard<std::mutex> g(outMu);
+      std::fputs("recompress: worker aborted\n", stderr);
+      ++failed;
+    }
+  };
   std::vector<std::thread> pool;
-  for (int t = 1; t < jobs; ++t)
-    pool.emplace_back(worker);
-  worker();
+  for (int t = 1; t < jobs; ++t) {
+    try {
+      pool.emplace_back(guardedWorker);
+    } catch (const std::system_error&) { // out of threads: run with what we have
+      break;
+    }
+  }
+  guardedWorker();
   for (auto& t : pool)
     t.join();
   if (progress)
@@ -1535,15 +1684,39 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   // appends to. Losing them would be defensible — an explicit sweep scans the
   // whole cache anyway — but then background recompression would silently stop
   // making progress on a volume that later has room.
+  // Whatever the deadline stopped us from reaching goes back too. Dropping it
+  // and trusting a sweep to rescan was wrong twice over: the sweep can refuse
+  // (capacity pre-flight on a non-tty, or the user answering no), and an emptied
+  // queue also silences the `status`/`doctor` explanation, which keys off queue
+  // depth — no builds AND no diagnosis.
+  if (overBudget.load())
+    for (size_t i = next.load(); i < work.size(); ++i)
+      requeue.push_back(work[i].key);
   if (!requeue.empty()) {
-    std::ofstream q(cfg.cacheDir + "/recompress.pending", std::ios::app);
+    // One write of whole lines: the plugin appends to this same file with a
+    // single O_APPEND write per line, and a buffered stream would flush at an
+    // arbitrary byte boundary and let a key be torn in half.
+    std::string blob;
     for (const auto& k : requeue)
-      q << k << "\n";
+      blob += k + "\n";
+    const std::string pendingPath = cfg.cacheDir + "/recompress.pending";
+    if (int qfd = ::open(pendingPath.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+        qfd >= 0) {
+      size_t off = 0;
+      while (off < blob.size()) { // a short write would tear a line too
+        ssize_t w = ::write(qfd, blob.data() + off, blob.size() - off);
+        if (w <= 0)
+          break;
+        off += static_cast<size_t>(w);
+      }
+      ::close(qfd);
+    }
   }
   if (deferred.load() && drainLog)
     drainLog << "recompress: deferred " << deferred.load() << " file(s) for want of space — "
              << "would add up to " << human(deferBytes.load()) << " with "
-             << human(passHeadroom) << " of headroom above the eviction floor. Left queued; "
+             << human(headroomToFloor(cfg, io))
+             << " of headroom above the eviction floor now. Left queued; "
              << "free space (`ucache evict --to-size`, `ucache rm`) or set "
              << "recompress_reclaim = full to replace byte copies instead of adding to them.\n";
   if (decNs.load() > 0) // calibrate from what we actually decoded
@@ -1580,7 +1753,8 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
                 "recompress: %d recompressed%s%s, %d nothing to do (nothing cached)%s%s, "
                 "%d failed%s",
                 done.load(), declinedSeg, alreadySeg, skipped.load(), incompleteSeg, deferredSeg,
-                failed.load(), yielded.load() ? " — stopped early for a foreground sweep" : "");
+                failed.load(),
+                overBudget.load() ? " — batch time budget reached, remainder requeued" : "");
   if (!drain) {
     std::printf("%s\n", summary);
     // Declined everything and built nothing: that is a configuration mismatch,
@@ -1602,14 +1776,6 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   }
   if (drain && drainLog)
     drainLog << summary << "\n";
-  if (drain && yielded.load()) {
-    // Yielding: hand the lock over now. The punch below and the follow-on pass
-    // are both work the waiting sweep does itself, with the user's --jobs.
-    if (drainLog)
-      drainLog << "recompress: yielded to a foreground sweep\n";
-    closeFds();
-    return 0;
-  }
   if (drain) {
     // Deferred punch: reclaim the superseded v1 pages of every replica in the
     // cache, this pass's builds included — deferred to here, after the workers
@@ -1636,16 +1802,14 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       drainLog << "punched " << punched
                << (reclaimFull ? " v1 bytes (reclaim full)\n" : " superseded v1 bytes\n");
     closeFds();
-    // Entries queued while this batch built: claim them too (fresh lock). NOT
-    // when this pass deferred any — those keys were just put back, so a
-    // follow-on pass would re-read them, defer them again, and recurse without
-    // end. A pass that ran out of space has nothing more to do this run.
-    if (deferred.load())
-      return failed.load() && !done.load() ? 1 : 0;
-    return cmdRecompress(store, cfg, io, jobs, RecompressMode::kDrain) == 0 &&
-                   !(failed.load() && !done.load())
-               ? 0
-               : 1;
+    // One bounded batch per invocation, then exit. This used to recurse to pick
+    // up whatever was queued while it built, which made the pass unbounded in
+    // both wall time and stack depth (each level kept its work list and log
+    // stream open, and nothing capped the descent), and it is what forced the
+    // whole yield mechanism into existence. Continuity comes from the plugin
+    // instead: it respawns a worker every 15 s while a job is closing files, and
+    // an explicit `ucache recompress` covers anything left over — it scans the
+    // cache rather than the queue.
   }
   closeFds();
   return failed.load() && !done.load() ? 1 : 0;
@@ -2514,8 +2678,11 @@ int cmdDoctor(const Config& cfg) {
     const size_t replicas = anyReplicaExists(cfg.cacheDir) ? 1 : 0;
     if (std::string why = recompressStall(cfg, dio, queued, replicas, /*deep=*/true);
         !why.empty()) {
-      std::printf("  [WARN] recompress = on but no replicas exist (%zu queued): %s\n", queued,
-                  why.c_str());
+      if (queued)
+        std::printf("  [WARN] recompress = on but no replicas exist (%zu queued): %s\n", queued,
+                    why.c_str());
+      else
+        std::printf("  [WARN] recompress = on but no replicas exist: %s\n", why.c_str());
       ++problems;
     }
   }

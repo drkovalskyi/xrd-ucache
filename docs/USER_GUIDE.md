@@ -354,9 +354,10 @@ nothing measurable and does a useful fraction for free, which shortens the
 sweep. Check where you stand with `ucache status` (the `recompressed:` line) or
 per file with `ucache ls` (the `RECOMP` column). The sweep's own summary gives
 each outcome its own words — `recompressed`, `declined` (with the codec it found
-and the one-line fix), `already recompressed`, `incomplete`, `deferred`,
-`failed` — and `ucache doctor` will tell you why nothing is being built if that
-is what you are seeing (see Troubleshooting).
+and the one-line fix), `already recompressed`, `incomplete`, `failed` — and
+background passes add `deferred` when they decline for want of disk space.
+`ucache doctor` will tell you why nothing is being built if that is what you are
+seeing (see Troubleshooting).
 
 Replicas coexist with the byte cache by default (only the ranges the replica
 physically replaced are punched). If disk space is tight, make replicas the

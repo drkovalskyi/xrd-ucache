@@ -40,12 +40,18 @@ namespace ucache {
 struct CacheSource : transpose::Source {
   int fd = -1;
   const MetaData* meta = nullptr;
+  // Set when a page that the bitmap says IS present failed its checksum: the
+  // bytes rotted (or were punched by something that did not clear the bit).
+  // Distinct from "not cached yet", because it does not heal by waiting — the
+  // serving path demotes such a page on read, a build cannot, so a caller that
+  // reported it as "will retry" would retry forever.
+  bool sawRot = false;
 
   // A range is usable only if every page it touches is marked present. The
   // caller's own coverage check runs earlier and over the same bitmap; this is
   // the per-read backstop.
   bool has(uint64_t off, uint64_t n) override {
-    if (!meta || n == 0 || off + n < off || off + n > meta->fileSize)
+    if (!meta || !meta->pageSize || n == 0 || off + n < off || off + n > meta->fileSize)
       return false;
     const uint64_t first = off / meta->pageSize, last = (off + n - 1) / meta->pageSize;
     for (uint64_t i = first; i <= last; ++i)
@@ -64,6 +70,14 @@ struct CacheSource : transpose::Source {
     if (!P || meta->pageCrcs.size() != meta->npages())
       return false; // summary-loaded sidecar: nothing to verify against
     const uint64_t first = off / P, last = (off + n - 1) / P;
+    // Absence is checked structurally, not inferred from the checksum. A page
+    // that was never filled reads back as zeros with a recorded crc of 0, and
+    // it is only crc32c(zeros) != 0 that makes the compare below reject it —
+    // true for every page length in range, but an accident of the polynomial,
+    // not a guarantee. The bitmap is the guarantee.
+    for (uint64_t i = first; i <= last; ++i)
+      if (!meta->bitmap.get(i))
+        return false;
     const uint64_t base = first * static_cast<uint64_t>(P);
     const uint64_t end = std::min<uint64_t>((last + 1) * static_cast<uint64_t>(P), meta->fileSize);
     buf_.resize(static_cast<size_t>(end - base));
@@ -73,8 +87,10 @@ struct CacheSource : transpose::Source {
     for (uint64_t i = first; i <= last; ++i) {
       const uint32_t nb = meta->pageBytes(i);
       const uint8_t* p = buf_.data() + (i * static_cast<uint64_t>(P) - base);
-      if (crc32c(p, nb) != meta->pageCrcs[i])
+      if (crc32c(p, nb) != meta->pageCrcs[i]) {
+        sawRot = true;
         return false;
+      }
     }
     std::memcpy(dst, buf_.data() + (off - base), static_cast<size_t>(n));
     return true;

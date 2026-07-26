@@ -829,3 +829,36 @@ TEST(CacheStore, EvictNowDropsListedArtifactsWithEntry) {
   for (const char* suf : {".tdata", ".tmeta", ".tok", ".val", ".cost"})
     EXPECT_LT(io.stat(base + suf, &st), 0) << suf;
 }
+
+// The eviction floor must be answerable from a Config that has NOT been through
+// a store's resolveBudget(), because that is what callers outside CacheStore
+// hold. Reading Config::minFreeBytes directly instead returns 0 in the DEFAULT
+// configuration (automatic floor, nothing set explicitly) — and a caller that
+// reads 0 as "no floor, nothing to protect" silently disables itself in exactly
+// the configuration almost every user runs. That is not hypothetical: it shipped.
+TEST(CacheStoreBudget, EffectiveFloorIsAnswerableBeforeResolution) {
+  ucache::test::TempDir td;
+  ucache::RealIO io;
+  ucache::Config cfg;
+  cfg.cacheDir = td.path();
+  cfg.budgetAuto = true; // what Config::fromEnv sets when max_bytes is unset
+  cfg.minFreeBytes = 0;  // ... and the field a caller would read
+
+  const uint64_t floor = ucache::CacheStore::effectiveMinFree(cfg, io);
+  EXPECT_GT(floor, 0u) << "the automatic floor must be visible without a store";
+
+  // And it must agree with what the store actually enforces.
+  ucache::CacheStore store(io, cfg);
+  EXPECT_EQ(store.config().minFreeBytes, floor);
+
+  // Explicit beats automatic, and is returned unchanged.
+  ucache::Config explicitCfg = cfg;
+  explicitCfg.minFreeBytes = 7ull << 30;
+  EXPECT_EQ(ucache::CacheStore::effectiveMinFree(explicitCfg, io), 7ull << 30);
+
+  // Eviction genuinely off (no auto policy, no floor) is the ONLY case that may
+  // report "nothing to protect".
+  ucache::Config offCfg = cfg;
+  offCfg.budgetAuto = false;
+  EXPECT_EQ(ucache::CacheStore::effectiveMinFree(offCfg, io), 0u);
+}

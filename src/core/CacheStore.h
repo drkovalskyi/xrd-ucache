@@ -49,6 +49,15 @@ class CacheStore {
   const Config& config() const { return cfg_; }
   Stats& stats() { return stats_; }
 
+  // The free-disk floor eviction actually enforces, for a Config that may not
+  // have been through resolveBudget(). A store resolves the automatic floor into
+  // its OWN copy of the Config, so a caller holding the pre-resolution Config
+  // sees minFreeBytes == 0 and would conclude "no floor, nothing to protect" —
+  // which silently disables anything gated on headroom. Ask here instead of
+  // reading the field, and the answer is the same wherever it is asked from.
+  // Returns 0 only when eviction is genuinely off. Pure: logs nothing.
+  static uint64_t effectiveMinFree(const Config& cfg, IOBackend& io);
+
   // Opens (or shares) the entry for `key`, validating against the origin
   // metadata. nullptr => caller fails open to pass-through.
   // Triggers a rate-limited eviction check.

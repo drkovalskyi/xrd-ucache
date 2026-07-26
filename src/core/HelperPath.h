@@ -23,21 +23,46 @@ namespace ucache {
 // UCACHE_RECOMPRESS_HELPER (an explicit path, used by tests and by installs
 // that keep the CLI outside PATH) must itself be executable; otherwise a bare
 // `ucache` is searched along PATH.
+// An executable REGULAR file: `access(X_OK)` alone says yes to a directory
+// named `ucache` that happens to be searchable, and a spawn on that fails with
+// EACCES — back to the silence this is here to prevent.
+inline bool isExecutableFile(const std::string& path) {
+  struct ::stat st;
+  return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && ::access(path.c_str(), X_OK) == 0;
+}
+
 inline bool recompressHelperResolvable(std::string& exeOut) {
   if (const char* helper = ::getenv("UCACHE_RECOMPRESS_HELPER"); helper && *helper) {
     exeOut = helper;
-    return ::access(helper, X_OK) == 0;
+    return isExecutableFile(helper);
   }
   exeOut = "ucache";
-  const char* path = ::getenv("PATH");
-  if (!path || !*path)
-    return false;
-  const std::string p(path);
-  for (size_t at = 0; at <= p.size();) {
+  // Mirror execvp's search, or the answer can differ from what the spawn will
+  // actually do — and since this gate SUPPRESSES the spawn, a divergence turns a
+  // working setup into a silently disabled one. Two rules are easy to miss:
+  // an unset PATH means the confstr default (usually /bin:/usr/bin), NOT "no
+  // search"; and an empty element (leading/trailing/doubled ':') means the
+  // current directory.
+  std::string p;
+  if (const char* env = ::getenv("PATH"); env && *env) {
+    p = env;
+  } else {
+    const size_t n = ::confstr(_CS_PATH, nullptr, 0);
+    if (n) {
+      std::string buf(n, '\0');
+      ::confstr(_CS_PATH, buf.data(), n);
+      buf.resize(n ? n - 1 : 0); // drop the trailing NUL
+      p = buf;
+    }
+    if (p.empty())
+      p = "/bin:/usr/bin";
+  }
+  for (size_t at = 0;; ) {
     const size_t colon = p.find(':', at);
-    const std::string dir =
-        p.substr(at, colon == std::string::npos ? std::string::npos : colon - at);
-    if (!dir.empty() && ::access((dir + "/ucache").c_str(), X_OK) == 0)
+    std::string dir = p.substr(at, colon == std::string::npos ? std::string::npos : colon - at);
+    if (dir.empty())
+      dir = "."; // POSIX: an empty PATH element is the current directory
+    if (isExecutableFile(dir + "/ucache"))
       return true;
     if (colon == std::string::npos)
       break;
