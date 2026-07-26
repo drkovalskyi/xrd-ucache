@@ -120,6 +120,7 @@ std::string Stats::toJsonBody() const {
 
 StatsTotals aggregateStats(const std::string& statsDir) {
   StatsTotals t;
+  bool sawNewSchema = false;
   DIR* d = ::opendir(statsDir.c_str());
   if (!d)
     return t;
@@ -174,7 +175,15 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.hitDiskSeq += extractU64(last, "hit_disk_seq");
     t.replicaBytesServed += extractU64(last, "replica_bytes_served");
     t.replicaReads += extractU64(last, "replica_reads");
-    t.replicaReadBytes += extractU64(last, "replica_read_bytes");
+    // Per FILE, not per total: a file written before this counter existed can
+    // only offer served bytes, and mixing the two bases silently divides new
+    // bytes by old-plus-new reads.
+    const bool hasNew = last.find("\"replica_read_bytes\":") != std::string::npos;
+    t.replicaReadBytes += hasNew ? extractU64(last, "replica_read_bytes")
+                                 : extractU64(last, "replica_bytes_served");
+    if (t.files > 1 && hasNew != sawNewSchema)
+      t.schemaMixed = true;
+    sawNewSchema = hasNew;
     t.relayBytes += extractU64(last, "relay_bytes");
     t.readvChunks += extractU64(last, "readv_chunks");
     t.readvCalls += extractU64(last, "readv_calls");

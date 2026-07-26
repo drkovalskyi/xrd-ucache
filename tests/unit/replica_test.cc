@@ -307,6 +307,7 @@ TEST(ReplicaStore, OverlayReadsCoalesceIntoOnePreadPerRun) {
   ASSERT_TRUE(v->read(off, len, got.data()));
   EXPECT_EQ(f.stats.replicaReads.load(), 1u);
   EXPECT_EQ(f.stats.replicaReadBytes.load(), 8u * kP); // whole pages checksummed
+  EXPECT_EQ(f.stats.replicaReadSize.b[19].load(), 1u); // 8x64 KiB = 512 KiB, log2 = 19
   EXPECT_EQ(0, std::memcmp(got.data(), overlay.data() + off, len));
 
   // The cap splits a longer run: 40 pages = 2.5 MiB spans three 1 MiB preads.
@@ -315,7 +316,44 @@ TEST(ReplicaStore, OverlayReadsCoalesceIntoOnePreadPerRun) {
   ASSERT_TRUE(v->read(0, all.size(), all.data()));
   EXPECT_EQ(f.stats.replicaReads.load(),
             (overlay.size() + kMaxCoalescedRead - 1) / kMaxCoalescedRead);
+  // Pin the ceiling exactly: the two full runs moved 1 MiB each.
+  EXPECT_EQ(f.stats.replicaReadSize.b[20].load(), 2u); // log2(1 MiB) = 20
   EXPECT_EQ(0, std::memcmp(all.data(), overlay.data(), all.size()));
+}
+
+// The founding premise of coalescing — read granularity is independent of
+// checksum granularity — has to hold on THIS tier too: every page of a run is
+// verified, not just the one the run starts at. Corrupt a page in the MIDDLE of
+// a run and read the whole run in one call.
+TEST(ReplicaStore, CorruptMiddlePageOfAnOverlayRunIsCaught) {
+  Fixture f;
+  auto overlay = test::randomBytes(4 * kP, 91);
+  ASSERT_EQ(f.rs->publish(key(), sampleMeta(1 << 20, overlay.size()), overlay.data(),
+                          overlay.size()),
+            0);
+  const std::string dPath = ReplicaStore::tdataPath(key(), f.cfg.cacheDir);
+  struct ::stat st;
+  ASSERT_EQ(::stat(dPath.c_str(), &st), 0);
+  struct timespec keep[2] = {st.st_atim, st.st_mtim};
+
+  // Page 2 of 4 — not the first page of the run the read below will build.
+  int fd = ::open(dPath.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  uint8_t b;
+  ASSERT_EQ(::pread(fd, &b, 1, 2 * kP + 17), 1);
+  b ^= 0x55;
+  ASSERT_EQ(::pwrite(fd, &b, 1, 2 * kP + 17), 1);
+  ::close(fd);
+  // Restore mtime so the verify-once marker skips the open-time scan: this must
+  // be caught by the PER-READ check, inside a coalesced run.
+  ASSERT_EQ(::utimensat(AT_FDCWD, dPath.c_str(), keep, 0), 0);
+
+  auto v = f.rs->openView(key(), 1 << 20);
+  ASSERT_TRUE(v);
+  std::vector<uint8_t> buf(4 * kP);
+  EXPECT_FALSE(v->read(0, 4 * kP, buf.data())); // one pread, page 2 rejected
+  EXPECT_EQ(f.stats.replicaCrcFailures.load(), 1u);
+  EXPECT_TRUE(v->invalid());
 }
 
 TEST(ReplicaStore, RepublishReplacesAtomically) {

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <memory>
 #include <thread>
 
 using namespace ucache;
@@ -432,6 +433,9 @@ TEST(FileEntry, HitReadsCoalesceIntoOnePreadPerRun) {
   EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + off, len));
   // The pread covered whole pages: 11 of them, more bytes than were asked for.
   EXPECT_EQ(fx.stats.hitDiskBytes.load(), 11u * 4096);
+  // …and the size histogram was actually fed: 11 pages = 45,056 B -> log2 bucket
+  // 15 (32-64 KiB). Without this the histogram can be unwired silently.
+  EXPECT_EQ(fx.stats.hitReadSize.b[15].load(), 1u);
 
   // Page-aligned request: read straight into the caller's buffer, still one op.
   ASSERT_TRUE(e->readCached(8 * 4096, 4 * 4096, buf.data()));
@@ -442,6 +446,48 @@ TEST(FileEntry, HitReadsCoalesceIntoOnePreadPerRun) {
   // misses (page-granular presence is unchanged by coalescing).
   e->releaseRanges({{4 * 4096, 4096}});
   EXPECT_FALSE(e->readCached(0, 8 * 4096, buf.data()));
+}
+
+// A coalesced pread must land STRICTLY inside the caller's buffer. The run is
+// read whole-pages-wide, so the bound that keeps it inside the request is the
+// only thing standing between "one big read" and a heap overflow — and slack in
+// a test buffer hides exactly that. Every read here goes into a buffer sized to
+// the request EXACTLY, with a canary immediately after it, across all four
+// alignment shapes.
+TEST(FileEntry, CoalescedReadStaysInsideTheCallersBuffer) {
+  Fixture fx(64 * 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 64 * 4096, fx.src.data());
+  e->flushAll();
+
+  struct Shape {
+    const char* name;
+    uint64_t off, len;
+  };
+  const Shape shapes[] = {
+      {"aligned/aligned", 4 * 4096, 8 * 4096},
+      {"aligned/unaligned", 4 * 4096, 8 * 4096 + 1000},
+      {"unaligned/aligned", 4 * 4096 + 500, 8 * 4096 - 500},
+      {"unaligned/unaligned", 4 * 4096 + 500, 8 * 4096 + 1234},
+      {"single partial page", 4096 + 100, 200},
+      {"crosses the short tail page", 60 * 4096 + 7, 4 * 4096 - 7},
+  };
+  for (const Shape& s : shapes) {
+    // (1) EXACTLY len bytes on the heap — no slack, no spare capacity — so a
+    // sanitizer build poisons the very next byte. `vector::resize` down would
+    // not do: it keeps capacity, and an overflow into capacity is invisible.
+    std::unique_ptr<uint8_t[]> exact(new uint8_t[s.len]);
+    ASSERT_TRUE(e->readCached(s.off, s.len, exact.get())) << s.name;
+    EXPECT_EQ(0, memcmp(exact.get(), fx.src.data() + s.off, s.len)) << s.name;
+
+    // (2) the same read into a guarded buffer, so a plain build catches it too.
+    std::vector<uint8_t> guarded(s.len + 16, 0xAB);
+    ASSERT_TRUE(e->readCached(s.off, s.len, guarded.data())) << s.name;
+    for (size_t i = s.len; i < guarded.size(); ++i)
+      ASSERT_EQ(guarded[i], 0xAB) << s.name << ": wrote " << (i - s.len + 1)
+                                  << " byte(s) past the caller's buffer";
+  }
 }
 
 // The coalescing cap splits a long run: a 3 MiB contiguous read cannot be one
@@ -459,6 +505,10 @@ TEST(FileEntry, CoalescedRunsAreCappedAtOneMiB) {
   ASSERT_TRUE(e->readCached(0, 3 * kCap, buf.data()));
   EXPECT_EQ(fx.stats.hitDiskReads.load(), 3u); // not 1, not 768
   EXPECT_EQ(fx.stats.hitDiskBytes.load(), 3u * kCap);
+  // Pin the ceiling EXACTLY: 3 reads of 3 MiB means each was 1 MiB, so a cap
+  // one page too large or a < / <= slip in the comparison is caught.
+  EXPECT_EQ(fx.stats.hitDiskBytes.load() / fx.stats.hitDiskReads.load(), kCap);
+  EXPECT_EQ(fx.stats.hitReadSize.b[20].load(), 3u); // log2(1 MiB) = 20
   EXPECT_EQ(0, memcmp(buf.data(), fx.src.data(), 3 * kCap));
 }
 

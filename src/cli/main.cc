@@ -229,11 +229,14 @@ const char* flagValue(int argc, char** argv, int& i, size_t flagLen) {
 
 // Stats aggregation (last-cumulative-line per file, summed across processes)
 // lives in ucache-core (Stats.h aggregateStats) so it is unit-tested there.
-// Approximate percentile from a log2-µs histogram: the value is the bucket
-// midpoint (1.5 * 2^i), rendered human. Good to ~±50% — regimes, not lab
-// timing.
-// Representative value of the bucket holding quantile q — log2 buckets, so
-// the midpoint 1.5*2^i. Negative if the histogram is empty.
+// Percentiles out of a log2 histogram are bucket-resolution: good to a factor
+// of two, i.e. regimes rather than lab numbers. Durations are reported at the
+// bucket MIDPOINT (1.5*2^i), which is the better estimator for values spread
+// smoothly inside a bucket. Sizes are reported at the bucket FLOOR (2^i),
+// because read sizes cluster on exact powers of two and page multiples, which
+// sit at the bottom of a bucket: with the midpoint, a workload of exactly-4 KiB
+// reads printed "6.0 KiB" four lines under an exactly-computed "mean 4.0 KiB".
+// Returns the bucket's lower bound; scale it at the call site.
 double histQuantile(const std::vector<uint64_t>& h, double q) {
   uint64_t total = 0;
   for (uint64_t c : h)
@@ -247,15 +250,16 @@ double histQuantile(const std::vector<uint64_t>& h, double q) {
   for (size_t i = 0; i < h.size(); ++i) {
     cum += h[i];
     if (cum >= target)
-      return i == 0 ? 1.0 : 1.5 * static_cast<double>(1ull << i);
+      return i == 0 ? 1.0 : static_cast<double>(1ull << i);
   }
   return -1.0;
 }
 
 std::string histPctile(const std::vector<uint64_t>& h, double q) {
-  const double us = histQuantile(h, q);
-  if (us < 0)
+  const double lo = histQuantile(h, q);
+  if (lo < 0)
     return "-";
+  const double us = lo <= 1.0 ? lo : 1.5 * lo; // durations: bucket midpoint
   char buf[32];
   if (us < 1000)
     std::snprintf(buf, sizeof buf, "%.0fus", us);
@@ -322,13 +326,17 @@ void printStats(const StatsTotals& t) {
               human(t.ramHitBytes).c_str(), human(diskB).c_str(),
               human(t.replicaBytesServed).c_str(), human(t.missBytes).c_str(),
               human(t.relayBytes).c_str());
-  if (t.hitDiskReads)
+  if (t.schemaMixed)
+    std::printf("  NOTE               stats files span a version where read counters changed\n"
+                "                     meaning (per page, now per coalesced run) — per-read\n"
+                "                     figures below are omitted. `stats --reset` for a clean window.\n");
+  if (t.hitDiskReads && !t.schemaMixed)
     std::printf("  hit disk reads     %llu (mean %s, %.0f%% sequential)\n",
                 (unsigned long long)t.hitDiskReads,
                 human(t.hitDiskBytes / t.hitDiskReads).c_str(),
                 100.0 * static_cast<double>(t.hitDiskSeq) /
                     static_cast<double>(t.hitDiskReads));
-  if (t.replicaReads)
+  if (t.replicaReads && !t.schemaMixed)
     std::printf("  replica reads      %llu (mean %s)\n",
                 (unsigned long long)t.replicaReads,
                 human((t.replicaReadBytes ? t.replicaReadBytes : t.replicaBytesServed) /
@@ -341,7 +349,7 @@ void printStats(const StatsTotals& t) {
   if (t.readvChunks) {
     std::printf("  vector reads       %llu chunks, %llu mixed hit+miss vectors\n",
                 (unsigned long long)t.readvChunks, (unsigned long long)t.readvMixed);
-    if (t.readvCalls)
+    if (t.readvCalls && !t.schemaMixed)
       std::printf("  vector width       %llu calls (mean %.1f chunks/call)\n",
                   (unsigned long long)t.readvCalls,
                   static_cast<double>(t.readvChunks) / static_cast<double>(t.readvCalls));
@@ -358,7 +366,7 @@ void printStats(const StatsTotals& t) {
       !t.histReplicaReadSize.empty()) {
     // Read shape: what the client asked for, next to what the cache disk was
     // asked for. The second should be >= the first, never a fraction of it.
-    std::printf("read size p50/p95/p99:\n");
+    std::printf("read size p50/p95/p99 (log2 buckets, floor):\n");
     if (!t.histReqRead.empty())
       std::printf("  requested          %s\n", pctilesB(t.histReqRead).c_str());
     if (!t.histHitReadSize.empty())

@@ -1540,6 +1540,9 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buffer,
                                        ResponseHandler* handler, uint16_t timeout) {
   auto entry = ensureEntry();
+  if (entry)
+    noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
+                                 // reads as Read, so it must be sampled too
   if (auto view = currentView(); entry && view) {
     if (size == 0 || offset + size < offset || offset + size > view->virtualSize()) {
       noteRelayBytes(st_, size);

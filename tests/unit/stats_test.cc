@@ -92,6 +92,37 @@ TEST(StatsAggregate, LastLinePerFileSummedAcrossProcesses) {
   EXPECT_EQ(t.failopenEvents, 1u);
 }
 
+// Stats files written on either side of the coalescing change use the same
+// counter NAMES with different meanings (hit_disk_reads counted pages, now
+// counts runs), so summing them yields a number that means nothing. The
+// aggregate must say so, and the CLI then withholds the derived per-read
+// figures rather than printing a plausible-looking average of the two.
+TEST(StatsAggregate, MixedSchemaIsFlagged) {
+  test::TempDir td;
+  std::string dir = td.path() + "/stats";
+  ::mkdir(dir.c_str(), 0700);
+  const char* oldLine = "{\"ts\":1,\"opens\":1,\"hit_disk_reads\":100,\"hit_disk_bytes\":409600,"
+                        "\"replica_reads\":10,\"replica_bytes_served\":655360}\n";
+  const char* newLine = "{\"ts\":2,\"opens\":1,\"hit_disk_reads\":10,\"hit_disk_bytes\":409600,"
+                        "\"replica_reads\":2,\"replica_bytes_served\":131072,"
+                        "\"replica_read_bytes\":140000,\"readv_calls\":3}\n";
+  { std::ofstream(dir + "/a.jsonl") << newLine; }
+  { std::ofstream(dir + "/b.jsonl") << newLine; }
+  EXPECT_FALSE(aggregateStats(dir).schemaMixed); // both new: comparable
+  { std::ofstream(dir + "/c.jsonl") << oldLine; }
+  EXPECT_TRUE(aggregateStats(dir).schemaMixed); // one pre-change file spoils it
+
+  // With only pre-change files the replica mean falls back to served bytes,
+  // which is the right basis for a file that has no bytes-moved counter.
+  test::TempDir td2;
+  std::string dir2 = td2.path() + "/stats";
+  ::mkdir(dir2.c_str(), 0700);
+  { std::ofstream(dir2 + "/only-old.jsonl") << oldLine; }
+  auto t = aggregateStats(dir2);
+  EXPECT_FALSE(t.schemaMixed);
+  EXPECT_EQ(t.replicaReadBytes, 655360u);
+}
+
 TEST(StatsAggregate, MissingDirIsZero) {
   StatsTotals t = aggregateStats("/nonexistent/ucache/stats");
   EXPECT_EQ(t.files, 0);

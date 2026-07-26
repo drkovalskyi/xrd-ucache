@@ -72,7 +72,13 @@ consumers together.
   read op — so `hit_disk_bytes / hit_disk_reads` is the mean size the device
   sees and `hit_disk_reads` divided by wall time is the op rate it is charged
   for (the currency on IOPS-quota storage). Bytes are counted at whole-page
-  granularity, since each page is still checksummed in full.
+  granularity, since each page is still checksummed in full. `hit_disk_bytes`
+  is directly comparable to versions before reads were coalesced for every
+  request that SUCCEEDS (verified byte-identical on the same workload). It
+  differs only for a request that fails part way: the older per-page loop had
+  already read some pages before discovering an absent one, whereas the planning
+  pass now finds that page first and reads nothing — so a run with a non-zero
+  acceptance triple can show slightly fewer bytes than an older one.
   `replica_bytes_served` / `replica_reads` / `replica_read_bytes` — bytes
   served from replica overlays, the physical `.tdata` preads that delivered
   them, and the bytes those preads moved (the replica-tier analogue of the

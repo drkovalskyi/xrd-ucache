@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <memory>
 #include <random>
 
 using namespace ucache;
@@ -74,9 +75,11 @@ class DifferentialHarness {
     uint64_t len = std::min<uint64_t>(lenD(rng_), src_.size());
     std::uniform_int_distribution<uint64_t> offD(0, src_.size() - len);
     uint64_t off = offD(rng_);
-    buf_.resize(len);
-    clientRead(off, len, buf_.data());
-    ASSERT_EQ(0, std::memcmp(buf_.data(), src_.data() + off, len))
+    // EXACTLY len bytes, freshly allocated: a reused vector keeps its capacity,
+    // and a read that overruns into that capacity is invisible to a sanitizer.
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[len]);
+    clientRead(off, len, buf.get());
+    ASSERT_EQ(0, std::memcmp(buf.get(), src_.data() + off, len))
         << "MISMATCH off=" << off << " len=" << len;
   }
 

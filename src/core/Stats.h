@@ -130,6 +130,11 @@ struct StatsTotals {
   std::vector<uint64_t> histHitRead, histOriginRt, histOpen, histReplicaRead, histFlushWrite;
   // … and log2 bytes, for the read-shape block:
   std::vector<uint64_t> histReqRead, histHitReadSize, histReplicaReadSize;
+  // True when the summed files do NOT all use the same counter vocabulary —
+  // i.e. some were written before reads were coalesced (hit_disk_reads counted
+  // PAGES) and some after (it counts RUNS). Summing those is meaningless, so
+  // derived per-read figures must be suppressed rather than printed.
+  bool schemaMixed = false;
 };
 // Sums the last JSON line of every <statsDir>/*.jsonl. Missing dir => zeros.
 StatsTotals aggregateStats(const std::string& statsDir);
