@@ -1263,6 +1263,7 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   (void)jobs;
   (void)mode;
   (void)yes;
+  (void)strict;
   std::fputs("recompress: built without the native transposer (codec libs missing)\n", stderr);
   return 2;
 #else
