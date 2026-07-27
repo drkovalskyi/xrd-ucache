@@ -90,7 +90,8 @@ void usage() {
       "  verify <url>      CRC-scrub an entry (detect + invalidate bad pages)\n"
       "  branches <url>    which branches your analysis read (fully-cached\n"
       "                    branches, bytes, source codec, and the summary share)\n"
-      "  recompress [--jobs N] [--yes]  transcode the cached files whose source codec is in\n"
+      "  recompress [--jobs N] [--yes] [--strict]\n"
+      "                                 transcode the cached files whose source codec is in\n"
       "                    recompress_codecs (default lzma), foreground with live\n"
       "                    progress (default jobs: half the CPU cores). For automatic\n"
       "                    background builds of everything your jobs read, turn the\n"
@@ -1254,7 +1255,7 @@ static uint64_t punchPerReclaim(ReplicaStore& rs, FileEntry& entry, const Replic
 #endif
 
 int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
-                  RecompressMode mode, bool yes = false) {
+                  RecompressMode mode, bool yes = false, bool strict = false) {
 #ifndef UCACHE_HAVE_TRANSPOSE
   (void)store;
   (void)cfg;
@@ -1874,9 +1875,20 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   // not cached) are legitimate outcomes and stay silent in the exit code.
   if (!drain && failed.load())
     std::printf("  %d entr%s failed to build: coverage is INCOMPLETE. A warm pass "
-                "over this cache is a mixture of tiers, not a replica measurement.\n",
-                failed.load(), failed.load() == 1 ? "y" : "ies");
-  return failed.load() ? 1 : 0;
+                "over this cache is a mixture of tiers, not a replica measurement.%s\n",
+                failed.load(), failed.load() == 1 ? "y" : "ies",
+                strict ? "" : "  (--strict to exit non-zero on this)");
+  // A partial build failure is a WARNING, not an error. Nothing is broken by it:
+  // uCache fails open, so an entry without a replica simply serves from the byte
+  // tier. Exiting non-zero would break a driver script over a condition the
+  // cache handles gracefully. What the original complaint needed was to be able
+  // to TELL that coverage stopped short -- that is the line above, and the
+  // benchmark harness's coverage verdict. `--strict` is there for a caller that
+  // genuinely wants coverage enforced.
+  //
+  // Unchanged without --strict: a sweep where nothing at all built still exits
+  // non-zero, which is the long-standing behaviour.
+  return (failed.load() && (strict || !done.load())) ? 1 : 0;
 #endif
 }
 
@@ -3109,7 +3121,7 @@ int main(int argc, char** argv) {
     int jobs =
         static_cast<int>(std::max<unsigned>(1, std::thread::hardware_concurrency() / 2));
     RecompressMode mode = RecompressMode::kSweep; // explicit command = do it, visibly
-    bool yes = false;
+    bool yes = false, strict = false;
     for (int i = 2; i < argc; ++i) {
       if (!std::strcmp(argv[i], "--jobs") && i + 1 < argc)
         jobs = std::atoi(argv[++i]);
@@ -3119,6 +3131,8 @@ int main(int argc, char** argv) {
         ; // legacy no-op
       else if (!std::strcmp(argv[i], "--yes"))
         yes = true; // skip the capacity confirmation (scripts)
+      else if (!std::strcmp(argv[i], "--strict"))
+        strict = true; // exit non-zero if any entry failed to build
       else if (!std::strcmp(argv[i], "--estimate") || !std::strcmp(argv[i], "--force")) {
         std::fprintf(stderr,
                      "recompress: %s was removed with the evidence gate — bare "
@@ -3142,7 +3156,7 @@ int main(int argc, char** argv) {
       int cap = hw ? static_cast<int>(hw) : 4;
       jobs = std::min(jobs, cap);
     }
-    return cmdRecompress(store, cfg, io, jobs, mode, yes);
+    return cmdRecompress(store, cfg, io, jobs, mode, yes, strict);
   }
   std::fprintf(stderr, "unknown command: %s\n", cmd.c_str());
   usage();
