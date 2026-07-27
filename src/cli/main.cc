@@ -1866,7 +1866,17 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     // cache rather than the queue.
   }
   closeFds();
-  return failed.load() && !done.load() ? 1 : 0;
+  // Any build failure is a non-zero exit, not just a total one. A field run
+  // finished 1416 of 1456 entries with 40 deterministic `build failed` lines
+  // and exited 0, so a script had no way to know the corpus was 97.3% covered
+  // -- and partial coverage buys almost nothing, because the unreplicated
+  // remainder paces the next read pass. Declined (codec) and incomplete (bytes
+  // not cached) are legitimate outcomes and stay silent in the exit code.
+  if (!drain && failed.load())
+    std::printf("  %d entr%s failed to build: coverage is INCOMPLETE. A warm pass "
+                "over this cache is a mixture of tiers, not a replica measurement.\n",
+                failed.load(), failed.load() == 1 ? "y" : "ies");
+  return failed.load() ? 1 : 0;
 #endif
 }
 
