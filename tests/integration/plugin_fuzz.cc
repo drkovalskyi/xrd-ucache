@@ -131,7 +131,12 @@ void worker(Ctx* ctx, const Source& src, uint64_t seed, uint64_t ops, int tid) {
       }
     }
     if (rng() % 100 < 55) { // single read
-      uint32_t len = 1 + rng() % (256 * 1024);
+      // Mostly small, but one in sixteen is large enough to cross the readv
+      // element ceiling. That size class rounds its fetched span differently,
+      // so the served bytes come out of the wire buffer at a shifted offset --
+      // the arithmetic this exercises is not reachable with 256 KiB reads.
+      uint32_t len = (rng() % 16 == 0) ? 2 * 1024 * 1024 + rng() % (2 * 1024 * 1024)
+                                       : 1 + rng() % (256 * 1024);
       if (len > fsize)
         len = fsize;
       uint64_t off = rng() % (fsize - len + 1);

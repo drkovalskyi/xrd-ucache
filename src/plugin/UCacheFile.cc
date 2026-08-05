@@ -4,6 +4,7 @@
 #include "Executor.h"
 #include "Log.h"
 #include "OpenRetry.h"
+#include "ReadRounding.h"
 #include "Trace.h"
 #include "vendor/crc32c.h"
 
@@ -196,10 +197,6 @@ class RetryingOpenHandler : public ResponseHandler {
   int attempt_ = 0;
   XRootDStatus lastStatus_;
 };
-
-// kXR readv element ceiling (16-byte header inside a 2 MiB frame); rounding
-// that would exceed it is skipped for that chunk.
-constexpr uint64_t kMaxReadvElem = 2 * 1024 * 1024 - 16;
 
 uint64_t nowUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -636,7 +633,8 @@ XRootDStatus issueWireRead(XrdCl::File* f, uint64_t off, uint64_t len, void* buf
   return f->Read(off, len, buf, mh, timeout);
 }
 
-std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len);
+std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len,
+                                         RoundCap cap);
 
 // Parked-read re-dispatch: runs on the executor after the owning fetch
 // released the gate. Usually a RAM hit against the just-staged pages; if the
@@ -659,7 +657,7 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
     complete(handler, okStatus(), chunkResponse(offset, size, buffer));
     return;
   }
-  auto [ws, we] = roundChunk(*entry, offset, size);
+  auto [ws, we] = roundChunk(*entry, offset, size, RoundCap::kWholeRead);
   auto fired = std::make_shared<std::atomic<bool>>(false);
   auto again = [st, entry, offset, size, buffer, handler, fired] {
     if (fired->exchange(true))
@@ -808,15 +806,11 @@ class MissVReadHandler : public ResponseHandler {
   uint64_t t0_;
 };
 
-// Rounded [start,end) for a chunk; unrounded when rounding would exceed the
-// readv element ceiling or run past EOF bookkeeping.
-std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len) {
-  const uint64_t P = e.pageSize();
-  uint64_t start = off / P * P;
-  uint64_t end = std::min<uint64_t>((off + len + P - 1) / P * P, e.fileSize());
-  if (end - start > kMaxReadvElem)
-    return {off, off + len};
-  return {start, end};
+// Rounded [start,end) for a chunk. `cap` says which wire request this span is
+// for; the rounding rule and why it is not optional are in ReadRounding.h.
+std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len,
+                                         RoundCap cap) {
+  return roundSpan(e.pageSize(), e.fileSize(), off, len, cap);
 }
 
 // Issues the wire VectorRead for the miss stage. Runs on the caller's thread
@@ -830,7 +824,7 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
   ivals.reserve(missIdx.size());
   for (size_t idx : missIdx) {
     const auto& c = userChunks[idx];
-    ivals.push_back(roundChunk(*entry, c.offset, c.length));
+    ivals.push_back(roundChunk(*entry, c.offset, c.length, RoundCap::kReadvElem));
   }
   std::sort(ivals.begin(), ivals.end());
   std::vector<WireElem> wire;
@@ -1535,7 +1529,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
         return;
       }
       // CRC quarantine: demote to wire miss (counted by core).
-      auto [ws, we] = roundChunk(*entry, offset, size);
+      auto [ws, we] = roundChunk(*entry, offset, size, RoundCap::kWholeRead);
       auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
       if (XrdCl::File* f = st->acquireInner()) {
         auto* mh = new MissReadHandler(st, entry, offset, size, buffer, handler, ws,
@@ -1557,7 +1551,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   // rounded miss already in flight (another handle/thread — RDF-IMT re-reads
   // the same baskets constantly) parks this read instead of duplicating the
   // fetch; the owner's staged pages then serve it from RAM.
-  auto [ws, we] = roundChunk(*entry, offset, size);
+  auto [ws, we] = roundChunk(*entry, offset, size, RoundCap::kWholeRead);
   {
     auto st = st_;
     auto fired = std::make_shared<std::atomic<bool>>(false);
