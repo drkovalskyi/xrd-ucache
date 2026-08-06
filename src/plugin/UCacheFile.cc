@@ -633,8 +633,7 @@ XRootDStatus issueWireRead(XrdCl::File* f, uint64_t off, uint64_t len, void* buf
   return f->Read(off, len, buf, mh, timeout);
 }
 
-std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len,
-                                         RoundCap cap);
+std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len);
 
 // Parked-read re-dispatch: runs on the executor after the owning fetch
 // released the gate. Usually a RAM hit against the just-staged pages; if the
@@ -657,7 +656,7 @@ void redispatchRead(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> 
     complete(handler, okStatus(), chunkResponse(offset, size, buffer));
     return;
   }
-  auto [ws, we] = roundChunk(*entry, offset, size, RoundCap::kWholeRead);
+  auto [ws, we] = roundChunk(*entry, offset, size);
   auto fired = std::make_shared<std::atomic<bool>>(false);
   auto again = [st, entry, offset, size, buffer, handler, fired] {
     if (fired->exchange(true))
@@ -748,12 +747,31 @@ class MissVReadHandler : public ResponseHandler {
       return;
     }
 
-    // Scatter wire bytes into the user's miss chunks (memcpy only).
+    // Scatter wire bytes into the user's miss chunks (memcpy only). A chunk can
+    // span several elements: an oversized run is cut into protocol-legal pieces,
+    // and the pieces of one run are adjacent and in offset order.
     uint64_t missBytes = 0;
+    const WireElem* const wend = wire_.data() + wire_.size();
     for (size_t idx : missIdx_) {
       auto& c = userChunks_[idx];
-      const WireElem* w = findWire(c.offset);
-      std::memcpy(c.buffer, w->buf->data() + (c.offset - w->off), c.length);
+      char* dst = static_cast<char*>(c.buffer);
+      uint64_t at = c.offset, left = c.length;
+      for (const WireElem* w = findWire(at); left && w < wend; ++w) {
+        if (at < w->off || at >= w->off + w->len)
+          break; // gap: coverage is broken, do not read outside the element
+        const uint64_t n = std::min<uint64_t>(left, w->off + w->len - at);
+        std::memcpy(dst, w->buf->data() + (at - w->off), n);
+        dst += n;
+        at += n;
+        left -= n;
+      }
+      if (left) {
+        // Unreachable by construction (the runs cover every rounded miss
+        // range); serving a partially filled buffer would be a wrong answer.
+        complete(user_, new XRootDStatus(XrdCl::stError, XrdCl::errInternal), nullptr);
+        delete this;
+        return;
+      }
       missBytes += c.length;
     }
     if (st_->store) {
@@ -806,11 +824,10 @@ class MissVReadHandler : public ResponseHandler {
   uint64_t t0_;
 };
 
-// Rounded [start,end) for a chunk. `cap` says which wire request this span is
-// for; the rounding rule and why it is not optional are in ReadRounding.h.
-std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len,
-                                         RoundCap cap) {
-  return roundSpan(e.pageSize(), e.fileSize(), off, len, cap);
+// Rounded [start,end) for a chunk; the rule and why it is not optional are in
+// ReadRounding.h. Vector reads cut the result to legal elements afterwards.
+std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint64_t len) {
+  return roundSpan(e.pageSize(), e.fileSize(), off, len);
 }
 
 // Issues the wire VectorRead for the miss stage. Runs on the caller's thread
@@ -824,18 +841,28 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
   ivals.reserve(missIdx.size());
   for (size_t idx : missIdx) {
     const auto& c = userChunks[idx];
-    ivals.push_back(roundChunk(*entry, c.offset, c.length, RoundCap::kReadvElem));
+    ivals.push_back(roundChunk(*entry, c.offset, c.length));
   }
   std::sort(ivals.begin(), ivals.end());
-  std::vector<WireElem> wire;
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
   for (auto [s, e] : ivals) {
-    if (!wire.empty() && s <= wire.back().off + wire.back().len) {
-      uint64_t newEnd = std::max(wire.back().off + wire.back().len, e);
-      wire.back().len = newEnd - wire.back().off;
-    } else {
-      wire.push_back({s, e - s, nullptr});
-    }
+    if (!runs.empty() && s <= runs.back().second)
+      runs.back().second = std::max(runs.back().second, e);
+    else
+      runs.emplace_back(s, e);
   }
+  // Cut each run into protocol-legal elements. An element above the ceiling is
+  // REFUSED and fails the whole request, so this is correctness, not tuning;
+  // cutting on page boundaries keeps every piece storable whole. Runs stay
+  // sorted and their pieces adjacent, which is what the scatter below relies on.
+  std::vector<WireElem> wire;
+  wire.reserve(runs.size());
+  for (auto [s, e] : runs)
+    for (uint64_t at = s; at < e;) {
+      const uint64_t cut = readvElemEnd(at, e, entry->pageSize());
+      wire.push_back({at, cut - at, nullptr});
+      at = cut;
+    }
   ChunkList wireChunks;
   wireChunks.reserve(wire.size());
   for (auto& w : wire) {
@@ -1529,7 +1556,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
         return;
       }
       // CRC quarantine: demote to wire miss (counted by core).
-      auto [ws, we] = roundChunk(*entry, offset, size, RoundCap::kWholeRead);
+      auto [ws, we] = roundChunk(*entry, offset, size);
       auto wireBuf = std::make_shared<std::vector<char>>(we - ws);
       if (XrdCl::File* f = st->acquireInner()) {
         auto* mh = new MissReadHandler(st, entry, offset, size, buffer, handler, ws,
@@ -1551,7 +1578,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   // rounded miss already in flight (another handle/thread — RDF-IMT re-reads
   // the same baskets constantly) parks this read instead of duplicating the
   // fetch; the owner's staged pages then serve it from RAM.
-  auto [ws, we] = roundChunk(*entry, offset, size, RoundCap::kWholeRead);
+  auto [ws, we] = roundChunk(*entry, offset, size);
   {
     auto st = st_;
     auto fired = std::make_shared<std::atomic<bool>>(false);

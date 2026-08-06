@@ -11,14 +11,6 @@ namespace ucache {
 // 2 MiB frame, 16 bytes of which are its header.
 constexpr uint64_t kMaxReadvElem = 2 * 1024 * 1024 - 16;
 
-// Which wire request the rounded span is destined for. This is not a tuning
-// choice: it is a protocol fact about the request, and picking the wrong one
-// silently costs cacheability (see below).
-enum class RoundCap {
-  kWholeRead,  // one kXR_read: no element ceiling exists, so always round
-  kReadvElem,  // one kXR_readv element: bounded by kMaxReadvElem
-};
-
 // Widen [off, off+len) out to whole pages, so that what is fetched is what can
 // be stored.
 //
@@ -30,14 +22,13 @@ enum class RoundCap {
 // Rounding the fetched span out to page boundaries is what makes a request
 // cacheable at all, and it costs at most two extra pages on the wire.
 //
-// Only kXR_readv has a reason not to round: its elements are capped, so a
-// rounded element that would cross kMaxReadvElem is issued unrounded and
-// knowingly gives up its edge pages. A single kXR_read has no element limit, so
-// it always rounds. Applying the readv cap to single reads made every large
-// unaligned read permanently uncacheable -- reads above the cap were served
-// correctly and then dropped, forever, on every pass.
+// This holds for every wire request, with no exception for vector reads. Their
+// elements are size-capped, but that is a reason to CUT a rounded span into
+// legal pieces (readvElemEnd below), never a reason to leave it unrounded:
+// declining to round never made an oversized element legal — the request still
+// failed — it only made the bytes uncacheable on top.
 inline std::pair<uint64_t, uint64_t> roundSpan(uint64_t pageSize, uint64_t fileSize,
-                                              uint64_t off, uint64_t len, RoundCap cap) {
+                                              uint64_t off, uint64_t len) {
   const uint64_t start = off / pageSize * pageSize;
   const uint64_t end =
       std::min<uint64_t>((off + len + pageSize - 1) / pageSize * pageSize, fileSize);
@@ -45,9 +36,6 @@ inline std::pair<uint64_t, uint64_t> roundSpan(uint64_t pageSize, uint64_t fileS
   // At or past EOF the clamp can put end below start; rounding has nothing to
   // widen into, and the subtraction below would wrap.
   if (end <= start)
-    return {off, off + len};
-
-  if (cap == RoundCap::kReadvElem && end - start > kMaxReadvElem)
     return {off, off + len};
 
   // The wire read length crosses a uint32_t API boundary. A rounded span that
@@ -59,6 +47,23 @@ inline std::pair<uint64_t, uint64_t> roundSpan(uint64_t pageSize, uint64_t fileS
     return {off, off + len};
 
   return {start, end};
+}
+
+// Where to cut [start, end) so the piece is a legal vector-read element and
+// still ends on a page boundary, keeping it storable whole. Callers loop until
+// the returned cut reaches `end`.
+//
+// Cutting is mandatory, not an optimization: an element above the ceiling is
+// refused by the protocol and the whole request fails. Page-aligned cuts keep
+// every piece cacheable, so a large read costs no residency either.
+inline uint64_t readvElemEnd(uint64_t start, uint64_t end, uint64_t pageSize) {
+  if (end - start <= kMaxReadvElem)
+    return end;
+  uint64_t cut = start + kMaxReadvElem;
+  cut -= cut % pageSize; // land on an absolute page boundary
+  if (cut <= start)      // page bigger than the ceiling: one page per element
+    cut = start + pageSize;
+  return std::min(cut, end);
 }
 
 } // namespace ucache
