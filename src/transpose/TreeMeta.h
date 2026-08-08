@@ -37,6 +37,33 @@ std::optional<KeyInfo> parseKey(const uint8_t* p, size_t n, uint64_t off);
 // exactly `objlen` bytes; empty vector on failure or unknown frames.
 std::vector<uint8_t> decompressFrames(const uint8_t* payload, size_t n, uint64_t objlen);
 
+// The TFile container level: header geometry, root directory, keys list. This
+// is shared by every payload type — a TTree and an RNTuple differ only in the
+// class of the key they hang off, so the walk to the keys list is identical
+// and is deliberately written once. It is also the layer that takes hostile
+// bytes first, and a second copy of these bounds checks would be a second
+// copy to keep fuzzed.
+struct ContainerMeta {
+  bool large = false; // 64-bit header layout (file version > 1000000)
+  int64_t fend = 0;
+  int64_t keyslistSeek = 0;
+  uint64_t dirSeekKeysOff = 0; // file offset of the directory's fSeekKeys
+  // The header and the root-directory record carry INDEPENDENT seek widths
+  // and need not agree; each is valid only at its own site. See FileMeta.
+  int headerSeekWidth = 8;
+  int dirSeekWidth = 8;
+  int64_t fileSize = 0;
+  std::vector<KeyInfo> keys; // the keys list, in file order
+  std::string error;         // non-empty => nothing above is meaningful
+};
+
+// Walk an open ROOT file to its keys list. Bounds-checked throughout.
+ContainerMeta parseContainer(int fd);
+
+// Read key `k`'s payload, decompressing it when the key says it is compressed.
+// Returns empty on a short read or a failed decompression.
+std::vector<uint8_t> readKeyPayload(int fd, const KeyInfo& k);
+
 struct BranchInfo {
   std::string name;
   int32_t writeBasket = 0;

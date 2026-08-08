@@ -389,24 +389,20 @@ bool parseBranch(Cur& c, FileMeta& fm,
 
 } // namespace
 
-FileMeta parseFile(const std::string& path, const std::string& tree) {
-  FileMeta fm;
+ContainerMeta parseContainer(int fd) {
+  ContainerMeta fm;
   auto fail = [&](std::string why) {
     fm.error = std::move(why);
-    fm.branches.clear();
+    fm.keys.clear();
     return fm;
   };
 
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
-    return fail("cannot open " + path);
   off_t fsz = ::lseek(fd, 0, SEEK_END);
+  fm.fileSize = fsz;
   std::vector<uint8_t> head(512);
   if (::pread(fd, head.data(), head.size(), 0) < 4 ||
-      std::memcmp(head.data(), "root", 4) != 0) {
-    ::close(fd);
+      std::memcmp(head.data(), "root", 4) != 0)
     return fail("not a ROOT file");
-  }
   fm.large = beGet<int32_t>(head.data() + 4) > 1000000;
   fm.headerSeekWidth = fm.large ? 8 : 4;
   fm.fend = fm.large ? beGet<int64_t>(head.data() + 12) : beGet<int32_t>(head.data() + 12);
@@ -414,10 +410,8 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
   // Root directory record at fBEGIN=100: key, TNamed payload, TDirectory
   // (fVersion, 2x datime, fNbytesKeys, fNbytesName, 3 seeks by width).
   auto dirKey = parseKey(head.data(), head.size(), 100);
-  if (!dirKey) {
-    ::close(fd);
+  if (!dirKey)
     return fail("no root directory key");
-  }
   {
     // The whole walk is bounds-checked against the header buffer: keylen and
     // the TString lengths are hostile bytes (a bad keylen once walked the
@@ -447,18 +441,14 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
     };
     pstr(q);
     pstr(q);
-    if (oob || q + 2 > head.size()) {
-      ::close(fd);
+    if (oob || q + 2 > head.size())
       return fail("directory record out of bounds");
-    }
     uint16_t dver = beGet<uint16_t>(head.data() + q);
     q += 2 + 4 + 4 + 4 + 4; // version, datimeC, datimeM, fNbytesKeys, fNbytesName
     bool wide = dver > 1000;
     q += (wide ? 8 : 4) * 2; // fSeekDir, fSeekParent
-    if (q + (wide ? 8u : 4u) > head.size()) {
-      ::close(fd);
+    if (q + (wide ? 8u : 4u) > head.size())
       return fail("directory record out of bounds");
-    }
     fm.keyslistSeek = wide ? beGet<int64_t>(head.data() + q) : beGet<int32_t>(head.data() + q);
     fm.dirSeekKeysOff = q;
     // A narrow directory record under a 64-bit header is a valid layout, not a
@@ -466,7 +456,7 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
     fm.dirSeekWidth = wide ? 8 : 4;
   }
 
-  // Keys list: pick the live (highest-cycle) key named `tree`.
+  // Keys list.
   {
     auto kl = [&]() -> std::optional<KeyInfo> {
       std::vector<uint8_t> buf(4096);
@@ -475,23 +465,17 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
         return std::nullopt;
       return parseKey(buf.data(), static_cast<size_t>(r), 0);
     }();
-    if (!kl) {
-      ::close(fd);
+    if (!kl)
       return fail("cannot read keys list");
-    }
     // Geometry must hold before it sizes an allocation or indexes the record
     // (hostile nbytes/keylen: negative/oversized alloc, OOB nkeys read).
     if (kl->nbytes <= 0 || kl->keylen + 4u > static_cast<uint32_t>(kl->nbytes) ||
-        fm.keyslistSeek < 0 || kl->nbytes > fsz - fm.keyslistSeek) {
-      ::close(fd);
+        fm.keyslistSeek < 0 || kl->nbytes > fsz - fm.keyslistSeek)
       return fail("keys-list key geometry implausible");
-    }
     std::vector<uint8_t> buf(kl->nbytes);
     if (::pread(fd, buf.data(), buf.size(), fm.keyslistSeek) !=
-        static_cast<ssize_t>(buf.size())) {
-      ::close(fd);
+        static_cast<ssize_t>(buf.size()))
       return fail("short keys list read");
-    }
     size_t at = kl->keylen;
     int32_t nkeys = beGet<int32_t>(buf.data() + at);
     at += 4;
@@ -499,13 +483,62 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
       auto e = parseKey(buf.data(), buf.size(), at);
       if (!e)
         break;
-      if (e->cls == "TTree" && e->name == tree && e->cycle >= fm.treeKey.cycle)
-        fm.treeKey = *e;
+      fm.keys.push_back(*e);
       if (e->keylen < 29) // smaller than a minimal key record: cannot advance
         break;
       at += e->keylen;
     }
   }
+  return fm;
+}
+
+std::vector<uint8_t> readKeyPayload(int fd, const KeyInfo& k) {
+  if (k.nbytes <= 0 || k.keylen > k.nbytes || k.objlen < 0 || k.seekkey < 0)
+    return {};
+  std::vector<uint8_t> rec(k.nbytes);
+  if (::pread(fd, rec.data(), rec.size(), k.seekkey) != static_cast<ssize_t>(rec.size()))
+    return {};
+  std::vector<uint8_t> out;
+  if (k.objlen == k.nbytes - k.keylen)
+    out.assign(rec.begin() + k.keylen, rec.end());
+  else
+    out = decompressFrames(rec.data() + k.keylen, rec.size() - k.keylen, k.objlen);
+  if (out.size() != static_cast<size_t>(k.objlen))
+    return {};
+  return out;
+}
+
+FileMeta parseFile(const std::string& path, const std::string& tree) {
+  FileMeta fm;
+  auto fail = [&](std::string why) {
+    fm.error = std::move(why);
+    fm.branches.clear();
+    return fm;
+  };
+
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return fail("cannot open " + path);
+  ContainerMeta cm = parseContainer(fd);
+  // Geometry is carried over even when the walk failed later on: the detected
+  // seek widths stay observable on the error path, which is what makes a
+  // width-detection bug diagnosable from a file that does not fully parse.
+  const off_t fsz = cm.fileSize;
+  fm.large = cm.large;
+  fm.headerSeekWidth = cm.headerSeekWidth;
+  fm.fend = cm.fend;
+  fm.keyslistSeek = cm.keyslistSeek;
+  fm.dirSeekKeysOff = cm.dirSeekKeysOff;
+  fm.dirSeekWidth = cm.dirSeekWidth;
+  if (!cm.error.empty()) {
+    ::close(fd);
+    return fail(cm.error);
+  }
+
+  // The live (highest-cycle) key named `tree`.
+  for (const auto& e : cm.keys)
+    if (e.cls == "TTree" && e.name == tree && e.cycle >= fm.treeKey.cycle)
+      fm.treeKey = e;
   if (fm.treeKey.nbytes == 0) {
     ::close(fd);
     return fail("tree '" + tree + "' not found in keys list");
@@ -516,24 +549,8 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
     ::close(fd);
     return fail("tree key geometry implausible");
   }
-
-  // Decompress the tree metadata blob.
-  {
-    std::vector<uint8_t> rec(fm.treeKey.nbytes);
-    if (::pread(fd, rec.data(), rec.size(), fm.treeKey.seekkey) !=
-        static_cast<ssize_t>(rec.size())) {
-      ::close(fd);
-      return fail("short tree key read");
-    }
-    if (fm.treeKey.objlen == fm.treeKey.nbytes - fm.treeKey.keylen) {
-      fm.treeBlob.assign(rec.begin() + fm.treeKey.keylen, rec.end());
-    } else {
-      fm.treeBlob = decompressFrames(rec.data() + fm.treeKey.keylen,
-                                     rec.size() - fm.treeKey.keylen, fm.treeKey.objlen);
-    }
-  }
+  fm.treeBlob = readKeyPayload(fd, fm.treeKey);
   ::close(fd);
-  (void)fsz;
   if (fm.treeBlob.size() != static_cast<size_t>(fm.treeKey.objlen))
     return fail("tree metadata decompression failed");
 
