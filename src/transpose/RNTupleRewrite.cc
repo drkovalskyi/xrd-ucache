@@ -235,12 +235,18 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   if (m.anchor.payloadOffset == 0) return fail("compressed anchor cannot be patched in place");
   if (m.anchor.payloadLength < 78) return fail("anchor payload too short to patch");
   {
+    // ONE contiguous window from seekFooter through the checksum, rather than
+    // two with maxKeySize untouched between them. The bytes in the gap are
+    // rewritten to their existing values, which costs 8 bytes and means no
+    // read of the anchor can straddle an extent boundary — a stitched reader
+    // then never has to splice this record out of two sources.
     RNTuplePatch p;
-    p.offset = m.anchor.payloadOffset + 38; // seekFooter
-    p.bytes.resize(24);
+    p.offset = m.anchor.payloadOffset + 38; // seekFooter .. checksum
+    p.bytes.resize(40);
     putBE(p.bytes.data(), ftrAt, 8);
     putBE(p.bytes.data() + 8, ftrStored.size(), 8);
     putBE(p.bytes.data() + 16, ftr.size(), 8);
+    putBE(p.bytes.data() + 24, m.anchor.maxKeySize, 8); // unchanged, rewritten
 
     // Rebuild the checksummed window (payload[6:70]) to hash it.
     std::vector<uint8_t> win(64);
@@ -255,12 +261,8 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
     putBE(win.data() + 40, ftrStored.size(), 8);
     putBE(win.data() + 48, ftr.size(), 8);
     putBE(win.data() + 56, m.anchor.maxKeySize, 8);
-    RNTuplePatch ck;
-    ck.offset = m.anchor.payloadOffset + 70;
-    ck.bytes.resize(8);
-    putBE(ck.bytes.data(), xxh3_64(win.data(), win.size()), 8);
+    putBE(p.bytes.data() + 32, xxh3_64(win.data(), win.size()), 8);
     rw.patches.push_back(std::move(p));
-    rw.patches.push_back(std::move(ck));
   }
 
   // fEND must cover the appended data or ROOT truncates its view of the file.
