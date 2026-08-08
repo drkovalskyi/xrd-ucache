@@ -139,13 +139,22 @@ void worker(Ctx* ctx, const Source& src, uint64_t seed, uint64_t ops, int tid) {
                                        : 1 + rng() % (256 * 1024);
       if (len > fsize)
         len = fsize;
-      uint64_t off = rng() % (fsize - len + 1);
+      // One in 32 reads deliberately runs PAST EOF, and must come back SHORT.
+      // Every read here used to be placed in bounds by construction, so the
+      // last-block overrun that any fixed-block reader performs was never
+      // exercised — and a stitched entry answering it with zero bytes went
+      // unnoticed until a real client aborted on it.
+      const bool overrun = (rng() % 32 == 0) && len > 1;
+      const uint64_t off = overrun ? fsize - len / 2 : rng() % (fsize - len + 1);
+      const uint32_t want =
+          static_cast<uint32_t>(fsize - off < len ? fsize - off : len);
       uint32_t got = 0;
       auto st = file->Read(off, len, buf.data(), got);
-      if (!st.IsOK() || got != len ||
-          std::memcmp(buf.data(), src.bytes.data() + off, len) != 0) {
-        std::fprintf(stderr, "READ MISMATCH tid=%d op=%llu off=%llu len=%u got=%u ok=%d\n",
-                     tid, (unsigned long long)i, (unsigned long long)off, len, got,
+      if (!st.IsOK() || got != want ||
+          std::memcmp(buf.data(), src.bytes.data() + off, want) != 0) {
+        std::fprintf(stderr,
+                     "READ MISMATCH tid=%d op=%llu off=%llu len=%u want=%u got=%u ok=%d\n",
+                     tid, (unsigned long long)i, (unsigned long long)off, len, want, got,
                      st.IsOK());
         ++gFailures;
         return;

@@ -1517,15 +1517,28 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   if (auto view = currentView(); entry && view) {
     // Stitched entry: serve on the executor — overlay + v1
     // cache locally, residual original sub-ranges via the miss machinery.
-    if (size == 0 || offset + size < offset || offset + size > view->virtualSize()) {
+    if (offset + size < offset) { // overflow: not a request we can reason about
       noteRelayBytes(st_, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->Read(offset, size, buffer, rh, timeout); // garbage in, origin's answer out
       });
     }
+    // A read running past EOF is ORDINARY, not an error: readers that fetch in
+    // fixed-size blocks (ROOT's raw-file layer uses 128 KiB) always overrun on
+    // the last block, and the correct answer is a SHORT read. Relaying it to
+    // the origin cannot give that answer — a stitched file is LARGER than the
+    // file the origin has, so the origin returns nothing and the caller sees
+    // nread == 0. Clamp to the virtual size and serve what exists.
+    const uint64_t vsize = view->virtualSize();
+    const uint32_t served =
+        offset >= vsize ? 0u : static_cast<uint32_t>(std::min<uint64_t>(size, vsize - offset));
+    if (served == 0) { // at or past EOF, or a zero-length request: 0 bytes, not an error
+      complete(handler, okStatus(), chunkResponse(offset, 0, buffer));
+      return XRootDStatus();
+    }
     auto st = st_;
     ChunkList one;
-    one.emplace_back(offset, size, buffer);
+    one.emplace_back(offset, served, buffer);
     Executor::instance().post([st, entry, view, one = std::move(one), handler]() mutable {
       stitchedServe(st, entry, view, std::move(one), /*isVRead=*/false, handler);
     });
@@ -1629,12 +1642,21 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
     noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
                                  // reads as Read, so it must be sampled too
   if (auto view = currentView(); entry && view) {
-    if (size == 0 || offset + size < offset || offset + size > view->virtualSize()) {
+    if (offset + size < offset) { // overflow
       noteRelayBytes(st_, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->PgRead(offset, size, buffer, rh, timeout);
       });
     }
+    // Same clamp as Read: past EOF is a short read, and the origin cannot
+    // produce one for a file that is larger here than it is there.
+    const uint64_t pgVsize = view->virtualSize();
+    if (offset >= pgVsize || size == 0) {
+      complete(handler, okStatus(), new AnyObject());
+      return XRootDStatus();
+    }
+    if (offset + size > pgVsize)
+      size = static_cast<uint32_t>(pgVsize - offset);
     struct PgAdapter : ResponseHandler {
       ResponseHandler* user;
       uint64_t off;

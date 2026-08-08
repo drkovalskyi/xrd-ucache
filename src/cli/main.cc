@@ -1726,17 +1726,9 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       // the FIRST hint that this might be one. Only then is the RNTuple parse
       // attempted, which keeps the cost off every TTree entry and leaves that
       // path's behaviour exactly as it was.
-      //
-      // OFF BY DEFAULT. Building one of these works and is verified, but the
-      // resulting replica does not yet SERVE: ROOT aborts with a short read
-      // ("nread == nbytes violated" in its own mini-file reader) when it
-      // follows the patched anchor. Enabled by default this would be a
-      // regression — an RNTuple entry that used to serve from the byte tier
-      // would instead get a replica that breaks reads — so it stays behind an
-      // explicit opt-in until serving is fixed and gated.
       tp::RNTupleMeta rm;
       bool isRNTuple = false;
-      if (!fm.error.empty() && ::getenv("UCACHE_EXPERIMENTAL_RNTUPLE_REPLICA")) {
+      if (!fm.error.empty()) {
         rm = tp::parseRNTuple(key->dataPath(cfg.cacheDir), "");
         isRNTuple = rm.error.empty();
       }
