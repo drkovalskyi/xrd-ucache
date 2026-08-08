@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
+#include <utility>
 #include <unistd.h>
 
 namespace ucache::transpose {
@@ -76,8 +78,24 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   std::vector<uint8_t> pl = m.pageList; // patched copy
   std::vector<uint8_t> buf, raw;
 
+  // RNTuple SHARES pages: distinct page records can point at the same bytes
+  // (identical pages are written once). Re-encoding each record separately is
+  // correct but writes the duplicate, so a source page already transcoded is
+  // reused — same input, same output, and the locators simply both point at it.
+  std::map<std::pair<uint64_t, uint32_t>, std::pair<uint64_t, uint32_t>> seen;
+
   for (const auto& range : m.ranges) {
     for (const auto& pg : range.pages) {
+      {
+        auto it = seen.find({pg.offset, pg.nbytes});
+        if (it != seen.end()) {
+          putLE(pl.data() + pg.recordOffset + 4, it->second.second, 4);
+          putLE(pl.data() + pg.recordOffset + 8, it->second.first, 8);
+          ++rw.pages;
+          ++rw.sharedPages;
+          continue;
+        }
+      }
       const uint64_t onDisk = (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0);
       if (!src.has(pg.offset, onDisk))
         return fail("page bytes not available", true);
@@ -127,6 +145,7 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
       // 16-byte page record.
       putLE(pl.data() + pg.recordOffset + 4, (uint64_t)enc.size(), 4);
       putLE(pl.data() + pg.recordOffset + 8, at, 8);
+      seen[{pg.offset, pg.nbytes}] = {at, (uint32_t)enc.size()};
 
       ++rw.pages;
       rw.oldPageBytes += onDisk;
@@ -204,6 +223,76 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   }
 
   return rw;
+}
+
+Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw) {
+  Overlay ov;
+  if (!rw.error.empty()) {
+    ov.error = rw.error;
+    ov.transient = rw.transient;
+    return ov;
+  }
+
+  // Patches first, then the extension: extents must be sorted by virtual
+  // offset and non-overlapping, and .tdata is concatenated in the same order.
+  struct Piece {
+    uint64_t virtOff;
+    const std::vector<uint8_t>* bytes;
+  };
+  std::vector<Piece> pieces;
+  for (const auto& p : rw.patches) pieces.push_back({p.offset, &p.bytes});
+  std::sort(pieces.begin(), pieces.end(),
+            [](const Piece& a, const Piece& b) { return a.virtOff < b.virtOff; });
+  for (size_t i = 1; i < pieces.size(); ++i) {
+    if (pieces[i].virtOff < pieces[i - 1].virtOff + pieces[i - 1].bytes->size()) {
+      ov.error = "overlapping patch windows";
+      return ov;
+    }
+  }
+
+  uint64_t tdataAt = 0;
+  for (const auto& pc : pieces) {
+    ov.tdata.insert(ov.tdata.end(), pc.bytes->begin(), pc.bytes->end());
+    ov.meta.extents.push_back({pc.virtOff, pc.bytes->size(), tdataAt});
+    tdataAt += pc.bytes->size();
+  }
+  ov.meta.extents.push_back({rw.extBase, rw.extension.size(), tdataAt});
+  ov.tdata.insert(ov.tdata.end(), rw.extension.begin(), rw.extension.end());
+
+  // Superseded: the pages the rewrite replaced, plus the page list and footer
+  // it repointed away from. The HEADER envelope is not superseded — the
+  // rewrite still points at it.
+  std::vector<ReplicaMeta::Range> sup;
+  for (const auto& range : m.ranges)
+    for (const auto& pg : range.pages)
+      sup.push_back({pg.offset, (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0)});
+  if (m.pageListNbytes) sup.push_back({m.pageListOffset, m.pageListNbytes});
+  if (m.anchor.nbytesFooter) sup.push_back({m.anchor.seekFooter, m.anchor.nbytesFooter});
+
+  // Merge, so reclaim is a few large punches rather than one per page.
+  std::sort(sup.begin(), sup.end(),
+            [](const auto& a, const auto& b) { return a.off < b.off; });
+  std::vector<ReplicaMeta::Range> merged;
+  for (const auto& r : sup) {
+    if (!merged.empty() && r.off <= merged.back().off + merged.back().len) {
+      const uint64_t end = std::max(merged.back().off + merged.back().len, r.off + r.len);
+      merged.back().len = end - merged.back().off;
+    } else {
+      merged.push_back(r);
+    }
+  }
+  ov.meta.superseded = std::move(merged);
+  ov.meta.virtualSize = rw.extBase + rw.extension.size();
+  ov.meta.originSize = m.fileSize;
+  ov.meta.encoding = ReplicaMeta::kZstd1;
+  ov.baskets = rw.pages; // pages here; the accounting field is shared
+  ov.transcoded = rw.pages - rw.storedRaw;
+  ov.fallbackRaw = rw.storedRaw;
+  ov.oldBytes = rw.oldPageBytes;
+  ov.newBytes = rw.newPageBytes;
+  ov.decodeBytes = rw.decodeBytes;
+  ov.decodeNs = rw.decodeNs;
+  return ov;
 }
 
 bool writeRewrittenRNTuple(const std::string& srcPath, const std::string& dstPath,

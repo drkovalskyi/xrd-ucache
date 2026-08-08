@@ -112,6 +112,10 @@ struct RNTupleMeta {
   std::vector<uint8_t> header, footer, pageList;
   // Where the footer records the page-list locator (length, nbytes, offset).
   uint32_t pageListLocatorOffset = 0;
+  // ...and where that locator currently points, so a rewrite can mark the
+  // superseded copy as reclaimable.
+  uint64_t pageListOffset = 0;
+  uint32_t pageListNbytes = 0;
 };
 
 // Parse the RNTuple named `ntuple` out of `path`. On any malformed or

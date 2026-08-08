@@ -322,6 +322,8 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
   }
 
   // --- page list: cluster summaries, then per-column page lists -----------
+  m.pageListOffset = pageLists[0].second.second;
+  m.pageListNbytes = pageLists[0].second.first;
   m.pageList = readEnvelope(fd, pageLists[0].second.second, pageLists[0].second.first,
                             pageLists[0].first, fsz);
   ::close(fd);

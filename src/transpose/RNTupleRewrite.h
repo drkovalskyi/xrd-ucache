@@ -38,6 +38,9 @@ struct RNTupleRewrite {
   std::vector<RNTuplePatch> patches; // anchor payload, and fEND
 
   uint64_t pages = 0, storedRaw = 0;
+  // Page records whose bytes were already transcoded for an earlier record —
+  // RNTuple writes an identical page once and points several records at it.
+  uint64_t sharedPages = 0;
   uint64_t oldPageBytes = 0, newPageBytes = 0;
   uint64_t decodeBytes = 0, decodeNs = 0; // calibration data, as for baskets
 
@@ -58,5 +61,12 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
 // the result and reports the same physics.
 bool writeRewrittenRNTuple(const std::string& srcPath, const std::string& dstPath,
                            const RNTupleRewrite& rw, std::string& error);
+
+// Package a rewrite as a replica overlay — the same artifact the basket
+// transposer emits, so it publishes and serves through the existing path
+// unchanged. The patch windows and the extension become extents over .tdata;
+// the pages they replace become superseded ranges, which is what makes the
+// original bytes reclaimable.
+Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw);
 
 } // namespace ucache::transpose

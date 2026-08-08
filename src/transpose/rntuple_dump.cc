@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 
 int main(int argc, char** argv) {
@@ -20,13 +21,17 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  size_t pages = 0, checksummed = 0;
+  size_t pages = 0, checksummed = 0, zeroSized = 0;
   std::map<int32_t, size_t> comp;
+  std::set<uint64_t> offsets;
   for (const auto& r : m.ranges) {
     pages += r.pages.size();
     comp[r.compressionSettings]++;
-    for (const auto& p : r.pages)
+    for (const auto& p : r.pages) {
       if (p.hasChecksum) ++checksummed;
+      if (p.nbytes == 0) ++zeroSized;
+      offsets.insert(p.offset);
+    }
   }
 
   std::printf("{\"ntuple\":\"%s\",\"writer\":\"%s\",", m.ntupleName.c_str(), m.writer.c_str());
@@ -36,6 +41,8 @@ int main(int argc, char** argv) {
               (unsigned long long)m.nEntries, m.nClusters, m.columns.size());
   std::printf("\"pages\":%zu,\"pages_with_checksum\":%zu,\"ranges\":%zu,", pages, checksummed,
               m.ranges.size());
+  // Distinct offsets below the page count means pages share bytes on disk.
+  std::printf("\"distinct_page_offsets\":%zu,\"zero_sized_pages\":%zu,", offsets.size(), zeroSized);
   std::printf("\"compression\":{");
   bool first = true;
   for (const auto& kv : comp) {
