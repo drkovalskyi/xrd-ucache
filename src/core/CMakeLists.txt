@@ -13,6 +13,7 @@ add_library(ucache-core STATIC
   Trace.cc
   UrlKey.cc
   vendor/crc32c.cc
+  vendor/xxh3.cc
   vendor/sha256.cc
 )
 set_target_properties(ucache-core PROPERTIES POSITION_INDEPENDENT_CODE ON)

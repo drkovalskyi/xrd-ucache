@@ -12,6 +12,7 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(ucache-unit-tests
   unit/crc32c_test.cc
+  unit/xxh3_test.cc
   unit/sha256_test.cc
   unit/config_test.cc
   unit/log_test.cc
