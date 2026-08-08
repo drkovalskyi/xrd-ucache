@@ -93,6 +93,13 @@ struct ColumnRange {
 
 struct RNTupleMeta {
   std::string error;    // non-empty => nothing below is meaningful
+  uint64_t fileSize = 0;
+  int64_t fend = 0;
+  // fEND's width in the file header. A file that outgrew 2 GB after its keys
+  // list was written keeps narrow records elsewhere, so this width is valid
+  // only at fEND's own site — and a rewrite that pushes fEND past 2 GB under a
+  // narrow header cannot be patched in place at all.
+  int headerSeekWidth = 8;
   std::string ntupleName;
   std::string writer;   // e.g. "ROOT v6.36.02"; self-identifying, do not assume
   RNTupleAnchor anchor;

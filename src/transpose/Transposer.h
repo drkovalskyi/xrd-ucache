@@ -81,4 +81,9 @@ std::vector<std::string> deriveHotBranches(const FileMeta& fm, Source& src,
 // Build the overlay for `hot` (already counter-completed) over `src`.
 Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::string>& hot);
 
+// raw bytes -> a ROOT multi-frame ZSTD container. Exposed because RNTuple
+// pages are the same ROOT block format as TTree baskets and must be encoded
+// identically; one encoder, so the two cannot drift.
+std::vector<uint8_t> encodeZstdFrames(const uint8_t* raw, size_t n, int level);
+
 } // namespace ucache::transpose

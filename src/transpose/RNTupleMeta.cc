@@ -174,6 +174,9 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
     return fail(cm.error);
   }
   const uint64_t fsz = (uint64_t)cm.fileSize;
+  m.fileSize = fsz;
+  m.fend = cm.fend;
+  m.headerSeekWidth = cm.headerSeekWidth;
 
   // The anchor hangs off a key whose class is ROOT::RNTuple; that class name
   // is the ONLY thing distinguishing this container from a TTree one.

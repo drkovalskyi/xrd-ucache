@@ -399,4 +399,8 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
   return ov;
 }
 
+std::vector<uint8_t> encodeZstdFrames(const uint8_t* raw, size_t n, int level) {
+  return zstdFrames(raw, n, level);
+}
+
 } // namespace ucache::transpose
