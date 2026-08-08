@@ -12,6 +12,7 @@
 #include "UrlKey.h"
 #ifdef UCACHE_HAVE_TRANSPOSE
 #include "CacheSource.h"
+#include "RNTupleRewrite.h"
 #include "Transposer.h"
 namespace tp = ucache::transpose;
 #endif
@@ -1693,8 +1694,53 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         }
       }
       // Parse + hot set once; gate before any transcode work.
+      // Publishing is identical whatever produced the overlay, so both the
+      // basket and the page builder end here rather than each growing a copy.
+      auto publishOverlay = [&](const tp::Overlay& ov) -> bool {
+        ReplicaMeta meta = ov.meta;
+        meta.originMtime = cm->originMtime;
+        meta.cksumKind = cm->cksumKind;
+        meta.originCksum = cm->originCksum;
+        if (meta.originSize != cm->fileSize ||
+            rs.publish(*key, meta, ov.tdata.data(), ov.tdata.size()) != 0)
+          return false;
+        decB += ov.decodeBytes;
+        decNs += ov.decodeNs;
+        auto view = rs.openView(*key, meta.originSize, meta.originMtime, cm->cksumKind,
+                                cm->originCksum);
+        if (!view)
+          return false;
+        uint64_t punchedB = 0;
+        if (mode == RecompressMode::kSweep) // background never punches live v1
+          if (auto entry = store.open(*key, meta.originSize, meta.originMtime, cm->cksumKind,
+                                      cm->originCksum))
+            punchedB = punchPerReclaim(rs, *entry, view->meta(), cfg);
+        totOverlay += ov.tdata.size();
+        totPunched += punchedB;
+        ++done;
+        return true;
+      };
+
       tp::FileMeta fm = tp::parseFile(key->dataPath(cfg.cacheDir), "Events");
-      if (!fm.error.empty()) {
+      // An RNTuple container has no TTree to find, so the tree parse failing is
+      // the FIRST hint that this might be one. Only then is the RNTuple parse
+      // attempted, which keeps the cost off every TTree entry and leaves that
+      // path's behaviour exactly as it was.
+      //
+      // OFF BY DEFAULT. Building one of these works and is verified, but the
+      // resulting replica does not yet SERVE: ROOT aborts with a short read
+      // ("nread == nbytes violated" in its own mini-file reader) when it
+      // follows the patched anchor. Enabled by default this would be a
+      // regression — an RNTuple entry that used to serve from the byte tier
+      // would instead get a replica that breaks reads — so it stays behind an
+      // explicit opt-in until serving is fixed and gated.
+      tp::RNTupleMeta rm;
+      bool isRNTuple = false;
+      if (!fm.error.empty() && ::getenv("UCACHE_EXPERIMENTAL_RNTUPLE_REPLICA")) {
+        rm = tp::parseRNTuple(key->dataPath(cfg.cacheDir), "");
+        isRNTuple = rm.error.empty();
+      }
+      if (!fm.error.empty() && !isRNTuple) {
         // The parser reads the header, keys list and tree key from the sparse
         // image DIRECTLY, without the bitmap gate and checksum that basket reads
         // go through, so on a partially cached entry a hole surfaces here as
@@ -1726,6 +1772,36 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       CacheSource csrc;
       csrc.fd = fd;
       csrc.meta = &*cm;
+      if (isRNTuple) {
+        // Pages are relocated per (cluster, column) range, to ZSTD-1 — the
+        // same target the basket path uses.
+        auto rw = tp::buildRNTupleRewrite(rm, csrc, rm.fileSize, 1, cfg.recompressCodecs);
+        if (rw.rangesRelocated == 0) {
+          // Same three-way distinction the basket path draws, for the same
+          // reason: "nothing happened" hides whether the policy declined the
+          // file, nothing was cached, or there was nothing to do.
+          ::close(fd);
+          if (rw.rangesDeclined > 0) {
+            ++declined;
+            std::lock_guard<std::mutex> g(outMu);
+            if (!rw.declinedCodec.empty())
+              declinedCodecs.insert(rw.declinedCodec);
+          } else {
+            ++skipped;
+          }
+          continue;
+        }
+        tp::Overlay ov = tp::rnTupleOverlay(rm, rw);
+        ::close(fd);
+        if (!ov.error.empty()) {
+          std::lock_guard<std::mutex> g(outMu);
+          std::fprintf(stderr, "recompress: build failed: %s\n", ov.error.c_str());
+          ++failed;
+          continue;
+        }
+        if (!publishOverlay(ov)) ++failed;
+        continue;
+      }
       auto hot = tp::deriveHotBranches(fm, csrc, cfg.recompressCodecs);
       if (hot.empty()) {
         // Nothing to transcode here. Two very different reasons, and conflating
@@ -1776,30 +1852,8 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         }
         continue;
       }
-      ReplicaMeta meta = ov.meta;
-      meta.originMtime = cm->originMtime;
-      meta.cksumKind = cm->cksumKind;
-      meta.originCksum = cm->originCksum;
-      if (meta.originSize != cm->fileSize ||
-          rs.publish(*key, meta, ov.tdata.data(), ov.tdata.size()) != 0) {
+      if (!publishOverlay(ov))
         ++failed;
-        continue;
-      }
-      decB += ov.decodeBytes;
-      decNs += ov.decodeNs;
-      if (auto view = rs.openView(*key, meta.originSize, meta.originMtime, cm->cksumKind,
-                                  cm->originCksum)) {
-        uint64_t punchedB = 0;
-        if (mode == RecompressMode::kSweep) // background never punches live v1
-          if (auto entry = store.open(*key, meta.originSize, meta.originMtime, cm->cksumKind,
-                                      cm->originCksum))
-            punchedB = punchPerReclaim(rs, *entry, view->meta(), cfg);
-        totOverlay += ov.tdata.size();
-        totPunched += punchedB;
-        ++done;
-      } else {
-        ++failed;
-      }
     }
   };
   // A throw escaping a std::thread terminates the process, and this worker
