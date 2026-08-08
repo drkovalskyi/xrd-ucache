@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <map>
+#include <set>
 #include <utility>
 #include <unistd.h>
 
@@ -62,8 +63,19 @@ uint64_t appendBlob(std::vector<uint8_t>& ext, uint64_t extBase, const std::vect
 
 } // namespace
 
-RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize,
-                                   int level) {
+std::string rnTupleCodecName(int32_t compressionSettings) {
+  switch (compressionSettings / 100) {
+    case 0: return "none";
+    case 1: return "zlib";
+    case 2: return "lzma";
+    case 4: return "lz4";
+    case 5: return "zstd";
+    default: return "";
+  }
+}
+
+RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize, int level,
+                                   const std::vector<std::string>& codecs) {
   RNTupleRewrite rw;
   rw.extBase = fileSize;
   auto fail = [&](std::string why, bool transient = false) {
@@ -83,8 +95,38 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   // correct but writes the duplicate, so a source page already transcoded is
   // reused — same input, same output, and the locators simply both point at it.
   std::map<std::pair<uint64_t, uint32_t>, std::pair<uint64_t, uint32_t>> seen;
+  // Page offsets still referenced by a range this build did NOT relocate.
+  // Sharing makes this necessary: punching a page because one range moved off
+  // it would silently destroy a page another range is still serving from.
+  std::set<uint64_t> live;
+  std::vector<ReplicaMeta::Range> supersedeCandidates;
 
   for (const auto& range : m.ranges) {
+    // Eligibility is decided for the whole range BEFORE any transcode work,
+    // because a range that turns out to be unusable half way through would
+    // leave its locators half patched.
+    if (!codecs.empty()) {
+      const std::string codec = rnTupleCodecName(range.compressionSettings);
+      if (std::find(codecs.begin(), codecs.end(), codec) == codecs.end()) {
+        ++rw.rangesDeclined;
+        if (rw.declinedCodec.empty() && !codec.empty()) rw.declinedCodec = codec;
+        for (const auto& pg : range.pages) live.insert(pg.offset);
+        continue;
+      }
+    }
+    bool cached = true;
+    for (const auto& pg : range.pages)
+      if (!src.has(pg.offset, (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0))) {
+        cached = false;
+        break;
+      }
+    if (!cached) {
+      ++rw.rangesUncached;
+      for (const auto& pg : range.pages) live.insert(pg.offset);
+      continue; // left pointing at the original bytes
+    }
+    ++rw.rangesRelocated;
+
     for (const auto& pg : range.pages) {
       {
         auto it = seen.find({pg.offset, pg.nbytes});
@@ -150,10 +192,23 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
       ++rw.pages;
       rw.oldPageBytes += onDisk;
       rw.newPageBytes += stored.size();
+      supersedeCandidates.push_back({pg.offset, onDisk});
     }
     // ROOT's usual algorithm*100 + level; 5 is ZSTD.
     putLE(pl.data() + range.compressionOffset, (uint64_t)(500 + level), 4);
   }
+
+  if (rw.rangesRelocated == 0) {
+    // Nothing moved, so an overlay would be pure overhead. The counters say
+    // WHY — codec policy, or nothing cached — and the caller reports that
+    // rather than a bare failure.
+    return fail("no eligible column ranges", rw.rangesUncached > 0 && rw.rangesDeclined == 0);
+  }
+
+  // Only pages this build actually moved off may be punched, and only when no
+  // range left in place still points at them.
+  for (const auto& r : supersedeCandidates)
+    if (!live.count(r.off)) rw.superseded.push_back(r);
 
   // Re-seal the page list, then store it compressed like any other payload.
   sealEnvelope(pl.data(), pl.size());
@@ -262,10 +317,7 @@ Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw) {
   // Superseded: the pages the rewrite replaced, plus the page list and footer
   // it repointed away from. The HEADER envelope is not superseded — the
   // rewrite still points at it.
-  std::vector<ReplicaMeta::Range> sup;
-  for (const auto& range : m.ranges)
-    for (const auto& pg : range.pages)
-      sup.push_back({pg.offset, (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0)});
+  std::vector<ReplicaMeta::Range> sup = rw.superseded;
   if (m.pageListNbytes) sup.push_back({m.pageListOffset, m.pageListNbytes});
   if (m.anchor.nbytesFooter) sup.push_back({m.anchor.seekFooter, m.anchor.nbytesFooter});
 

@@ -36,11 +36,22 @@ struct RNTupleRewrite {
   uint64_t extBase = 0;             // where `extension` is appended (old file size)
   std::vector<uint8_t> extension;   // relocated pages + page list + footer
   std::vector<RNTuplePatch> patches; // anchor payload, and fEND
+  // Original ranges the overlay replaced, and therefore the only ones safe to
+  // punch. A range left un-relocated still serves from the original bytes, and
+  // because pages are SHARED a page kept alive by one such range must survive
+  // even when another, relocated range also pointed at it.
+  std::vector<ReplicaMeta::Range> superseded;
 
   uint64_t pages = 0, storedRaw = 0;
   // Page records whose bytes were already transcoded for an earlier record —
   // RNTuple writes an identical page once and points several records at it.
   uint64_t sharedPages = 0;
+  // Work is counted in (cluster, column) RANGES, not pages: the compression
+  // setting is recorded per range, so a range can only be relocated whole.
+  uint64_t rangesRelocated = 0, rangesUncached = 0, rangesDeclined = 0;
+  // A source codec actually observed on a declined range, so the caller can
+  // tell the user which codec to add to the policy rather than guessing.
+  std::string declinedCodec;
   uint64_t oldPageBytes = 0, newPageBytes = 0;
   uint64_t decodeBytes = 0, decodeNs = 0; // calibration data, as for baskets
 
@@ -50,11 +61,23 @@ struct RNTupleRewrite {
   bool transient = false;
 };
 
-// Recompress every page of `m` to ZSTD at `level`, reading original page bytes
+// Recompress `m`'s pages to ZSTD at `level`, reading original page bytes
 // through `src`. `fileSize` is the source file's size, which is where the
 // extension begins.
-RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize,
-                                   int level);
+//
+// Works per (cluster, column) RANGE and relocates a range only when every one
+// of its pages is available AND its source codec is listed in `codecs` (empty
+// = no filter). A range that is not relocated is left pointing at the original
+// bytes, so a partially cached entry yields a partial replica instead of no
+// replica — the same behaviour the basket path has for hot branches. Doing
+// this per page would be wrong: the compression setting is recorded once per
+// range and could not describe a range that was only half relocated.
+RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize, int level,
+                                   const std::vector<std::string>& codecs = {});
+
+// Codec name for a page-list compression setting ("lzma"/"zlib"/"zstd"/"lz4"/
+// "none"), the same vocabulary the recompress policy is written in.
+std::string rnTupleCodecName(int32_t compressionSettings);
 
 // Apply a rewrite to a copy of `srcPath`, producing a standalone file. This is
 // the verification path: the arbiter for any change here is whether ROOT reads

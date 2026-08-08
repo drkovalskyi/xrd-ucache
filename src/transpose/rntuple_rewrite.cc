@@ -9,23 +9,34 @@
 #include <cstring>
 #include <fcntl.h>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 namespace {
 
 // Plain-file byte source: every byte is present, which is the difference
 // between rewriting a file and rewriting a partially cached entry.
+//
+// UCACHE_TEST_HIDE_ABOVE makes it declare everything past an offset absent, so
+// the partial-cache path — the one that produces a partly relocated file — can
+// be exercised without building a real half-filled cache entry.
 class FileSource : public ucache::transpose::Source {
 public:
-  explicit FileSource(int fd, uint64_t size) : fd_(fd), size_(size) {}
+  explicit FileSource(int fd, uint64_t size) : fd_(fd), size_(size) {
+    if (const char* h = ::getenv("UCACHE_TEST_HIDE_ABOVE")) hide_ = std::strtoull(h, nullptr, 10);
+  }
   bool read(void* dst, uint64_t n, uint64_t off) override {
     return ::pread(fd_, dst, n, (off_t)off) == (ssize_t)n;
   }
-  bool has(uint64_t off, uint64_t n) override { return off + n <= size_ && off + n >= off; }
+  bool has(uint64_t off, uint64_t n) override {
+    if (off + n < off || off + n > size_) return false;
+    return hide_ == 0 || off + n <= hide_;
+  }
 
 private:
   int fd_;
   uint64_t size_;
+  uint64_t hide_ = 0;
 };
 
 } // namespace
@@ -36,6 +47,16 @@ int main(int argc, char** argv) {
     return 2;
   }
   const int level = argc > 3 ? std::atoi(argv[3]) : 1;
+  std::vector<std::string> codecs; // comma-separated source-codec policy
+  if (argc > 4) {
+    std::string s = argv[4], cur;
+    for (char c : s + ",")
+      if (c == ',') {
+        if (!cur.empty()) codecs.push_back(cur);
+        cur.clear();
+      } else
+        cur += c;
+  }
 
   auto m = ucache::transpose::parseRNTuple(argv[1], "");
   if (!m.error.empty()) {
@@ -48,7 +69,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   FileSource src(fd, m.fileSize);
-  auto rw = ucache::transpose::buildRNTupleRewrite(m, src, m.fileSize, level);
+  auto rw = ucache::transpose::buildRNTupleRewrite(m, src, m.fileSize, level, codecs);
   ::close(fd);
   if (!rw.error.empty()) {
     std::fprintf(stderr, "rewrite: %s%s\n", rw.error.c_str(), rw.transient ? " (retryable)" : "");
@@ -96,6 +117,10 @@ int main(int argc, char** argv) {
               rw.oldPageBytes ? (double)rw.newPageBytes / (double)rw.oldPageBytes : 0.0,
               (unsigned long long)rw.extension.size(), (unsigned long long)rw.decodeBytes,
               rw.decodeNs / 1e6);
+  std::printf("{\"ranges_relocated\":%llu,\"ranges_uncached\":%llu,\"ranges_declined\":%llu,"
+              "\"shared_pages\":%llu}\n",
+              (unsigned long long)rw.rangesRelocated, (unsigned long long)rw.rangesUncached,
+              (unsigned long long)rw.rangesDeclined, (unsigned long long)rw.sharedPages);
   std::printf("{\"overlay_extents\":%zu,\"tdata_bytes\":%zu,\"superseded_ranges\":%zu,"
               "\"superseded_bytes\":%llu,\"virtual_size\":%llu,\"stitch\":\"matches\"}\n",
               ov.meta.extents.size(), ov.tdata.size(), ov.meta.superseded.size(),
