@@ -37,7 +37,10 @@ target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing 
 target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin)
 if (TARGET ucache-transpose) # learner + seek-width + hole-verification contracts
   target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc
-                 unit/transpose_hole_test.cc unit/rntuple_meta_test.cc)
+                 unit/transpose_hole_test.cc unit/rntuple_meta_test.cc
+                 unit/rntuple_rewrite_test.cc)
+  target_compile_definitions(ucache-unit-tests PRIVATE
+                             UCACHE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)
   target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/cli) # CacheSource.h
 endif()

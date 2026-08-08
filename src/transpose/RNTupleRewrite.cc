@@ -145,6 +145,21 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
       if (pg.nbytes && !src.read(raw.data(), pg.nbytes, pg.offset))
         return fail("page read failed", true);
 
+      // Verify the page against the checksum the FORMAT already carries,
+      // before anything is re-encoded. Skipping this is not a theoretical
+      // risk: a page stored uncompressed decodes to itself, so damaged bytes
+      // pass straight through the transcoder and into a replica that then
+      // serves them for ever. The checksum is right there — use it.
+      if (pg.hasChecksum) {
+        uint8_t ck[8];
+        if (!src.read(ck, 8, pg.offset + pg.nbytes))
+          return fail("page checksum read failed", true);
+        uint64_t stored = 0;
+        for (int i = 7; i >= 0; --i) stored = (stored << 8) | ck[(size_t)i];
+        if (xxh3_64(raw.data(), raw.size()) != stored)
+          return fail("page checksum mismatch — source bytes are damaged (run `ucache verify`)");
+      }
+
       // The page's uncompressed size is authoritative from the schema, not
       // from the block header: a bit-packed column's byte count is a ceiling
       // over the element count and nothing on disk restates it.
