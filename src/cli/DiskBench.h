@@ -42,6 +42,14 @@ struct DiskBenchOpts {
   double phaseSeconds = 5.0;         // --phase-seconds (per timed phase)
   std::vector<int> streams{1, 16};   // --streams (parallel-stream counts)
   uint64_t blockBytes = 4ull << 20;  // --block (large-block read/write size)
+  // The expected-fill-pattern stage. Defaults are MEASURED, not assumed: a
+  // cold analysis fills through ONE stream (uCache keys one entry per URL and
+  // drains per entry, so the analysis thread count never reaches the write
+  // path) in ~48 KiB writes (one contiguous run of requested pages — the
+  // basket, not the coalescing ceiling).
+  int fillWriters = 1;               // --fill writers=
+  uint64_t fillBlock = 48ull << 10;  // --fill block=
+  uint64_t fillFile = 256ull << 20;  // --fill file=
   std::string logPath = "ucache-bench.txt"; // --log; empty = --no-log
   std::string cmdline;               // the invocation, recorded in the log
 };

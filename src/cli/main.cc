@@ -598,6 +598,48 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
         return 2;
       }
       opts.blockBytes = kb * 1024;
+    } else if (a == "--fill" || a.rfind("--fill=", 0) == 0) {
+      // One flag, keyword list, so a sixth parameter later does not add a
+      // sixth flag: --fill writers=1,block=48k,file=256m
+      const char* v = flagValue(argc, argv, i, 6);
+      bool bad = !v || !*v;
+      for (const char* p = v; !bad && *p;) {
+        const char* eq = std::strchr(p, '=');
+        if (!eq) {
+          bad = true;
+          break;
+        }
+        std::string key(p, static_cast<size_t>(eq - p));
+        const char* val = eq + 1;
+        uint64_t num = 0;
+        if (key == "writers") {
+          char* end = nullptr;
+          long w = std::strtol(val, &end, 10);
+          if (end == val || w < 1 || w > 256)
+            bad = true;
+          else
+            opts.fillWriters = static_cast<int>(w);
+        } else if (key == "block" || key == "file") {
+          if (!parseSizeArg(std::string(val, std::strcspn(val, ",")).c_str(), num) || num == 0)
+            bad = true;
+          else if (key == "block")
+            opts.fillBlock = num;
+          else
+            opts.fillFile = num;
+        } else {
+          bad = true;
+        }
+        const char* comma = std::strchr(p, ',');
+        if (!comma)
+          break;
+        p = comma + 1;
+      }
+      if (bad) {
+        std::fputs("bench: --fill takes writers=N,block=SZ,file=SZ "
+                   "(e.g. --fill writers=1,block=48k,file=256m)\n",
+                   stderr);
+        return 2;
+      }
     } else if (a == "--log" || a.rfind("--log=", 0) == 0) {
       const char* v = flagValue(argc, argv, i, 5);
       if (!v || !*v) {

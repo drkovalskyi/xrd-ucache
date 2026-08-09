@@ -42,6 +42,9 @@ constexpr uint64_t kMaxStreamBufTotal = 1ull << 30;
 // A quarter-window shorter than this cannot carry an honest rate, so the
 // burst/sustained split is only attempted on windows of 4x it or more.
 constexpr double kMinQuarterS = 0.5;
+// Datasheets quote random IOPS at queue depth 32; pin it so the number is
+// comparable rather than a function of whatever --streams was passed.
+constexpr int kStdQd = 32;
 
 double nowS() {
   return std::chrono::duration<double>(
@@ -353,6 +356,11 @@ struct Machine {
   std::string host, kernel, arch, cpuModel;
   long ncpu = 0;
   double memGb = 0;
+  // Buffered writes are free until the kernel's dirty limit, so a buffered
+  // measurement smaller than this measures RAM. Recorded because it differs
+  // across the fleet and explains an otherwise impossible write rate.
+  int dirtyRatio = -1, dirtyBgRatio = -1;
+  double dirtyLimitGb = 0;
 };
 
 Machine machineInfo() {
@@ -386,6 +394,16 @@ Machine machineInfo() {
       break;
     }
   }
+  std::string dr = readFileTrim("/proc/sys/vm/dirty_ratio");
+  std::string db = readFileTrim("/proc/sys/vm/dirty_background_ratio");
+  if (!dr.empty())
+    m.dirtyRatio = std::atoi(dr.c_str());
+  if (!db.empty())
+    m.dirtyBgRatio = std::atoi(db.c_str());
+  std::string dbytes = readFileTrim("/proc/sys/vm/dirty_bytes");
+  uint64_t db_abs = dbytes.empty() ? 0 : std::strtoull(dbytes.c_str(), nullptr, 10);
+  m.dirtyLimitGb = db_abs ? static_cast<double>(db_abs) / (1ull << 30)
+                          : (m.dirtyRatio > 0 ? m.memGb * m.dirtyRatio / 100.0 : 0);
   return m;
 }
 
@@ -458,6 +476,13 @@ uint64_t randLoop(int fd, uint64_t fsz, bool write, char* buf, double deadline,
   }
   return ops;
 }
+
+// The expected-fill-pattern result. Reported alongside the rate because if the
+// filesystem did not issue the writes we asked for, that is the finding.
+struct FillStat {
+  double mbps = 0, filesPerS = 0, meanWriteKib = 0;
+  uint64_t writes = 0, bytes = 0, files = 0;
+};
 
 // One stream-count result. `nEff` is what actually ran: a file too small to
 // slice N ways is measured with fewer streams and says so rather than
@@ -565,20 +590,153 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
   return s;
 }
 
+// The write pattern a cold fill actually generates: N writers (measured: 1),
+// each creating its own file, extending it in `block`-sized writes, flushing,
+// closing, unlinking, and starting the next one — so allocation cost and file
+// turnover are inside the measurement, which is what makes a fill different
+// from writing to a file that already exists.
+//
+// BUFFERED is the real mode; the O_DIRECT pass is the control that shows
+// whether the kernel merged our small writes into larger device writes.
+// The fsync is INSIDE the timed window on purpose: without it a run smaller
+// than the machine's dirty limit measures RAM, not the disk.
+//
+// Thread-safety: each writer owns its files, fd and buffer; only the totals
+// (atomics) are shared.
+FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
+                   double phase) {
+  FillStat s;
+  const int nw = std::max(1, o.fillWriters);
+  uint64_t blk = std::max<uint64_t>(kAlign, o.fillBlock / kAlign * kAlign);
+  // Space bound: every writer may hold one file at a time, AND the test file
+  // is still on disk, so the fill set gets a quarter of --size, not all of it.
+  uint64_t want = std::max<uint64_t>(o.fileBytes, kMinFile) / 4 / static_cast<uint64_t>(nw);
+  uint64_t fsize = std::min(o.fillFile, want) / blk * blk;
+  if (fsize < blk)
+    fsize = blk;
+
+  std::atomic<uint64_t> bytes{0}, writes{0}, files{0};
+  double t0 = nowS(), deadline = t0 + phase;
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<size_t>(nw));
+  for (int t = 0; t < nw; ++t)
+    pool.emplace_back([&, t] {
+      char* buf = alignedBuf(blk);
+      if (!buf)
+        return;
+      uint64_t lb = 0, lw = 0, lf = 0;
+      for (int seq = 0; nowS() < deadline; ++seq) {
+        char nm[4300];
+        std::snprintf(nm, sizeof nm, "%s/fill%02d-%06d", dir.c_str(), t, seq);
+        int fd = ::open(nm, O_WRONLY | O_CREAT | O_TRUNC | (direct ? O_DIRECT : 0), 0600);
+        if (fd < 0)
+          break;
+        for (uint64_t off = 0; off < fsize && nowS() < deadline; off += blk) {
+          if (::pwrite(fd, buf, blk, static_cast<off_t>(off)) != static_cast<ssize_t>(blk))
+            break;
+          lb += blk;
+          ++lw;
+        }
+        ::fdatasync(fd); // inside the window: otherwise this measures RAM
+        ::close(fd);
+        ::unlink(nm);
+        ++lf;
+      }
+      ::free(buf);
+      bytes += lb;
+      writes += lw;
+      files += lf;
+    });
+  for (auto& th : pool)
+    th.join();
+  double el = std::max(1e-9, nowS() - t0);
+  s.bytes = bytes.load();
+  s.writes = writes.load();
+  s.files = files.load();
+  s.mbps = static_cast<double>(s.bytes) / 1e6 / el;
+  s.filesPerS = static_cast<double>(s.files) / el;
+  s.meanWriteKib = s.writes ? static_cast<double>(s.bytes) / s.writes / 1024.0 : 0;
+  return s;
+}
+
+// Random reads of an arbitrary block size at a given queue depth. 4 KiB is the
+// datasheet number; the tiers uCache actually serves from read at ~42 KiB
+// (byte cache) and ~599 KiB (replica), which sit between the standard 4 KiB
+// and 4 MiB points — and that interval is where a device stops being
+// op-bound and becomes bandwidth-bound, so it cannot be interpolated.
+StreamStat randSizeStage(const std::string& tf, int rflags, uint64_t fsz, int qd,
+                         uint64_t blk, double phase, bool write) {
+  StreamStat s;
+  s.n = s.nEff = qd;
+  blk = std::max<uint64_t>(kAlign, blk / kAlign * kAlign);
+  if (fsz <= blk)
+    return s;
+  const uint64_t slots = (fsz - blk) / blk;
+  std::atomic<uint64_t> ops{0};
+  std::mutex mu;
+  std::vector<uint32_t> us;
+  const size_t cap = std::max<size_t>(20000, 500000 / static_cast<size_t>(qd));
+  double t0 = nowS(), deadline = t0 + phase;
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<size_t>(qd));
+  for (int t = 0; t < qd; ++t)
+    pool.emplace_back([&, t] {
+      int fd = ::open(tf.c_str(), write ? (rflags & ~O_RDONLY) | O_WRONLY : rflags);
+      char* buf = alignedBuf(blk);
+      std::vector<uint32_t> mine;
+      std::mt19937_64 rng(900 + static_cast<uint64_t>(t));
+      uint64_t n = 0;
+      while (fd >= 0 && buf && nowS() < deadline) {
+        uint64_t off = (rng() % slots) * blk;
+        double a = nowS();
+        ssize_t r = write ? ::pwrite(fd, buf, blk, static_cast<off_t>(off))
+                          : ::pread(fd, buf, blk, static_cast<off_t>(off));
+        if (r != static_cast<ssize_t>(blk))
+          break;
+        if (mine.size() < cap)
+          mine.push_back(static_cast<uint32_t>(std::min(4.0e9, (nowS() - a) * 1e6)));
+        ++n;
+      }
+      if (fd >= 0)
+        ::close(fd);
+      ::free(buf);
+      ops += n;
+      std::lock_guard<std::mutex> g(mu);
+      us.insert(us.end(), mine.begin(), mine.end());
+    });
+  for (auto& th : pool)
+    th.join();
+  double el = std::max(1e-9, nowS() - t0);
+  s.iops = static_cast<double>(ops.load()) / el;
+  s.mbps = static_cast<double>(ops.load()) * static_cast<double>(blk) / 1e6 / el;
+  s.lat = percentiles(us);
+  return s;
+}
+
 // ---------------------------------------------------------------------------
 
 struct Result {
   std::string path, fs, mode, error;
   double totalGb = 0, freeGb = 0, fileMb = 0, wantMb = 0;
   bool sizeCapped = false;
-  double seqWriteMbps = 0;      // sustained — the quotable figure
-  double seqWriteBurstMbps = 0; // first quarter of the build window
-  double seqWriteWindowS = 0;   // how long the build actually ran
-  bool writeSplit = false;      // window long enough to separate the two
+  // Test-file creation. NOT a device spec: it pays allocation, runs cold, and
+  // its window length varies with --size, which is why three runs of one
+  // command on one idle SSD reported 268.5 / 451.9 / 371.9 MB/s. Kept for its
+  // SHAPE and for the allocation cost; the quotable sequential write is
+  // stdSeqWriteMbps.
+  double buildWriteMbps = 0;
+  double buildBurstMbps = 0; // first quarter of the build window
+  double buildWindowS = 0;   // how long the build actually ran
+  bool buildSplit = false;   // window long enough to separate the two
+  double stdSeqWriteMbps = 0; // STANDARD: 1 stream, large block, O_DIRECT, in place
+  uint64_t blockKib = 0;      // printed: a rate is not relatable without it
   double seqReadMbps = 0;
   double fsyncP50Ms = 0;
   double randwIops = 0;
   std::vector<StreamStat> randr, bigread, bigwrite;
+  std::vector<StreamStat> predRead;  // tier-sized random reads at job concurrency
+  StreamStat randw;                  // STANDARD: random 4 KiB write at depth
+  FillStat fillBuf, fillDir;         // expected fill pattern, both modes
   double mixedReadIops = 0, mixedWriteMbps = 0;
   Pct mixed;
   double createPs = 0, unlinkPs = 0;
@@ -595,7 +753,7 @@ struct Result {
 // shape is a fact about the run, not about the device alone, and the record
 // has to carry it.
 const char* writeShape(const Result& r) {
-  double b = r.seqWriteBurstMbps, s = r.seqWriteMbps;
+  double b = r.buildBurstMbps, s = r.buildWriteMbps;
   double hi = std::max(b, s);
   if (hi <= 0 || std::fabs(b - s) / hi <= 0.10)
     return "flat";
@@ -620,7 +778,7 @@ std::string humanBlock(const Result& r) {
   // rate, and a threshold that prints the pair only past some divergence has a
   // cliff edge: a 24% rise printed one bare number on a device sustaining half
   // of it.
-  if (r.writeSplit) {
+  if (r.buildSplit) {
     const char* shape = writeShape(r);
     const char* gloss =
         std::strcmp(shape, "FALLING") == 0
@@ -629,14 +787,16 @@ std::string humanBlock(const Result& r) {
             ? "the window never fell out of the write cache (or allocation paced the start), so "
               "this is a ceiling, not a sustained floor"
             : "steady across the window";
-    appendf(s, "  sequential write        %8.1f MB/s   (build %.0f s: %.1f -> %.1f MB/s, %s — %s)\n",
-            r.seqWriteMbps, r.seqWriteWindowS, r.seqWriteBurstMbps, r.seqWriteMbps, shape, gloss);
+    appendf(s, "  test-file creation      %8.1f MB/s   (build %.0f s: %.1f -> %.1f MB/s, %s — %s)\n",
+            r.buildWriteMbps, r.buildWindowS, r.buildBurstMbps, r.buildWriteMbps, shape, gloss);
   } else {
-    appendf(s, "  sequential write        %8.1f MB/s   (build %.0f s, too short to split)\n",
-            r.seqWriteMbps, r.seqWriteWindowS);
+    appendf(s, "  test-file creation      %8.1f MB/s   (build %.0f s, too short to split)\n",
+            r.buildWriteMbps, r.buildWindowS);
   }
   appendf(s, "  fdatasync               %8.2f ms (p50)\n", r.fsyncP50Ms);
-  appendf(s, "  scattered 4KiB write    %8.0f IOPS\n", r.randwIops);
+  appendf(s, "  scattered 4KiB write    %8.0f IOPS   (QD1)\n", r.randwIops);
+  appendf(s, "  random 4KiB write       %8.0f IOPS   (QD%d)   p50 %.2f ms   p99 %.2f ms\n",
+          r.randw.iops, kStdQd, r.randw.lat.p50 / 1e3, r.randw.lat.p99 / 1e3);
   for (size_t i = 0; i < r.randr.size(); ++i) {
     const StreamStat& t = r.randr[i];
     char lbl[64];
@@ -656,16 +816,22 @@ std::string humanBlock(const Result& r) {
       appendf(s, "   (scaling %.1fx)", t.mbps / r.bigread.front().mbps);
     appendf(s, "\n");
   }
-  appendf(s, "  sequential read         %8.1f MB/s\n", r.seqReadMbps);
-  for (size_t i = 0; i < r.bigwrite.size(); ++i) {
-    const StreamStat& t = r.bigwrite[i];
+  appendf(s, "  sequential read         %8.1f MB/s   (QD1, %llu KiB blocks)\n", r.seqReadMbps,
+          static_cast<unsigned long long>(r.blockKib));
+  for (size_t i = 0; i < r.predRead.size(); ++i) {
+    const StreamStat& t = r.predRead[i];
     char lbl[64];
-    std::snprintf(lbl, sizeof lbl, "large-block write (%d)", t.nEff);
-    appendf(s, "  %-24s%8.1f MB/s", lbl, t.mbps);
-    if (i > 0 && r.bigwrite.front().mbps > 0)
-      appendf(s, "   (scaling %.1fx)", t.mbps / r.bigwrite.front().mbps);
-    appendf(s, "\n");
+    std::snprintf(lbl, sizeof lbl, "random %lluKiB read (QD%d)",
+                  static_cast<unsigned long long>(i == 0 ? 48 : 512), t.nEff);
+    appendf(s, "  %-24s%8.1f MB/s   %8.0f IOPS   p99 %.2f ms\n", lbl, t.mbps, t.iops,
+            t.lat.p99 / 1e3);
   }
+  appendf(s, "  sequential write        %8.1f MB/s   (QD1, %llu KiB blocks, in place)\n",
+          r.stdSeqWriteMbps, static_cast<unsigned long long>(r.blockKib));
+  appendf(s, "  fill pattern (buffered) %8.1f MB/s   %5.1f files/s   writes %.1f KiB\n",
+          r.fillBuf.mbps, r.fillBuf.filesPerS, r.fillBuf.meanWriteKib);
+  appendf(s, "  fill pattern (O_DIRECT) %8.1f MB/s   %5.1f files/s   writes %.1f KiB\n",
+          r.fillDir.mbps, r.fillDir.filesPerS, r.fillDir.meanWriteKib);
   appendf(s, "  read under writeback    %8.0f IOPS   p50 %.2f ms   p99 %.2f ms   (write %.1f MB/s)\n",
           r.mixedReadIops, r.mixed.p50 / 1e3, r.mixed.p99 / 1e3, r.mixedWriteMbps);
   appendf(s, "  create / unlink         %8.0f /s   %8.0f /s\n", r.createPs, r.unlinkPs);
@@ -685,6 +851,10 @@ std::string contextBlock(const Result& r, const DiskBenchOpts& o) {
           e.mach.kernel.c_str(), e.mach.arch.c_str(), e.mach.ncpu, e.mach.memGb);
   if (!e.mach.cpuModel.empty())
     appendf(s, "  cpu       %s\n", e.mach.cpuModel.c_str());
+  if (e.mach.dirtyRatio >= 0)
+    appendf(s, "  writeback dirty_ratio %d%% / background %d%%  -> buffered writes are free "
+               "up to ~%.1f GiB\n",
+            e.mach.dirtyRatio, e.mach.dirtyBgRatio, e.mach.dirtyLimitGb);
   appendf(s, "  load      %.2f %.2f %.2f at start -> %.2f %.2f %.2f at end",
           e.load0.l1, e.load0.l5, e.load0.l15, e.load1.l1, e.load1.l5, e.load1.l15);
   if (e.cpuBusyPct() >= 0)
@@ -730,14 +900,38 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
   appendf(s, "ucache-bench-json: {\"schema\":1,\"host\":\"%s\",\"path\":\"%s\",\"fs\":\"%s\","
              "\"mode\":\"%s\",\"total_gb\":%.1f,\"free_gb\":%.1f,\"file_mb\":%.0f,"
              "\"size_capped\":%s,\"phase_s\":%.1f,\"block_kb\":%llu,\"error\":\"%s\","
-             "\"seq_write_mbps\":%.1f,\"seq_write_burst_mbps\":%.1f,"
-             "\"seq_write_window_s\":%.1f,\"seq_write_shape\":\"%s\","
-             "\"fsync_p50_ms\":%.2f,\"randw_iops\":%.0f",
+             "\"build_write_mbps\":%.1f,\"build_write_burst_mbps\":%.1f,"
+             "\"build_write_window_s\":%.1f,\"build_write_shape\":\"%s\","
+             "\"fsync_p50_ms\":%.2f,\"randw_qd1_iops\":%.0f",
           jesc(e.mach.host).c_str(), jesc(r.path).c_str(), jesc(r.fs).c_str(),
           jesc(r.mode).c_str(), r.totalGb, r.freeGb, r.fileMb, r.sizeCapped ? "true" : "false",
           o.phaseSeconds, static_cast<unsigned long long>(o.blockBytes / 1024),
-          jesc(r.error).c_str(), r.seqWriteMbps, r.seqWriteBurstMbps, r.seqWriteWindowS,
-          r.writeSplit ? writeShape(r) : "unsplit", r.fsyncP50Ms, r.randwIops);
+          jesc(r.error).c_str(), r.buildWriteMbps, r.buildBurstMbps, r.buildWindowS,
+          r.buildSplit ? writeShape(r) : "unsplit", r.fsyncP50Ms, r.randwIops);
+  // STANDARD measures, at pinned block sizes and queue depths so they can be
+  // read against a datasheet. seq_write_mbps keeps its name and now carries
+  // the in-place single-stream figure: the build-stage number it used to hold
+  // moved 68% across three runs of one command and is in build_write_mbps.
+  appendf(s, ",\"seq_write_mbps\":%.1f,\"std_block_kib\":%llu,\"std_qd\":%d,"
+             "\"randw_iops\":%.0f,\"randw_us_p50\":%llu,\"randw_us_p99\":%llu",
+          r.stdSeqWriteMbps, static_cast<unsigned long long>(r.blockKib), kStdQd, r.randw.iops,
+          static_cast<unsigned long long>(r.randw.lat.p50),
+          static_cast<unsigned long long>(r.randw.lat.p99));
+  // PREDICTIVE: tier-sized random reads at job concurrency, and the fill.
+  for (size_t i = 0; i < r.predRead.size(); ++i)
+    appendf(s, ",\"predread_%s_mbps\":%.1f,\"predread_%s_iops\":%.0f,"
+               "\"predread_%s_us_p99\":%llu",
+            i == 0 ? "48k" : "512k", r.predRead[i].mbps, i == 0 ? "48k" : "512k",
+            r.predRead[i].iops, i == 0 ? "48k" : "512k",
+            static_cast<unsigned long long>(r.predRead[i].lat.p99));
+  appendf(s, ",\"fill_writers\":%d,\"fill_block_kib\":%llu,\"fill_file_mib\":%llu,"
+             "\"fill_buffered_mbps\":%.1f,\"fill_buffered_files_ps\":%.1f,"
+             "\"fill_buffered_write_kib\":%.1f,\"fill_direct_mbps\":%.1f,"
+             "\"fill_direct_files_ps\":%.1f,\"fill_direct_write_kib\":%.1f",
+          o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024),
+          static_cast<unsigned long long>(o.fillFile >> 20), r.fillBuf.mbps,
+          r.fillBuf.filesPerS, r.fillBuf.meanWriteKib, r.fillDir.mbps, r.fillDir.filesPerS,
+          r.fillDir.meanWriteKib);
   appendf(s, ",\"streams\":[");
   for (size_t i = 0; i < r.randr.size(); ++i)
     appendf(s, "%s%d", i ? "," : "", r.randr[i].nEff);
@@ -759,10 +953,12 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
           static_cast<unsigned long long>(r.mixed.p99), r.mixedWriteMbps, r.createPs, r.unlinkPs);
   // run context
   appendf(s, ",\"time\":\"%s\",\"version\":\"%s\",\"cmd\":\"%s\",\"wall_s\":%.1f,"
-             "\"kernel\":\"%s\",\"arch\":\"%s\",\"ncpu\":%ld,\"mem_gb\":%.1f,\"cpu_model\":\"%s\"",
+             "\"kernel\":\"%s\",\"arch\":\"%s\",\"ncpu\":%ld,\"mem_gb\":%.1f,\"cpu_model\":\"%s\","
+             "\"dirty_ratio\":%d,\"dirty_background_ratio\":%d,\"dirty_limit_gb\":%.1f",
           jesc(e.startIso).c_str(), UCACHE_VERSION, jesc(o.cmdline).c_str(), e.wallS,
           jesc(e.mach.kernel).c_str(), jesc(e.mach.arch).c_str(), e.mach.ncpu, e.mach.memGb,
-          jesc(e.mach.cpuModel).c_str());
+          jesc(e.mach.cpuModel).c_str(), e.mach.dirtyRatio, e.mach.dirtyBgRatio,
+          e.mach.dirtyLimitGb);
   appendf(s, ",\"mount\":\"%s\",\"mount_fstype\":\"%s\",\"mount_source\":\"%s\","
              "\"mount_opts\":\"%s\",\"mount_super_opts\":\"%s\",\"dev\":\"%u:%u\"",
           jesc(e.mnt.mountPoint).c_str(), jesc(e.mnt.fsType).c_str(), jesc(e.mnt.source).c_str(),
@@ -793,6 +989,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   Result r;
   r.path = path;
   r.fs = fsName(path);
+  r.blockKib = o.blockBytes / 1024;
   r.env.mach = machineInfo();
   r.env.mnt = mountFor(path);
   r.env.startLocal = stamp("%Y-%m-%d %H:%M:%S %z");
@@ -897,9 +1094,9 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     ::fdatasync(wfd);
     double totalS = nowS() - t0; // the flush is part of the cost of the write
     double overall = totalS > 0 ? static_cast<double>(fsz) / 1e6 / totalS : 0;
-    r.seqWriteMbps = overall;
-    r.seqWriteBurstMbps = overall;
-    r.seqWriteWindowS = totalS;
+    r.buildWriteMbps = overall;
+    r.buildBurstMbps = overall;
+    r.buildWindowS = totalS;
     // A device write cache makes the head of the window fast and the tail
     // honest. Split only when each quarter is long enough to mean anything.
     if (writeS >= 4 * kMinQuarterS && prog.size() >= 8) {
@@ -915,9 +1112,9 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       double q1 = writeS * 0.25, q3 = writeS * 0.75;
       uint64_t b1 = bytesAt(q1), b3 = bytesAt(q3);
       if (q1 > 0 && totalS > q3 && fsz > b3) {
-        r.seqWriteBurstMbps = static_cast<double>(b1) / 1e6 / q1;
-        r.seqWriteMbps = static_cast<double>(fsz - b3) / 1e6 / (totalS - q3);
-        r.writeSplit = true;
+        r.buildBurstMbps = static_cast<double>(b1) / 1e6 / q1;
+        r.buildWriteMbps = static_cast<double>(fsz - b3) / 1e6 / (totalS - q3);
+        r.buildSplit = true;
       }
     }
     r.sizeCapped = fsz < want;
@@ -982,28 +1179,37 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     r.bigread.push_back(bigStage(tf, fsz, n, o.blockBytes, o.phaseSeconds, false, direct));
   }
 
-  // --- sequential read (single stream, whole file) ------------------------
+  // --- sequential read IS the single-stream large-block read. Measuring it
+  // --- separately cost a window and agreed to 0.02% (552.7 vs 552.6 MB/s).
+  if (!r.bigread.empty())
+    r.seqReadMbps = r.bigread.front().mbps;
+
+  // --- PREDICTIVE READ: the block sizes the two tiers actually serve at
+  // --- (~42 KiB byte cache, ~599 KiB replica). They sit between the standard
+  // --- 4 KiB and 4 MiB points, in the interval where a device stops being
+  // --- op-bound and turns bandwidth-bound — so it cannot be interpolated.
+  // --- Reads ARE issued per analysis thread, unlike fills, so queue depth
+  // --- here is the job's thread count.
   {
-    if (!direct)
-      evict(rfd);
-    double t0 = nowS(), deadline = t0 + o.phaseSeconds;
-    uint64_t off = 0, bytes = 0;
-    while (nowS() < deadline) {
-      uint64_t n = std::min<uint64_t>(o.blockBytes, fsz - off) / kAlign * kAlign;
-      if (n == 0 || ::pread(rfd, big, n, static_cast<off_t>(off)) != static_cast<ssize_t>(n))
-        break;
-      bytes += n;
-      off += n;
-      if (off + kAlign >= fsz)
-        off = 0; // wrap: keep streaming for the full phase
+    const int qd = o.streams.empty() ? 1 : o.streams.back();
+    for (uint64_t blk : {48ull << 10, 512ull << 10}) {
+      if (!direct)
+        evict(rfd);
+      r.predRead.push_back(randSizeStage(tf, rflags, fsz, qd, blk, o.phaseSeconds, false));
     }
-    r.seqReadMbps = static_cast<double>(bytes) / 1e6 / std::max(1e-9, nowS() - t0);
   }
 
-  // --- large-block writes at each stream count (can the cache absorb a fast
-  // --- source?) — in place, so disk usage never exceeds --size -------------
-  for (int n : o.streams)
-    r.bigwrite.push_back(bigStage(tf, fsz, n, o.blockBytes, o.phaseSeconds, true, direct));
+  // --- STANDARD sequential write: 1 stream, large block, O_DIRECT, IN PLACE.
+  // --- This is the reproducible one (~6% across three runs of one command);
+  // --- the build stage moved 68% across the same three, which is why the
+  // --- quotable figure is this and not that.
+  r.bigwrite.push_back(bigStage(tf, fsz, 1, o.blockBytes, o.phaseSeconds, true, direct));
+  r.stdSeqWriteMbps = r.bigwrite.front().mbps;
+
+  // --- STANDARD random write, 4 KiB at queue depth 32 (the datasheet number;
+  // --- the shipped scattered-write stage is single-threaded, so the tool had
+  // --- QD1 only while every spec sheet quotes QD32).
+  r.randw = randSizeStage(tf, rflags, fsz, kStdQd, kSmall, o.phaseSeconds, true);
 
   // --- random reads UNDER writeback (the production killer mode) ----------
   {
@@ -1061,6 +1267,12 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   }
   ::close(rfd);
 
+  // --- EXPECTED FILL PATTERN (both modes). Buffered is what uCache does;
+  // --- the O_DIRECT pass is the control that shows whether the kernel merged
+  // --- our small writes into larger device writes.
+  r.fillBuf = fillStage(dir, o, /*direct=*/false, o.phaseSeconds);
+  r.fillDir = fillStage(dir, o, /*direct=*/true, o.phaseSeconds);
+
   // --- create / unlink (the cleanup / eviction pattern) -------------------
   {
     const int n = 200;
@@ -1101,22 +1313,27 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   std::string sl;
   for (size_t i = 0; i < o.streams.size(); ++i)
     appendf(sl, "%s%d", i ? "," : "", o.streams[i]);
-  const double perPath = 3 * W + W + static_cast<double>(n) * W * 3 + W + W;
+  const double perPath = 3 * W + W * (8 + 2 * static_cast<double>(n));
   std::string s;
-  appendf(s, "run plan: 9 stages, %.1f s per timed window, streams %s, block %llu KiB\n", W,
-          sl.c_str(), static_cast<unsigned long long>(o.blockBytes / 1024));
-  appendf(s, "  build test file        up to 3 x %.1f s   (target %.1f GiB; stops at whichever "
-             "comes first)\n",
+  appendf(s, "run plan: %.1f s per timed window, streams %s, block %llu KiB\n", W, sl.c_str(),
+          static_cast<unsigned long long>(o.blockBytes / 1024));
+  appendf(s, "  build test file        up to 3 x %.1f s   (target %.1f GiB; whichever comes "
+             "first)\n",
           W, static_cast<double>(std::max<uint64_t>(o.fileBytes, kMinFile)) / (1ull << 30));
   appendf(s, "  fdatasync              untimed (5 samples)\n");
-  appendf(s, "  scattered 4KiB write   %.1f s\n", W);
-  appendf(s, "  random 4KiB read       %zu x %.1f s   (streams %s)\n", n, W, sl.c_str());
-  appendf(s, "  large-block read       %zu x %.1f s   (streams %s)\n", n, W, sl.c_str());
-  appendf(s, "  sequential read        %.1f s\n", W);
-  appendf(s, "  large-block write      %zu x %.1f s   (streams %s, in place — the file never "
-             "grows)\n",
-          n, W, sl.c_str());
-  appendf(s, "  read under writeback   %.1f s\n", W);
+  appendf(s, "  STANDARD  seq read / seq write            2 x %.1f s   (QD1, in place)\n", W);
+  appendf(s, "  STANDARD  rand 4KiB read                  %zu x %.1f s   (QD %s)\n", n, W,
+          sl.c_str());
+  appendf(s, "  STANDARD  rand 4KiB write                 %.1f s   (QD%d)\n", W, kStdQd);
+  appendf(s, "  large-block read                          %zu x %.1f s   (QD %s)\n", n, W,
+          sl.c_str());
+  appendf(s, "  PREDICT   rand 48KiB + 512KiB read        2 x %.1f s   (QD%d — the tier sizes)\n",
+          W, o.streams.empty() ? 1 : o.streams.back());
+  appendf(s, "  PREDICT   fill pattern, buffered + direct 2 x %.1f s   (%d writer(s), %llu KiB "
+             "writes, %llu MiB files)\n",
+          W, o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024),
+          static_cast<unsigned long long>(o.fillFile >> 20));
+  appendf(s, "  read under writeback                      %.1f s\n", W);
   appendf(s, "  create / unlink        untimed\n");
   const double total = perPath * static_cast<double>(paths.size());
   if (total >= 120)
@@ -1147,14 +1364,16 @@ std::string comparisonBlock(const std::vector<Result>& results) {
     appendf(s, "\n");
   };
   auto lastRead = [](const Result& r) { return r.bigread.empty() ? 0.0 : r.bigread.back().mbps; };
-  auto lastWrite = [](const Result& r) { return r.bigwrite.empty() ? 0.0 : r.bigwrite.back().mbps; };
+  auto lastWrite = [](const Result& r) { return r.stdSeqWriteMbps; };
   auto firstRand = [](const Result& r) { return r.randr.empty() ? 0.0 : r.randr.front().iops; };
   auto lastRand = [](const Result& r) { return r.randr.empty() ? 0.0 : r.randr.back().iops; };
   auto firstLat = [](const Result& r) { return r.randr.empty() ? 0.0 : r.randr.front().lat.p50 / 1e3; };
-  row("seq write MB/s", [](const Result& r) { return r.seqWriteMbps; }, "  %16.1f");
+  row("test-file create MB/s", [](const Result& r) { return r.buildWriteMbps; }, "  %16.1f");
   row("seq read MB/s", [](const Result& r) { return r.seqReadMbps; }, "  %16.1f");
   row("large read MB/s (N)", lastRead, "  %16.1f");
-  row("large write MB/s (N)", lastWrite, "  %16.1f");
+  row("seq write MB/s (QD1)", lastWrite, "  %16.1f");
+  row("fill buffered MB/s", [](const Result& r) { return r.fillBuf.mbps; }, "  %16.1f");
+  row("rand write IOPS (QD32)", [](const Result& r) { return r.randw.iops; }, "  %16.0f");
   row("rand read IOPS (1)", firstRand, "  %16.0f");
   row("rand read IOPS (N)", lastRand, "  %16.0f");
   row("rand read p50 ms", firstLat, "  %16.2f");

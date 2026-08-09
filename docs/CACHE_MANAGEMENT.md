@@ -440,30 +440,45 @@ latency reference and the denominator of every scaling factor.
 
 Reported (raw numbers; interpretation guidance will come later):
 
+The numbers come in two groups, because they answer different questions.
+
+**Standard measures** — fixed block sizes and queue depths, so they can be read
+against a drive's datasheet, an `fio` number someone quotes, or another machine:
+
+| metric | config |
+|---|---|
+| sequential read MB/s | QD1, large block, O_DIRECT |
+| sequential write MB/s | QD1, large block, O_DIRECT, in place |
+| random 4 KiB read IOPS + latency | QD1 (the latency reference) and at each `--streams` depth |
+| random 4 KiB write IOPS | QD32 — the depth datasheets quote |
+
+**Predictive measures** — the patterns uCache actually generates, so they
+predict what a job will get here:
+
 | metric | what it corresponds to in uCache |
 |---|---|
-| sequential write MB/s, burst and sustained | replica (recompressed) builds; see below |
-| large-block write MB/s at 1..N streams | whether the disk can absorb a fast source while several fills run |
-| sequential / large-block read MB/s at 1..N streams | replica serving, at one stream and at job concurrency |
-| scattered 4 KiB write IOPS | the cold-fill page writes |
-| random 4 KiB read IOPS + latency (1 stream) | warm hit serving, worst case: hits too scattered to coalesce |
+| fill pattern MB/s, buffered and O_DIRECT | the cold fill: one writer, ~48 KiB writes, new files created and extended. The pair shows whether the kernel merges those small writes into larger device writes |
+| random 48 KiB / 512 KiB read at job concurrency | the two serving tiers — the byte cache reads at ~42 KiB, a replica at ~599 KiB. Both sit between the standard 4 KiB and 4 MiB points, in the range where a device stops being op-bound and turns bandwidth-bound |
+| large-block read MB/s at 1..N streams | replica serving as concurrency rises; flat scaling means one stream already saturates the link |
 | random 4 KiB read IOPS (N streams) | multi-threaded jobs; **flat scaling vs 1 stream exposes an IOPS quota** |
 | read-under-writeback latency | warm reads while a fill is running — the common mixed mode |
 | fdatasync / create / unlink rates | sidecar flushes, eviction, `clear` |
+| test-file creation MB/s | NOT a device spec — see below |
 
 The multi-stream write stage cycles in place over per-stream slices of the
 one test file, so however long the window runs it never uses more disk than
 `--size`.
 
-**Burst vs sustained writes — and which write number to trust.** A device
-write cache makes the first seconds of a write far faster than the steady
-state, so the build stage reports the first quarter of its window and the
-last quarter separately and always says which way the window moved:
+**Which write number to trust.** Building the test file is not a device
+measurement: it pays allocation, runs before anything has warmed up, and its
+window length depends on `--size`. Three runs of one command on one idle SSD
+reported 268.5, 451.9 and 371.9 MB/s for it, while the in-place sequential
+write reproduced to ~6%. So **quote `seq_write_mbps`** (in place, QD1) for the
+device, and read the test-file line for its SHAPE, which the tool always
+states:
 
-    sequential write   268.5 MB/s   (build 180 s: 436.9 -> 268.5 MB/s, FALLING
-                                     — the device's write cache absorbed the
-                                     start; the last quarter is the sustained
-                                     rate)
+    test-file creation 268.5 MB/s   (build 180 s: 436.9 -> 268.5 MB/s, FALLING
+                                     — the last quarter is the sustained rate)
 
 `FALLING` is the useful case: the window got far enough to fall out of the
 cache, so `seq_write_mbps` (the last quarter) is a real sustained rate.
