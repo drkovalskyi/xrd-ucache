@@ -1544,12 +1544,25 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
     });
     return XRootDStatus();
   }
-  if (!entry || size == 0 || offset + size < offset || offset + size > entry->fileSize()) {
+  if (!entry || offset + size < offset) {
     noteRelayBytes(st_, size);
     return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
       return f->Read(offset, size, buffer, rh, timeout);
     });
   }
+  // Past EOF is a SHORT read, and it must still be cached. Relaying it here
+  // was correct in what it returned — the origin has the same file — but relay
+  // bypasses the cache, so the last block of every file stayed uncached. Any
+  // reader that fetches in fixed-size blocks overruns on its final block, so
+  // that is the tail of EVERY file; for a container whose metadata lives at the
+  // end (RNTuple keeps its page list and footer there) the effect is that the
+  // metadata is never cached and no replica can ever be built from the entry.
+  if (offset >= entry->fileSize() || size == 0) {
+    complete(handler, okStatus(), chunkResponse(offset, 0, buffer));
+    return XRootDStatus();
+  }
+  if (offset + size > entry->fileSize())
+    size = static_cast<uint32_t>(entry->fileSize() - offset);
 
   if (entry->hasRange(offset, size)) {
     // HIT: disk read + verification on the executor (§5.3).

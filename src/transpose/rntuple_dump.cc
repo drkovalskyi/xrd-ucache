@@ -51,6 +51,14 @@ int main(int argc, char** argv) {
   }
   std::printf("},\"header_bytes\":%zu,\"footer_bytes\":%zu,\"pagelist_bytes\":%zu",
               m.header.size(), m.footer.size(), m.pageList.size());
+  // Where the metadata physically lives, so it can be checked for presence in
+  // a partially cached image — the envelopes are what a rebuild needs first.
+  std::printf(",\"meta_extents\":{\"header\":[%llu,%llu],\"footer\":[%llu,%llu],"
+              "\"pagelist\":[%llu,%llu],\"anchor\":[%llu,%u]}",
+              (unsigned long long)m.anchor.seekHeader, (unsigned long long)m.anchor.nbytesHeader,
+              (unsigned long long)m.anchor.seekFooter, (unsigned long long)m.anchor.nbytesFooter,
+              (unsigned long long)m.pageListOffset, (unsigned long long)m.pageListNbytes,
+              (unsigned long long)m.anchor.payloadOffset, m.anchor.payloadLength);
   if (!m.columns.empty())
     std::printf(",\"first_column\":{\"field\":\"%s\",\"bits\":%u}", m.columns[0].fieldName.c_str(),
                 m.columns[0].bitsOnStorage);
