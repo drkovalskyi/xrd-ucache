@@ -422,22 +422,79 @@ directory — using the exact access patterns uCache generates:
 ```sh
 ucache bench                      # test the configured cache dir (~1 min)
 ucache bench /data1 /ssd/scratch  # compare candidate locations
-ucache bench /tmp --size 2g --seconds 10   # bigger file, longer phases
+ucache bench /tmp --size 64g --phase-seconds 60 --streams 1,16,32
 ```
+
+`--phase-seconds` (`--seconds` is still accepted) is the window of ONE
+stage, not the runtime of the tool: the build stage gets 3× it, and a full
+run takes roughly `(6 + 3 × number of stream counts) × S`. The tool prints
+the plan and its estimated total before it starts, so the arithmetic never
+has to be guessed. Every phase is time-boxed — that is what lets the tool
+finish on a volume that delivers a few dozen IOPS — so `--size` is a
+ceiling the file may not reach; when it does not, the test-file line says
+`stopped at time cap`.
+
+Use `--streams` to measure at the concurrency your jobs actually bring: a
+comma list, default `1,16`, and 1 is always included because it is the
+latency reference and the denominator of every scaling factor.
 
 Reported (raw numbers; interpretation guidance will come later):
 
 | metric | what it corresponds to in uCache |
 |---|---|
-| sequential write / read MB/s | replica (recompressed) builds and serving |
+| sequential write MB/s, burst and sustained | replica (recompressed) builds; see below |
+| large-block write MB/s at 1..N streams | whether the disk can absorb a fast source while several fills run |
+| sequential / large-block read MB/s at 1..N streams | replica serving, at one stream and at job concurrency |
 | scattered 4 KiB write IOPS | the cold-fill page writes |
 | random 4 KiB read IOPS + latency (1 stream) | warm hit serving, worst case: hits too scattered to coalesce |
-| random 4 KiB read IOPS (16 streams) | multi-threaded jobs; **flat scaling vs 1 stream exposes an IOPS quota** |
+| random 4 KiB read IOPS (N streams) | multi-threaded jobs; **flat scaling vs 1 stream exposes an IOPS quota** |
 | read-under-writeback latency | warm reads while a fill is running — the common mixed mode |
 | fdatasync / create / unlink rates | sidecar flushes, eviction, `clear` |
 
-Each run also prints a `ucache-bench-json:` line — save it when reporting
-performance problems. Rules of thumb from the machines measured so far:
+The multi-stream write stage cycles in place over per-stream slices of the
+one test file, so however long the window runs it never uses more disk than
+`--size`.
+
+**Burst vs sustained writes — and which write number to trust.** A device
+write cache makes the first seconds of a write far faster than the steady
+state, so the build stage reports the first quarter of its window and the
+last quarter separately and always says which way the window moved:
+
+    sequential write   268.5 MB/s   (build 180 s: 436.9 -> 268.5 MB/s, FALLING
+                                     — the device's write cache absorbed the
+                                     start; the last quarter is the sustained
+                                     rate)
+
+`FALLING` is the useful case: the window got far enough to fall out of the
+cache, so `seq_write_mbps` (the last quarter) is a real sustained rate.
+`RISING` means it never did — the figure is a ceiling, not a floor, and a
+longer write would report less. `flat` means neither was visible.
+
+Whether you get one or the other depends on **how much the device has been
+written to recently**, not only on the device. The same 64 GiB build on one
+SATA SSD reported `FALLING 437 -> 268 MB/s` straight after a heavy write
+job and `RISING 342 -> 452` after the same device had been idle for forty
+minutes. Measure with a large `--size` and a long window
+(`--size 64g --phase-seconds 60`), and if you need the number to be
+defensible, run it twice.
+
+For a device's write capability under the concurrency your fills actually
+bring, prefer the **large-block write** rows (`bigwrite_mbps_*`). They write
+to already-allocated space partway through the run and reproduce across runs
+to about 1%, where the build-stage figure — first write to fresh space, with
+whatever cache state you started with — moved 68% between two runs an hour
+apart on an otherwise idle machine.
+
+Each run also prints a `ucache-bench-json:` line and appends a full record —
+plan, numbers, JSON line, and the context needed to read them later — to
+`./ucache-bench.txt` (`--log FILE` to redirect, `--no-log` to suppress).
+The context is the machine, kernel and CPU count, the mount and block
+device behind the path with its model and scheduler, the load average
+before and after, and the CPU and device activity during the run. Keep one
+such file per machine: it is what turns a number into evidence, and it is
+what to attach when reporting a performance problem.
+
+Rules of thumb from the machines measured so far:
 random-read latency in *microseconds* = healthy local disk; *milliseconds*
 = network-backed storage where warm reads may not beat the origin — on
 such storage `recompress on` (sequential replica reads) matters far more,

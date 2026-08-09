@@ -61,11 +61,17 @@ void usage() {
       "                    entry it created (a pre-existing entry is kept)\n"
       "  enable | disable  turn caching on/off (flips the plugin conf)\n"
       "  status            cache location, budget, usage, and aggregated stats\n"
-      "  bench [PATH ...] [--size SZ] [--seconds S]\n"
+      "  bench [PATH ...] [--size SZ] [--phase-seconds S] [--streams 1,16,64]\n"
+      "                    [--block KB] [--log FILE | --no-log]\n"
       "                    measure a cache location's raw storage performance\n"
-      "                    (read/write rates, IOPS, latency, fsync, unlink) —\n"
-      "                    default location: the configured cache dir; several\n"
-      "                    PATHs print a comparison (pick the best disk)\n"
+      "                    (read/write rates at 1..N streams, IOPS, latency,\n"
+      "                    fsync, unlink) — default location: the configured\n"
+      "                    cache dir; several PATHs print a comparison.\n"
+      "                    -S is the window of ONE stage: the build stage gets\n"
+      "                    3xS and a full run is roughly (6 + 3 x streams) x S.\n"
+      "                    The plan and the estimated total print before it runs.\n"
+      "                    Every run appends its numbers plus the machine, load\n"
+      "                    and block device behind PATH to ./ucache-bench.txt\n"
       "  netbench <root://url> [--streams 1,4,16] [--block KB] [--seconds S]\n"
       "                    measure the ORIGIN's random-read rates from this\n"
       "                    machine — the numbers a cache location must beat\n"
@@ -525,6 +531,13 @@ int cmdNetbench(int argc, char** argv) {
 int cmdBench(const Config& cfg, int argc, char** argv) {
   DiskBenchOpts opts;
   std::vector<std::string> paths;
+  for (int i = 1; i < argc; ++i) { // argv[0] is the program: record the rest
+    if (!opts.cmdline.empty())
+      opts.cmdline += ' ';
+    else
+      opts.cmdline = "ucache ";
+    opts.cmdline += argv[i];
+  }
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--size" || a.rfind("--size=", 0) == 0) {
@@ -533,15 +546,67 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
         std::fputs("bench: --size needs a size (e.g. 512m, 2g)\n", stderr);
         return 2;
       }
-    } else if (a == "--seconds" || a.rfind("--seconds=", 0) == 0) {
-      const char* v = flagValue(argc, argv, i, 9);
+    } else if (a == "--phase-seconds" || a.rfind("--phase-seconds=", 0) == 0 ||
+               a == "--seconds" || a.rfind("--seconds=", 0) == 0) {
+      // `--seconds` is the historical name and stays an alias; it sets the
+      // window of ONE stage, not the runtime of the whole tool.
+      bool isAlias = a.rfind("--seconds", 0) == 0;
+      const char* v = flagValue(argc, argv, i, isAlias ? 9 : 15);
       char* end = nullptr;
       double s = v ? std::strtod(v, &end) : 0;
       if (!v || end == v || s <= 0 || s > 300) {
-        std::fputs("bench: --seconds needs a number in (0, 300]\n", stderr);
+        std::fputs("bench: --phase-seconds needs a number in (0, 300]\n", stderr);
         return 2;
       }
       opts.phaseSeconds = s;
+    } else if (a == "--streams" || a.rfind("--streams=", 0) == 0) {
+      const char* v = flagValue(argc, argv, i, 9);
+      std::vector<int> got;
+      for (const char* p = v; v && *p;) {
+        char* end = nullptr;
+        long n = std::strtol(p, &end, 10);
+        if (end == p || n <= 0 || n > 256) {
+          got.clear();
+          break;
+        }
+        got.push_back(static_cast<int>(n));
+        p = end;
+        if (*p == ',')
+          ++p;
+        else if (*p)
+          { got.clear(); break; }
+      }
+      if (got.empty()) {
+        std::fputs("bench: --streams needs a comma list of counts in [1, 256] "
+                   "(e.g. 1,16,64)\n",
+                   stderr);
+        return 2;
+      }
+      // 1 stream is always measured: it is the latency reference and the
+      // denominator every scaling factor is quoted against.
+      if (std::find(got.begin(), got.end(), 1) == got.end())
+        got.insert(got.begin(), 1);
+      std::sort(got.begin(), got.end());
+      got.erase(std::unique(got.begin(), got.end()), got.end());
+      opts.streams = got;
+    } else if (a == "--block" || a.rfind("--block=", 0) == 0) {
+      const char* v = flagValue(argc, argv, i, 7);
+      char* end = nullptr;
+      unsigned long long kb = v ? std::strtoull(v, &end, 10) : 0;
+      if (!v || end == v || kb < 4 || kb > 65536 || kb % 4 != 0) {
+        std::fputs("bench: --block needs KiB in [4, 65536], a multiple of 4\n", stderr);
+        return 2;
+      }
+      opts.blockBytes = kb * 1024;
+    } else if (a == "--log" || a.rfind("--log=", 0) == 0) {
+      const char* v = flagValue(argc, argv, i, 5);
+      if (!v || !*v) {
+        std::fputs("bench: --log needs a file path (--no-log disables logging)\n", stderr);
+        return 2;
+      }
+      opts.logPath = v;
+    } else if (a == "--no-log") {
+      opts.logPath.clear();
     } else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "bench: unknown option '%s'\n", a.c_str());
       return 2;
