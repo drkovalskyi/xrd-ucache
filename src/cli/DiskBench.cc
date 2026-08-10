@@ -823,14 +823,18 @@ std::string humanBlock(const Result& r) {
   appendf(s, "    %-40s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms\n", lb, r.randw.iops,
           r.randw.lat.p50 / 1e3, r.randw.lat.p99 / 1e3);
 
-  appendf(s, "\n  Pattern measurements (at this machine's job concurrency, %d threads)\n",
-          r.threads);
-  std::snprintf(lb, sizeof lb, "sequential %llu KiB read (QD%d)",
-                static_cast<unsigned long long>(r.blockKib), r.patSeqRead.nEff);
-  appendf(s, "    %-40s%8.1f MB/s", lb, r.patSeqRead.mbps);
-  if (r.stdSeqReadMbps > 0)
-    appendf(s, "   (%.2fx QD1)", r.patSeqRead.mbps / r.stdSeqReadMbps);
-  appendf(s, "\n");
+  if (r.threads > 0)
+    appendf(s, "\n  Pattern measurements (job concurrency %d threads)\n", r.threads);
+  else
+    appendf(s, "\n  Pattern measurements (concurrency-dependent ones SKIPPED — no --threads)\n");
+  if (r.threads > 0) {
+    std::snprintf(lb, sizeof lb, "sequential %llu KiB read (QD%d)",
+                  static_cast<unsigned long long>(r.blockKib), r.patSeqRead.nEff);
+    appendf(s, "    %-40s%8.1f MB/s", lb, r.patSeqRead.mbps);
+    if (r.stdSeqReadMbps > 0)
+      appendf(s, "   (%.2fx QD1)", r.patSeqRead.mbps / r.stdSeqReadMbps);
+    appendf(s, "\n");
+  }
   for (size_t i = 0; i < r.patRead.size(); ++i) {
     const StreamStat& t = r.patRead[i];
     std::snprintf(lb, sizeof lb, "random %llu KiB read (QD%d)  [%s tier]",
@@ -931,7 +935,9 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
           static_cast<unsigned long long>(r.randw.lat.p50),
           static_cast<unsigned long long>(r.randw.lat.p99));
   // PREDICTIVE: tier-sized random reads at job concurrency, and the fill.
-  appendf(s, ",\"threads\":%d,\"pat_seq_read_mbps\":%.1f", r.threads, r.patSeqRead.mbps);
+  appendf(s, ",\"threads\":%d", r.threads);
+  if (r.threads > 0)
+    appendf(s, ",\"pat_seq_read_mbps\":%.1f", r.patSeqRead.mbps);
   for (size_t i = 0; i < r.patRead.size(); ++i)
     appendf(s, ",\"pat_rand%s_read_mbps\":%.1f,\"pat_rand%s_read_iops\":%.0f,"
                "\"pat_rand%s_read_us_p99\":%llu",
@@ -1001,8 +1007,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   r.path = path;
   r.fs = fsName(path);
   r.blockKib = o.blockBytes / 1024;
-  r.threads = o.threads > 0 ? o.threads
-                            : std::max(1, static_cast<int>(::sysconf(_SC_NPROCESSORS_ONLN)));
+  r.threads = o.threads; // 0 = not given; never probed (see planBlock)
   r.env.mach = machineInfo();
   r.env.mnt = mountFor(path);
   r.env.startLocal = stamp("%Y-%m-%d %H:%M:%S %z");
@@ -1186,21 +1191,27 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   // one command, 96% of this drive's spec), unlike creating the test file.
   r.stdSeqWriteMbps = bigStage(tf, fsz, 1, o.blockBytes, o.measurementSeconds, true, direct).mbps;
 
-  // ===== PATTERN measurements: the shapes uCache generates, at THIS machine's
-  // ===== job concurrency. Reads are issued per analysis thread (unlike fills,
-  // ===== which are single-stream), so the queue depth here is the core count.
-  {
+  // ===== PATTERN measurements: the shapes uCache generates. Reads are issued
+  // ===== per analysis thread (unlike fills, which are single-stream), so the
+  // ===== three read measurements need a job concurrency — and it is NOT
+  // ===== probed. A number nobody chose, whether inherited from a queue-depth
+  // ===== list or read off nproc, produces a "job concurrency" figure that is
+  // ===== wrong wherever the job does not use every core. Without --threads
+  // ===== they are skipped; the fill and the writeback mix still run, because
+  // ===== their configuration is fully determined without it.
+  if (r.threads > 0) {
     if (!direct)
       evict(rfd);
     r.patSeqRead = bigStage(tf, fsz, r.threads, o.blockBytes, o.measurementSeconds, false, direct);
-  }
-  // 48 KiB is what the byte tier serves at, 512 KiB what a replica serves at.
-  // Both sit between the standard 4 KiB and 4 MiB points, in the interval
-  // where a device stops being op-bound and turns bandwidth-bound.
-  for (uint64_t blk : {48ull << 10, 512ull << 10}) {
-    if (!direct)
-      evict(rfd);
-    r.patRead.push_back(randSizeStage(tf, rflags, fsz, r.threads, blk, o.measurementSeconds, false));
+    // 48 KiB is what the byte tier serves at, 512 KiB what a replica serves at.
+    // Both sit between the standard 4 KiB and 4 MiB points, in the interval
+    // where a device stops being op-bound and turns bandwidth-bound.
+    for (uint64_t blk : {48ull << 10, 512ull << 10}) {
+      if (!direct)
+        evict(rfd);
+      r.patRead.push_back(
+          randSizeStage(tf, rflags, fsz, r.threads, blk, o.measurementSeconds, false));
+    }
   }
 
   // --- STANDARD random write, 4 KiB at queue depth 32 (the datasheet number;
@@ -1306,11 +1317,10 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
 // the caller typed. Saying so up front is cheaper than a confused campaign.
 std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts& o) {
   const double W = o.measurementSeconds;
-  const int th = o.threads > 0 ? o.threads
-                               : std::max(1, static_cast<int>(::sysconf(_SC_NPROCESSORS_ONLN)));
   const int nStd = static_cast<int>(sizeof kStdQd / sizeof kStdQd[0]);
-  const int measurements = 2 + nStd + 1     // standard: seq r/w, rand read xN, rand write
-                           + 1 + 2 + 2 + 1; // pattern: seq read, 2 rand, 2 fill, writeback
+  const bool pat = o.threads > 0;
+  const int measurements = 2 + nStd + 1              // standard
+                           + (pat ? 3 : 0) + 2 + 1;  // pattern (3 need --threads)
   const double buildCap = std::max(W * 3, 10.0);
   const double total = (buildCap + W * measurements) * static_cast<double>(paths.size());
   std::string s;
@@ -1323,7 +1333,12 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   appendf(s, "\n");
   appendf(s, "  test file: build until %.1f GiB or %.0f s, whichever comes first\n",
           static_cast<double>(std::max<uint64_t>(o.fileBytes, kMinFile)) / (1ull << 30), buildCap);
-  appendf(s, "  threads: %d%s\n", th, o.threads > 0 ? "" : " (auto)");
+  if (pat)
+    appendf(s, "  threads: %d\n", o.threads);
+  else
+    appendf(s, "  threads: not set — the concurrency-dependent pattern measurements are\n"
+               "           SKIPPED (pass --threads N to measure at your job's concurrency;\n"
+               "           it is never guessed, because a number nobody chose is not one)\n");
   appendf(s, "\n  Standard measurements\n");
   appendf(s, "    sequential %llu KiB read, QD1\n",
           static_cast<unsigned long long>(o.blockBytes / 1024));
@@ -1333,10 +1348,12 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
     appendf(s, "    random 4 KiB read, QD%d\n", qd);
   appendf(s, "    random 4 KiB write, QD%d\n", kStdWriteQd);
   appendf(s, "\n  Pattern measurements\n");
-  appendf(s, "    sequential %llu KiB read, QD%d\n",
-          static_cast<unsigned long long>(o.blockBytes / 1024), th);
-  appendf(s, "    random 48 KiB read, QD%d          (byte tier)\n", th);
-  appendf(s, "    random 512 KiB read, QD%d         (replica tier)\n", th);
+  if (pat) {
+    appendf(s, "    sequential %llu KiB read, QD%d\n",
+            static_cast<unsigned long long>(o.blockBytes / 1024), o.threads);
+    appendf(s, "    random 48 KiB read, QD%d          (byte tier)\n", o.threads);
+    appendf(s, "    random 512 KiB read, QD%d         (replica tier)\n", o.threads);
+  }
   appendf(s, "    fill pattern, buffered           (%d writer(s), %llu KiB writes, %llu MiB "
              "files)\n",
           o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024),

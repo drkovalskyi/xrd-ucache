@@ -422,7 +422,7 @@ directory — using the exact access patterns uCache generates:
 ```sh
 ucache bench                      # test the configured cache dir (~1 min)
 ucache bench /data1 /ssd/scratch  # compare candidate locations
-ucache bench /tmp --size 64g --measurement-duration 60
+ucache bench /tmp --size 64g --measurement-duration 60 --threads 32
 ```
 
 `--measurement-duration` (`--phase-seconds` and `--seconds` are still
@@ -434,10 +434,12 @@ tool finish on a volume delivering a few dozen IOPS — so `--size` is a
 ceiling the file may not reach; when it does not, the test-file line says
 `stopped at time cap`.
 
-`--threads` sets the concurrency of the **pattern** measurements only, and
-defaults to the machine's core count, so the everyday command needs no
-per-machine argument. The **standard** measurements are pinned at queue
-depths 1, 16 and 32 on every machine — that is what makes them comparable.
+`--threads` sets the concurrency of the **pattern** measurements, and is
+**never guessed**: without it, the three concurrency-dependent ones are
+skipped and the output says so. Pass the thread count your analyses actually
+use — not the core count, unless they are the same. The **standard**
+measurements are pinned at queue depths 1, 16 and 32 on every machine, which
+is what makes them comparable.
 
 Reported (raw numbers; interpretation guidance will come later):
 
