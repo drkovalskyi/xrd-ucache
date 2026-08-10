@@ -323,6 +323,36 @@ DiskCounters diskCounters(const std::string& disk) {
   return d;
 }
 
+// Everything else device-side in this record is a delta across the whole run,
+// so it describes the run — including our own traffic — and says nothing about
+// the state the run began in. loadavg is no substitute: it mixes runnable with
+// IO-blocked tasks, it is a decaying average that mostly reflects what just
+// FINISHED, and it is machine-wide rather than device-specific. So sample the
+// device directly for a moment before touching anything.
+struct PreRun {
+  bool valid = false;
+  double seconds = 0, readMbps = 0, writeMbps = 0, busyPct = 0;
+};
+
+PreRun sampleIdle(const std::string& disk, double seconds) {
+  PreRun p;
+  DiskCounters a = diskCounters(disk);
+  if (!a.valid)
+    return p;
+  double t0 = nowS();
+  std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(seconds * 1000)));
+  double dt = nowS() - t0;
+  DiskCounters b = diskCounters(disk);
+  if (!b.valid || dt <= 0)
+    return p;
+  p.valid = true;
+  p.seconds = dt;
+  p.readMbps = (b.rdSect - a.rdSect) * 512.0 / 1e6 / dt;
+  p.writeMbps = (b.wrSect - a.wrSect) * 512.0 / 1e6 / dt;
+  p.busyPct = 100.0 * static_cast<double>(b.ticksMs - a.ticksMs) / (dt * 1000.0);
+  return p;
+}
+
 struct CpuCounters {
   bool valid = false;
   uint64_t total = 0, idle = 0, iowait = 0;
@@ -430,6 +460,8 @@ struct RunEnv {
   LoadAvg load0, load1;
   CpuCounters cpu0, cpu1;
   DiskCounters ds0, ds1;
+  PreRun pre;         // device state BEFORE the run
+  uint64_t ownReadBytes = 0, ownWriteBytes = 0; // what this benchmark issued
   double wallS = 0;
 
   double cpuBusyPct() const {
@@ -508,6 +540,7 @@ struct FillStat {
 struct StreamStat {
   int n = 0, nEff = 0;
   double iops = 0, mbps = 0;
+  uint64_t bytes = 0; // exact, so "what did WE issue" is measured not inferred
   Pct lat;
 };
 
@@ -542,6 +575,8 @@ StreamStat randReadStage(const std::string& tf, int rflags, uint64_t fsz, int n,
     t.join();
   double el = std::max(1e-9, nowS() - t0);
   s.iops = static_cast<double>(total.load()) / el;
+  s.bytes = total.load() * kSmall;
+  s.mbps = static_cast<double>(s.bytes) / 1e6 / el;
   s.lat = percentiles(us);
   return s;
 }
@@ -604,8 +639,9 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
   for (auto& t : pool)
     t.join();
   double el = std::max(1e-9, nowS() - t0);
-  s.mbps = static_cast<double>(bytes.load()) / 1e6 / el;
-  s.iops = static_cast<double>(bytes.load()) / static_cast<double>(blk) / el;
+  s.bytes = bytes.load();
+  s.mbps = static_cast<double>(s.bytes) / 1e6 / el;
+  s.iops = static_cast<double>(s.bytes) / static_cast<double>(blk) / el;
   return s;
 }
 
@@ -793,7 +829,8 @@ StreamStat randSizeStage(const std::string& tf, int rflags, uint64_t fsz, int qd
     th.join();
   double el = std::max(1e-9, nowS() - t0);
   s.iops = static_cast<double>(ops.load()) / el;
-  s.mbps = static_cast<double>(ops.load()) * static_cast<double>(blk) / 1e6 / el;
+  s.bytes = ops.load() * blk;
+  s.mbps = static_cast<double>(s.bytes) / 1e6 / el;
   s.lat = percentiles(us);
   return s;
 }
@@ -1004,11 +1041,32 @@ std::string contextBlock(const Result& r, const DiskBenchOpts& o) {
     appendf(s, "  device    (none — %s is not backed by a block device)\n",
             e.mnt.found ? e.mnt.fsType.c_str() : r.fs.c_str());
   }
+  if (e.pre.valid)
+    appendf(s, "  device BEFORE the run (%.1f s sample): read %.1f MB/s, wrote %.1f MB/s, "
+               "busy %.0f%%%s\n",
+            e.pre.seconds, e.pre.readMbps, e.pre.writeMbps, e.pre.busyPct,
+            e.pre.busyPct < 5 ? "   (idle)" : "   <- NOT IDLE: another workload is on this device");
   if (e.haveDev())
     appendf(s, "  device IO during the run (this benchmark + everything else): "
                "read %.1f GiB in %.0f ops, wrote %.1f GiB in %.0f ops, %.0f%% util\n",
             e.devReadMb() / 1024.0, e.devReads(), e.devWriteMb() / 1024.0, e.devWrites(),
             e.devUtilPct());
+  if (e.haveDev() && (e.ownReadBytes || e.ownWriteBytes)) {
+    const double orb = static_cast<double>(e.ownReadBytes) / 1e6;
+    const double owb = static_cast<double>(e.ownWriteBytes) / 1e6;
+    appendf(s, "    of which this benchmark issued: read %.1f GiB, wrote %.1f GiB\n",
+            orb / 1024.0, owb / 1024.0);
+    // A RESIDUAL, not a measurement, and an upper bound on interference: our
+    // own filesystem metadata (journal, extent maps, ~200 create/unlink pairs)
+    // and any traffic on OTHER partitions of the same disk land here too. Shown
+    // in MB with a share, because at GiB-with-one-decimal the metadata we would
+    // want to notice rounds to nothing.
+    const double ur = e.devReadMb() - orb, uw = e.devWriteMb() - owb;
+    appendf(s, "    unattributed remainder:         read %.0f MB (%.1f%%), wrote %.0f MB (%.1f%%)"
+               "   [our metadata + any other user of this disk]\n",
+            ur, e.devReadMb() > 0 ? 100.0 * ur / e.devReadMb() : 0.0, uw,
+            e.devWriteMb() > 0 ? 100.0 * uw / e.devWriteMb() : 0.0);
+  }
   return s;
 }
 
@@ -1101,9 +1159,16 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
                "\"dev_sched\":\"%s\",\"dev_size_gb\":%.1f",
             jesc(e.mnt.diskName).c_str(), jesc(e.mnt.model).c_str(), e.mnt.rotational,
             jesc(e.mnt.sched).c_str(), e.mnt.sizeGb);
+  if (e.pre.valid)
+    appendf(s, ",\"pre_read_mbps\":%.1f,\"pre_write_mbps\":%.1f,\"pre_busy_pct\":%.0f,"
+               "\"pre_sample_s\":%.1f",
+            e.pre.readMbps, e.pre.writeMbps, e.pre.busyPct, e.pre.seconds);
   appendf(s, ",\"load1_start\":%.2f,\"load1_end\":%.2f,\"cpu_busy_pct\":%.1f,"
              "\"cpu_iowait_pct\":%.1f",
           e.load0.l1, e.load1.l1, e.cpuBusyPct(), e.iowaitPct());
+  if (e.haveDev())
+    appendf(s, ",\"own_read_mb\":%.0f,\"own_write_mb\":%.0f",
+            static_cast<double>(e.ownReadBytes) / 1e6, static_cast<double>(e.ownWriteBytes) / 1e6);
   if (e.haveDev())
     appendf(s, ",\"dev_read_mb\":%.0f,\"dev_write_mb\":%.0f,\"dev_read_ops\":%.0f,"
                "\"dev_write_ops\":%.0f,\"dev_util_pct\":%.0f",
@@ -1130,6 +1195,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   r.env.startIso = stamp("%Y-%m-%dT%H:%M:%S%z");
   r.env.load0 = loadAvg();
   r.env.cpu0 = cpuCounters();
+  r.env.pre = sampleIdle(r.env.mnt.diskName, 2.0);
   r.env.ds0 = diskCounters(r.env.mnt.diskName);
   double wall0 = nowS();
   // Every exit path below records how long the run took and what the machine
@@ -1252,6 +1318,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       }
     }
     r.sizeCapped = fsz < want;
+    r.env.ownWriteBytes += fsz;
   }
   if (fsz < kMinFile) {
     r.error = "could not write a 16 MiB test file in time (device too slow?)";
@@ -1297,15 +1364,22 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     if (!direct)
       evict(rfd);
     r.randr.push_back(randReadStage(tf, rflags, fsz, qd, o.measurementSeconds));
+    r.env.ownReadBytes += r.randr.back().bytes;
   }
   {
     if (!direct)
       evict(rfd);
-    r.stdSeqReadMbps = bigStage(tf, fsz, 1, o.blockBytes, o.measurementSeconds, false, direct).mbps;
+    StreamStat sr = bigStage(tf, fsz, 1, o.blockBytes, o.measurementSeconds, false, direct);
+    r.stdSeqReadMbps = sr.mbps;
+    r.env.ownReadBytes += sr.bytes;
   }
   // Sequential write, in place: the reproducible one (~6% across four runs of
   // one command, 96% of this drive's spec), unlike creating the test file.
-  r.stdSeqWriteMbps = bigStage(tf, fsz, 1, o.blockBytes, o.measurementSeconds, true, direct).mbps;
+  {
+    StreamStat sw = bigStage(tf, fsz, 1, o.blockBytes, o.measurementSeconds, true, direct);
+    r.stdSeqWriteMbps = sw.mbps;
+    r.env.ownWriteBytes += sw.bytes;
+  }
 
   // ===== PATTERN measurements: the shapes uCache generates. Reads are issued
   // ===== per analysis thread (unlike fills, which are single-stream), so the
@@ -1319,6 +1393,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     if (!direct)
       evict(rfd);
     r.patSeqRead = bigStage(tf, fsz, r.threads, o.blockBytes, o.measurementSeconds, false, direct);
+    r.env.ownReadBytes += r.patSeqRead.bytes;
     // 48 KiB is what the byte tier serves at, 512 KiB what a replica serves at.
     // Both sit between the standard 4 KiB and 4 MiB points, in the interval
     // where a device stops being op-bound and turns bandwidth-bound.
@@ -1336,18 +1411,21 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
         evict(rfd);
       r.patRead.push_back(
           randSizeStage(tf, rflags, fsz, r.threads, sizes[i], o.measurementSeconds, false));
+      r.env.ownReadBytes += r.patRead.back().bytes;
       r.patReadKib.push_back(sizes[i] / 1024);
     }
     if (!direct)
       evict(rfd);
     r.patReplicaRead =
         bigStage(tf, fsz, r.threads, 512ull << 10, o.measurementSeconds, false, direct);
+    r.env.ownReadBytes += r.patReplicaRead.bytes;
   }
 
   // --- STANDARD random write, 4 KiB at queue depth 32 (the datasheet number;
   // --- the shipped scattered-write stage is single-threaded, so the tool had
   // --- QD1 only while every spec sheet quotes QD32).
   r.randw = randSizeStage(tf, rflags, fsz, kStdWriteQd, kSmall, o.measurementSeconds, true);
+  r.env.ownWriteBytes += r.randw.bytes;
 
   // --- random reads UNDER writeback (the production killer mode) ----------
   {
@@ -1399,6 +1477,8 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     double elapsed = std::max(1e-9, nowS() - t0);
     stop = true;
     writer.join();
+    r.env.ownReadBytes += rops.load() * kSmall;
+    r.env.ownWriteBytes += wbytes.load();
     r.mixedReadIops = static_cast<double>(rops.load()) / elapsed;
     r.mixed = percentiles(us);
     r.mixedWriteMbps = static_cast<double>(wbytes.load()) / 1e6 / elapsed;
@@ -1410,6 +1490,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   // --- our small writes into larger device writes.
   r.fillBuf = fillStage(dir, o, /*direct=*/false, o.measurementSeconds);
   r.fillDir = fillStage(dir, o, /*direct=*/true, o.measurementSeconds);
+  r.env.ownWriteBytes += r.fillBuf.bytes + r.fillDir.bytes;
 
   // --- create / unlink (the cleanup / eviction pattern) -------------------
   {
@@ -1463,7 +1544,7 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   appendf(s, "\n");
   appendf(s, "  test file: build until %.1f GiB or %.0f s, whichever comes first\n",
           static_cast<double>(std::max<uint64_t>(o.fileBytes, kMinFile)) / (1ull << 30), buildCap);
-  appendf(s, "  threads: %d   (job concurrency; never guessed — see --threads)\n", o.threads);
+  appendf(s, "  threads: %d\n", o.threads);
   appendf(s, "\n  Standard measurements\n");
   appendf(s, "    sequential %llu KiB read, QD1\n",
           static_cast<unsigned long long>(o.blockBytes / 1024));
