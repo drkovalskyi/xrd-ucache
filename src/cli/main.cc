@@ -61,17 +61,21 @@ void usage() {
       "                    entry it created (a pre-existing entry is kept)\n"
       "  enable | disable  turn caching on/off (flips the plugin conf)\n"
       "  status            cache location, budget, usage, and aggregated stats\n"
-      "  bench [PATH ...] [--size SZ] [--phase-seconds S] [--streams 1,16,64]\n"
-      "                    [--block KB] [--log FILE | --no-log]\n"
-      "                    measure a cache location's raw storage performance\n"
-      "                    (read/write rates at 1..N streams, IOPS, latency,\n"
-      "                    fsync, unlink) — default location: the configured\n"
-      "                    cache dir; several PATHs print a comparison.\n"
-      "                    -S is the window of ONE stage: the build stage gets\n"
-      "                    3xS and a full run is roughly (6 + 3 x streams) x S.\n"
-      "                    The plan and the estimated total print before it runs.\n"
-      "                    Every run appends its numbers plus the machine, load\n"
-      "                    and block device behind PATH to ./ucache-bench.txt\n"
+      "  bench [PATH ...] [--size SZ] [--measurement-duration S] [--threads N]\n"
+      "                    [--block KB] [--fill k=v,...] [--log FILE | --no-log]\n"
+      "                    measure a cache location's raw storage performance.\n"
+      "                    STANDARD measurements use pinned block sizes and\n"
+      "                    queue depths, so they compare to a datasheet or to\n"
+      "                    another machine; PATTERN measurements use the shapes\n"
+      "                    uCache generates, at --threads concurrency (default:\n"
+      "                    cores), so they predict what a job gets here.\n"
+      "                    -S is per MEASUREMENT; the run is measurements x S\n"
+      "                    plus building the test file. The plan and the total\n"
+      "                    print before anything runs. Default location: the\n"
+      "                    configured cache dir; several PATHs print a\n"
+      "                    comparison. Every run appends its numbers plus the\n"
+      "                    machine, load and block device behind PATH to\n"
+      "                    ./ucache-bench.txt\n"
       "  netbench <root://url> [--streams 1,4,16] [--block KB] [--seconds S]\n"
       "                    measure the ORIGIN's random-read rates from this\n"
       "                    machine — the numbers a cache location must beat\n"
@@ -546,49 +550,33 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
         std::fputs("bench: --size needs a size (e.g. 512m, 2g)\n", stderr);
         return 2;
       }
-    } else if (a == "--phase-seconds" || a.rfind("--phase-seconds=", 0) == 0 ||
+    } else if (a == "--measurement-duration" || a.rfind("--measurement-duration=", 0) == 0 ||
+               a == "--phase-seconds" || a.rfind("--phase-seconds=", 0) == 0 ||
                a == "--seconds" || a.rfind("--seconds=", 0) == 0) {
-      // `--seconds` is the historical name and stays an alias; it sets the
-      // window of ONE stage, not the runtime of the whole tool.
-      bool isAlias = a.rfind("--seconds", 0) == 0;
-      const char* v = flagValue(argc, argv, i, isAlias ? 9 : 15);
+      // One measurement runs for this long; the run is measurements x this,
+      // plus building the test file. The two older spellings stay as aliases.
+      size_t len = a.rfind("--measurement-duration", 0) == 0 ? 22
+                   : a.rfind("--phase-seconds", 0) == 0     ? 15
+                                                            : 9;
+      const char* v = flagValue(argc, argv, i, len);
       char* end = nullptr;
       double s = v ? std::strtod(v, &end) : 0;
       if (!v || end == v || s <= 0 || s > 300) {
-        std::fputs("bench: --phase-seconds needs a number in (0, 300]\n", stderr);
+        std::fputs("bench: --measurement-duration needs a number in (0, 300]\n", stderr);
         return 2;
       }
-      opts.phaseSeconds = s;
-    } else if (a == "--streams" || a.rfind("--streams=", 0) == 0) {
+      opts.measurementSeconds = s;
+    } else if (a == "--threads" || a.rfind("--threads=", 0) == 0) {
+      // Job concurrency for the PATTERN measurements only; the standard ones
+      // are pinned so they stay comparable across machines.
       const char* v = flagValue(argc, argv, i, 9);
-      std::vector<int> got;
-      for (const char* p = v; v && *p;) {
-        char* end = nullptr;
-        long n = std::strtol(p, &end, 10);
-        if (end == p || n <= 0 || n > 256) {
-          got.clear();
-          break;
-        }
-        got.push_back(static_cast<int>(n));
-        p = end;
-        if (*p == ',')
-          ++p;
-        else if (*p)
-          { got.clear(); break; }
-      }
-      if (got.empty()) {
-        std::fputs("bench: --streams needs a comma list of counts in [1, 256] "
-                   "(e.g. 1,16,64)\n",
-                   stderr);
+      char* end = nullptr;
+      long n = v ? std::strtol(v, &end, 10) : 0;
+      if (!v || end == v || n < 1 || n > 1024) {
+        std::fputs("bench: --threads needs a count in [1, 1024] (default: cores)\n", stderr);
         return 2;
       }
-      // 1 stream is always measured: it is the latency reference and the
-      // denominator every scaling factor is quoted against.
-      if (std::find(got.begin(), got.end(), 1) == got.end())
-        got.insert(got.begin(), 1);
-      std::sort(got.begin(), got.end());
-      got.erase(std::unique(got.begin(), got.end()), got.end());
-      opts.streams = got;
+      opts.threads = static_cast<int>(n);
     } else if (a == "--block" || a.rfind("--block=", 0) == 0) {
       const char* v = flagValue(argc, argv, i, 7);
       char* end = nullptr;

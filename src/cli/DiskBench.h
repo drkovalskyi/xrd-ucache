@@ -39,9 +39,12 @@ namespace ucache {
 
 struct DiskBenchOpts {
   uint64_t fileBytes = 1ull << 30;   // --size (test file ceiling; floor 16 MiB)
-  double phaseSeconds = 5.0;         // --phase-seconds (per timed phase)
-  std::vector<int> streams{1, 16};   // --streams (parallel-stream counts)
-  uint64_t blockBytes = 4ull << 20;  // --block (large-block read/write size)
+  double measurementSeconds = 5.0;   // --measurement-duration (per measurement)
+  // Job concurrency for the PATTERN measurements. One number, optional,
+  // defaulting to the core count: it used to be inherited from the queue-depth
+  // list, so a bare run measured "job concurrency" at 16 on a 64-core box.
+  int threads = 0;                   // --threads (0 = auto: nproc)
+  uint64_t blockBytes = 4ull << 20;  // --block (sequential read/write size)
   // The expected-fill-pattern stage. Defaults are MEASURED, not assumed: a
   // cold analysis fills through ONE stream (uCache keys one entry per URL and
   // drains per entry, so the analysis thread count never reaches the write

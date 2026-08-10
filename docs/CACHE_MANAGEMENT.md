@@ -422,21 +422,22 @@ directory — using the exact access patterns uCache generates:
 ```sh
 ucache bench                      # test the configured cache dir (~1 min)
 ucache bench /data1 /ssd/scratch  # compare candidate locations
-ucache bench /tmp --size 64g --phase-seconds 60 --streams 1,16,32
+ucache bench /tmp --size 64g --measurement-duration 60
 ```
 
-`--phase-seconds` (`--seconds` is still accepted) is the window of ONE
-stage, not the runtime of the tool: the build stage gets 3× it, and a full
-run takes roughly `(6 + 3 × number of stream counts) × S`. The tool prints
+`--measurement-duration` (`--phase-seconds` and `--seconds` are still
+accepted) is how long ONE measurement runs, not the runtime of the tool:
+the run is `measurements × S` plus building the test file. The tool prints
 the plan and its estimated total before it starts, so the arithmetic never
-has to be guessed. Every phase is time-boxed — that is what lets the tool
-finish on a volume that delivers a few dozen IOPS — so `--size` is a
+has to be guessed. Every measurement is time-boxed — that is what lets the
+tool finish on a volume delivering a few dozen IOPS — so `--size` is a
 ceiling the file may not reach; when it does not, the test-file line says
 `stopped at time cap`.
 
-Use `--streams` to measure at the concurrency your jobs actually bring: a
-comma list, default `1,16`, and 1 is always included because it is the
-latency reference and the denominator of every scaling factor.
+`--threads` sets the concurrency of the **pattern** measurements only, and
+defaults to the machine's core count, so the everyday command needs no
+per-machine argument. The **standard** measurements are pinned at queue
+depths 1, 16 and 32 on every machine — that is what makes them comparable.
 
 Reported (raw numbers; interpretation guidance will come later):
 
