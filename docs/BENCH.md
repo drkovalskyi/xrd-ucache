@@ -155,6 +155,16 @@ back to buffered I/O and drops the file's pages (`fdatasync` +
 `buffered` numbers as an upper bound on the device, and do not compare them
 against `O_DIRECT` numbers from another machine.
 
+**On a virtual machine, `O_DIRECT` bypasses only the guest's cache.** The
+hypervisor may still be caching underneath, and the block-layer counters cannot
+see that — they attribute the traffic to a virtual device that answered it out of
+someone else's RAM. The symptom is a rate above anything the hardware class can
+deliver: one VM volume reported 12.8 GB/s on the replica-tier row with 100% of
+the bytes attributed to the benchmark and the device idle beforehand. Nothing was
+wrong with the measurement; the "device" simply was not the disk. If a number
+exceeds the interconnect it would have to cross, it is a cache hit somewhere you
+cannot see, and it does not predict what a cold job gets.
+
 ### The order stages run in
 
 Build the file → `fdatasync` samples → random 4 KiB reads at QD1, 16, 32 →
@@ -587,6 +597,41 @@ A worked pass over one real run — 64 GiB test file, 60 s measurements,
 7. **Is the record trustworthy?** The context block reported the device idle
    beforehand and 0.0% of reads / 0.0% of writes unattributed. Nothing else was
    on the disk.
+
+### The other outcome: a capped volume
+
+The same command on a VM volume, for contrast. This is what you are looking for,
+and it is unmistakable once you know the shape:
+
+```
+    random 4 KiB read (QD1)                          1017 IOPS   p50 0.86 ms
+    random 4 KiB read (QD16)                         1000 IOPS   (1.0x QD1)
+    random 4 KiB read (QD32)                         1000 IOPS   (1.0x QD1)
+    sequential 4096 KiB read (QD1)                  157.6 MB/s
+    random 48 KiB read (QD32)  [byte tier]           39.2 MB/s
+    sequential 512 KiB read (QD32) [replica tier]   139.2 MB/s
+    random 4 KiB read under writeback (QD4)           328 IOPS
+```
+
+- **1.0× scaling at every depth, landing on a round 1000 IOPS.** Devices do not
+  do this; quotas do. No amount of concurrency will get more, so adding analysis
+  threads cannot help.
+- **p50 0.86 ms** — milliseconds, not microseconds. Comparable to fetching from
+  a nearby origin, which is the point at which a cache stops being obviously
+  worth it.
+- **The two tiers differ by 3.6×** (39 vs 139 MB/s), where on the local SSD above
+  they were within 3%. That gap *is* the operation price: the byte tier needs
+  many more operations for the same bytes, and here operations are the scarce
+  resource. On storage like this, completing a recompression is the difference
+  between the two rows.
+- **Reads collapse to 328 IOPS under writeback** — a third of an already small
+  budget, because reads and writes come out of the same one.
+- And the run itself reported `stopped at time cap`: the 64 GiB test file only
+  reached 28.7 GiB in 180 s. The build stage having to give up is itself a
+  measurement.
+
+The record was clean — device idle beforehand, 0 MB unattributed — so none of
+this is an artefact. It is what that volume does.
 
 ---
 
