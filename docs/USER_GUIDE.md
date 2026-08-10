@@ -291,7 +291,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 
 | command            | what it does |
 |--------------------|--------------|
-| `ucache --version` (`-V`) | print the version and exit |
+| `ucache --version` (`-V`) | print the version and the build id, then exit. The build id identifies the revision this binary was built from (`v0.18.3`, or `v0.18.3-4-g1a2b3c-dirty` for a local build with edits); it also appears in every benchmark record, so a measurement can be traced back to a binary. A build id equal to the bare version means the build could not read its own revision |
 | `ucache setup [--host H] [--dir PATH]` | write the single conf file (activation + settings, cache dir explicit) to `~/.xrootd/client.plugins.d` |
 | `ucache doctor`    | check install, filesystem (sparse/flock), and activation |
 | `ucache test <url>` | end-to-end self-test: cold + warm whole-file read via xrdcp against your setup as-is; warm must be origin-free; cleans up the entry it created (pre-existing entries kept) |

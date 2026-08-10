@@ -52,7 +52,7 @@ namespace {
 void usage() {
   std::fputs(
       "usage: ucache <command> [args]\n"
-      "  --version | -V    print the version and exit\n"
+      "  --version | -V    print the version and build id, and exit\n"
       "  setup [--host H] [--dir PATH]  write the single conf file (activation +\n"
       "                    settings, cache dir explicit) to ~/.xrootd/client.plugins.d\n"
       "  doctor            check install, filesystem, and activation\n"
@@ -3063,11 +3063,19 @@ int cmdEnableDisable(bool enable) {
 #ifndef UCACHE_VERSION
 #define UCACHE_VERSION "unknown"
 #endif
+#ifndef UCACHE_BUILD_ID
+#define UCACHE_BUILD_ID UCACHE_VERSION
+#endif
 
 int main(int argc, char** argv) {
   if (argc >= 2 && (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "-V") == 0 ||
                     std::strcmp(argv[1], "version") == 0)) {
-    std::printf("ucache %s\n", UCACHE_VERSION);
+    // The build id is shown here, not just in benchmark records, because this is
+    // where a reader looks to find out what they are running: the version alone
+    // is a constant between releases and names many different binaries. When it
+    // reads as a bare version rather than a tag description, the build could not
+    // identify its own revision — deliberately visible instead of formatted away.
+    std::printf("ucache %s (build %s)\n", UCACHE_VERSION, UCACHE_BUILD_ID);
     return 0;
   }
   if (argc < 2 || std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0 ||

@@ -55,6 +55,25 @@ jobs:
           fetch-depth: 0
       - name: package (build against the 5.6.4 floor, produce RPM + tarball)
         run: UCACHE_PKG_XROOTD_ROOT="$XRD_PREFIX" bash scripts/package-el9.sh
+      # A released binary exists to be identifiable, and until now it silently
+      # was not: `git describe` failed inside the container and the build id fell
+      # back to the plain version, which is indistinguishable from success. Assert
+      # it against the tag, the same way the handshake floor is asserted below —
+      # that check is the reason no artifact has ever shipped with the wrong one.
+      - name: assert the artifact stamps the tag it was built from
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          id=$(build-pkg/src/cli/ucache --version | sed -n 's/^ucache .* (build \(.*\))$/\1/p')
+          echo "build id: '$id'   tag: '$GITHUB_REF_NAME'"
+          if [ "$id" != "$GITHUB_REF_NAME" ]; then
+            echo "FATAL: the artifact cannot assert its provenance."
+            echo "  A build id equal to the bare version means \`git describe\` failed"
+            echo "  (look for the cmake WARNING in the package step); an empty one"
+            echo "  means --version no longer prints '(build <id>)' and this check"
+            echo "  needs updating with it."
+            exit 1
+          fi
+          echo "OK: build id matches the tag"
       - name: assert the plugin declares the 5.6 handshake floor
         run: |
           v=$(strings build-pkg/src/plugin/libXrdClUCache.so \
