@@ -441,9 +441,9 @@ use — not the core count, unless they are the same. The **standard**
 measurements are pinned at queue depths 1, 16 and 32 on every machine, which
 is what makes them comparable.
 
-Reported (raw numbers; interpretation guidance will come later):
-
 The numbers come in two groups, because they answer different questions.
+**`docs/BENCH.md` documents every measurement, how to read it, and how well each
+one reproduces**; what follows is the summary.
 
 **Standard measures** — fixed block sizes and queue depths, so they can be read
 against a drive's datasheet, an `fio` number someone quotes, or another machine:
@@ -452,25 +452,31 @@ against a drive's datasheet, an `fio` number someone quotes, or another machine:
 |---|---|
 | sequential read MB/s | QD1, large block, O_DIRECT |
 | sequential write MB/s | QD1, large block, O_DIRECT, in place |
-| random 4 KiB read IOPS + latency | QD1 (the latency reference) and at each `--streams` depth |
+| random 4 KiB read IOPS + latency | QD1 (the latency reference), QD16 and QD32 |
 | random 4 KiB write IOPS | QD32 — the depth datasheets quote |
 
-**Predictive measures** — the patterns uCache actually generates, so they
-predict what a job will get here:
+**Pattern measures** — the shapes uCache actually generates, at your job's
+concurrency, so they predict what a job will get here:
 
 | metric | what it corresponds to in uCache |
 |---|---|
 | fill pattern MB/s, buffered and O_DIRECT | the cold fill: one writer, ~48 KiB writes, new files created and extended. The pair shows whether the kernel merges those small writes into larger device writes |
-| random 48 KiB / 512 KiB read at job concurrency | the two serving tiers — the byte cache reads at ~42 KiB, a replica at ~599 KiB. Both sit between the standard 4 KiB and 4 MiB points, in the range where a device stops being op-bound and turns bandwidth-bound |
-| large-block read MB/s at 1..N streams | replica serving as concurrency rises; flat scaling means one stream already saturates the link |
-| random 4 KiB read IOPS (N streams) | multi-threaded jobs; **flat scaling vs 1 stream exposes an IOPS quota** |
+| random 48 KiB read at job concurrency | the byte cache, which serves at ~42 KiB with no locality between reads |
+| sequential 512 KiB read at job concurrency | a replica, which is branch-major, so consecutive reads land adjacent and reach ~599 KiB per operation |
+| sequential large-block read at job concurrency | streaming bandwidth under concurrency; **flat scaling vs QD1 means one stream already saturates the disk** |
 | read-under-writeback latency | warm reads while a fill is running — the common mixed mode |
 | fdatasync / create / unlink rates | sidecar flushes, eviction, `clear` |
 | test-file creation MB/s | NOT a device spec — see below |
 
-The multi-stream write stage cycles in place over per-stream slices of the
-one test file, so however long the window runs it never uses more disk than
-`--size`.
+Both tier sizes sit between the standard 4 KiB and 4 MiB points, in the range
+where a device stops being operation-bound and turns bandwidth-bound, so neither
+can be interpolated from the standard measures. `--sweep` measures that curve
+directly.
+
+The write measurements cycle in place inside the one test file, so however long
+a window runs the file never grows past `--size`. Peak disk usage is a little
+above it — the fill stage holds its own file alongside — so budget
+`--size` + 256 MiB.
 
 **Which write number to trust.** Building the test file is not a device
 measurement: it pays allocation, runs before anything has warmed up, and its
@@ -496,12 +502,11 @@ minutes. Measure with a large `--size` and a long window
 (`--size 64g --phase-seconds 60`), and if you need the number to be
 defensible, run it twice.
 
-For a device's write capability under the concurrency your fills actually
-bring, prefer the **large-block write** rows (`bigwrite_mbps_*`). They write
-to already-allocated space partway through the run and reproduce across runs
-to about 1%, where the build-stage figure — first write to fresh space, with
-whatever cache state you started with — moved 68% between two runs an hour
-apart on an otherwise idle machine.
+So for a device's write capability, use `seq_write_mbps`: it writes to
+already-allocated space partway through the run and reproduces to about 6%,
+where the build-stage figure — first write to fresh extents, with whatever cache
+state you started with — moved 68% across five runs of one command on an
+otherwise idle machine.
 
 Each run also prints a `ucache-bench-json:` line and appends a full record —
 plan, numbers, JSON line, and the context needed to read them later — to

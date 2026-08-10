@@ -1540,8 +1540,13 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   const double W = o.measurementSeconds;
   const int nStd = static_cast<int>(sizeof kStdQd / sizeof kStdQd[0]);
   const bool pat = o.threads > 0;
-  const int measurements = 2 + nStd + 1              // standard
-                           + (pat ? (o.sweep ? 9 : 3) : 0) + 2 + 1; // pattern
+  // Pattern, non-sweep: sequential at job concurrency, the byte tier, the
+  // replica tier. With --sweep the single byte-tier point becomes the 8-point
+  // ladder, and the sequential and replica measurements still run either way —
+  // so it is 10, not 9, and an estimate short by one whole window is exactly
+  // the arithmetic the plan exists to remove.
+  const int measurements = 2 + nStd + 1                          // standard
+                           + (pat ? (o.sweep ? 10 : 3) : 0) + 2 + 1; // pattern
   const double buildCap = std::max(W * 3, 10.0);
   const double total = (buildCap + W * measurements) * static_cast<double>(paths.size());
   std::string s;
