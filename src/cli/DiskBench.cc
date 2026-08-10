@@ -487,6 +487,19 @@ uint64_t randLoop(int fd, uint64_t fsz, bool write, char* buf, double deadline,
 struct FillStat {
   double mbps = 0, filesPerS = 0, meanWriteKib = 0;
   uint64_t writes = 0, bytes = 0, files = 0;
+  // One rate per completed file cycle. A 60 s window completes ~100 of them,
+  // so the distribution is already there — collapsing it to a mean is what
+  // made the build stage unreadable, and there is no reason to repeat that.
+  double p50 = 0, p10 = 0, p90 = 0;
+  size_t samples = 0;
+  // Percentiles alone cannot tell random scatter from a drift, because sorting
+  // discards the one thing that distinguishes them. If the within-window
+  // variation is systematic then the mean's uncertainty does NOT fall as
+  // 1/sqrt(n), and a between-run spread may be this same effect sampled at
+  // different phases rather than a separate mystery.
+  double q1 = 0, q4 = 0; // mean rate of the first and last quarter, IN ORDER
+  double lag1 = 0;       // lag-1 autocorrelation: catches a sawtooth that
+                         // quarter means would average flat
 };
 
 // One stream-count result. `nEff` is what actually ran: a file too small to
@@ -596,6 +609,24 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
   return s;
 }
 
+// What the ORDERED per-file series says about the mean's reliability. The
+// direction matters and is easy to get backwards: a DRIFT or clustered slow
+// runs (positive autocorrelation) shrink the effective sample count, so the
+// mean is worse than sigma/sqrt(n) and a between-run spread may be this same
+// effect sampled at different phases. An ALTERNATING series (negative
+// autocorrelation) cancels, so the mean is BETTER determined than independent
+// sampling would give — it does not explain a between-run spread away.
+const char* fillShape(const FillStat& f) {
+  const double drift = f.q1 > 0 ? (f.q4 - f.q1) / f.q1 : 0.0;
+  if (std::fabs(drift) > 0.03)
+    return "   <- DRIFTS: mean depends on where the window fell, not sigma/sqrt(n)";
+  if (f.lag1 > 0.3)
+    return "   <- CLUSTERED: effective samples fewer than they look, mean is softer";
+  if (f.lag1 < -0.3)
+    return "   <- ALTERNATES: cancels, so the mean is TIGHTER than sigma/sqrt(n)";
+  return "   (no drift or correlation: samples look independent)";
+}
+
 // The write pattern a cold fill actually generates: N writers (measured: 1),
 // each creating its own file, extending it in `block`-sized writes, flushing,
 // closing, unlinking, and starting the next one — so allocation cost and file
@@ -622,6 +653,8 @@ FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
     fsize = blk;
 
   std::atomic<uint64_t> bytes{0}, writes{0}, files{0};
+  std::mutex rmu;
+  std::vector<double> rates; // MB/s per completed file cycle
   double t0 = nowS(), deadline = t0 + phase;
   std::vector<std::thread> pool;
   pool.reserve(static_cast<size_t>(nw));
@@ -631,7 +664,10 @@ FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
       if (!buf)
         return;
       uint64_t lb = 0, lw = 0, lf = 0;
+      std::vector<double> mine;
       for (int seq = 0; nowS() < deadline; ++seq) {
+        const double fileT0 = nowS();
+        uint64_t fileBytes = 0;
         char nm[4300];
         std::snprintf(nm, sizeof nm, "%s/fill%02d-%06d", dir.c_str(), t, seq);
         int fd = ::open(nm, O_WRONLY | O_CREAT | O_TRUNC | (direct ? O_DIRECT : 0), 0600);
@@ -641,14 +677,24 @@ FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
           if (::pwrite(fd, buf, blk, static_cast<off_t>(off)) != static_cast<ssize_t>(blk))
             break;
           lb += blk;
+          fileBytes += blk;
           ++lw;
         }
         ::fdatasync(fd); // inside the window: otherwise this measures RAM
         ::close(fd);
         ::unlink(nm);
         ++lf;
+        // Only WHOLE cycles enter the distribution: the last file is usually
+        // cut off by the deadline, and a partial slice is not a rate.
+        double dt = nowS() - fileT0;
+        if (fileBytes == fsize && dt > 0)
+          mine.push_back(static_cast<double>(fileBytes) / 1e6 / dt);
       }
       ::free(buf);
+      {
+        std::lock_guard<std::mutex> g(rmu);
+        rates.insert(rates.end(), mine.begin(), mine.end());
+      }
       bytes += lb;
       writes += lw;
       files += lf;
@@ -662,6 +708,39 @@ FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
   s.mbps = static_cast<double>(s.bytes) / 1e6 / el;
   s.filesPerS = static_cast<double>(s.files) / el;
   s.meanWriteKib = s.writes ? static_cast<double>(s.bytes) / s.writes / 1024.0 : 0;
+  if (rates.size() >= 8) {
+    // ORDER-SENSITIVE statistics first, before sorting destroys the order.
+    const size_t n = rates.size(), q = n / 4;
+    double a = 0, b = 0;
+    for (size_t i = 0; i < q; ++i) {
+      a += rates[i];
+      b += rates[n - 1 - i];
+    }
+    s.q1 = a / static_cast<double>(q);
+    s.q4 = b / static_cast<double>(q);
+    double mean = 0;
+    for (double v : rates)
+      mean += v;
+    mean /= static_cast<double>(n);
+    double num = 0, den = 0;
+    for (size_t i = 0; i < n; ++i) {
+      double d = rates[i] - mean;
+      den += d * d;
+      if (i + 1 < n)
+        num += d * (rates[i + 1] - mean);
+    }
+    s.lag1 = den > 0 ? num / den : 0;
+  }
+  if (!rates.empty()) {
+    std::sort(rates.begin(), rates.end());
+    auto at = [&rates](double q) {
+      return rates[std::min(rates.size() - 1, static_cast<size_t>(rates.size() * q))];
+    };
+    s.p50 = at(0.50);
+    s.p10 = at(0.10);
+    s.p90 = at(0.90);
+    s.samples = rates.size();
+  }
   return s;
 }
 
@@ -856,10 +935,20 @@ std::string humanBlock(const Result& r) {
     appendf(s, "    %-46s%8.1f MB/s   %8.0f IOPS\n", lb, r.patReplicaRead.mbps,
             r.patReplicaRead.iops);
   }
-  appendf(s, "    %-46s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", "fill pattern, buffered",
-          r.fillBuf.mbps, r.fillBuf.filesPerS, r.fillBuf.meanWriteKib);
-  appendf(s, "    %-46s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", "fill pattern, O_DIRECT",
-          r.fillDir.mbps, r.fillDir.filesPerS, r.fillDir.meanWriteKib);
+  auto fillLine = [&s](const char* label, const FillStat& f) {
+    appendf(s, "    %-46s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", label, f.mbps,
+            f.filesPerS, f.meanWriteKib);
+    if (f.samples >= 4)
+      appendf(s, "      per file: p50 %.1f   p10 %.1f   p90 %.1f MB/s   (%zu files, "
+                 "p90/p10 %.2fx)\n",
+              f.p50, f.p10, f.p90, f.samples, f.p10 > 0 ? f.p90 / f.p10 : 0.0);
+    if (f.samples >= 8)
+      appendf(s, "      in order: first quarter %.1f -> last quarter %.1f MB/s (%+.1f%%), "
+                 "lag-1 autocorr %+.2f%s\n",
+              f.q1, f.q4, f.q1 > 0 ? 100.0 * (f.q4 - f.q1) / f.q1 : 0.0, f.lag1, fillShape(f));
+  };
+  fillLine("fill pattern, buffered", r.fillBuf);
+  fillLine("fill pattern, O_DIRECT", r.fillDir);
   appendf(s, "    %-46s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms   (write %.1f MB/s)\n",
           "random 4 KiB read under writeback (QD4)", r.mixedReadIops, r.mixed.p50 / 1e3, r.mixed.p99 / 1e3, r.mixedWriteMbps);
   appendf(s, "\n  Untimed\n    %-46s%8.0f /s   %8.0f /s\n", "create / unlink", r.createPs,
@@ -965,11 +1054,20 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
   appendf(s, ",\"fill_writers\":%d,\"fill_block_kib\":%llu,\"fill_file_mib\":%llu,"
              "\"fill_buffered_mbps\":%.1f,\"fill_buffered_files_ps\":%.1f,"
              "\"fill_buffered_write_kib\":%.1f,\"fill_direct_mbps\":%.1f,"
-             "\"fill_direct_files_ps\":%.1f,\"fill_direct_write_kib\":%.1f",
+             "\"fill_direct_files_ps\":%.1f,\"fill_direct_write_kib\":%.1f,"
+             "\"fill_buffered_p50_mbps\":%.1f,\"fill_buffered_p10_mbps\":%.1f,"
+             "\"fill_buffered_p90_mbps\":%.1f,\"fill_buffered_samples\":%zu,"
+             "\"fill_direct_p50_mbps\":%.1f,\"fill_direct_p10_mbps\":%.1f,"
+             "\"fill_direct_p90_mbps\":%.1f,\"fill_direct_samples\":%zu,"
+             "\"fill_buffered_q1_mbps\":%.1f,\"fill_buffered_q4_mbps\":%.1f,"
+             "\"fill_buffered_lag1\":%.3f,\"fill_direct_q1_mbps\":%.1f,"
+             "\"fill_direct_q4_mbps\":%.1f,\"fill_direct_lag1\":%.3f",
           o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024),
           static_cast<unsigned long long>(o.fillFile >> 20), r.fillBuf.mbps,
           r.fillBuf.filesPerS, r.fillBuf.meanWriteKib, r.fillDir.mbps, r.fillDir.filesPerS,
-          r.fillDir.meanWriteKib);
+          r.fillDir.meanWriteKib, r.fillBuf.p50, r.fillBuf.p10, r.fillBuf.p90, r.fillBuf.samples,
+          r.fillDir.p50, r.fillDir.p10, r.fillDir.p90, r.fillDir.samples, r.fillBuf.q1,
+          r.fillBuf.q4, r.fillBuf.lag1, r.fillDir.q1, r.fillDir.q4, r.fillDir.lag1);
   appendf(s, ",\"std_qds\":[");
   for (size_t i = 0; i < r.randr.size(); ++i)
     appendf(s, "%s%d", i ? "," : "", r.randr[i].nEff);
