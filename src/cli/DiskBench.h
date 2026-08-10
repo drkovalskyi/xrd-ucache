@@ -45,6 +45,12 @@ struct DiskBenchOpts {
   // list, so a bare run measured "job concurrency" at 16 on a 64-core box.
   int threads = 0;                   // --threads (0 = auto: nproc)
   uint64_t blockBytes = 4ull << 20;  // --block (sequential read/write size)
+  // --sweep: measure the random read at a ladder of block sizes instead of
+  // just the two tier sizes. The knee between op-bound and bandwidth-bound
+  // lies between 4 and 48 KiB on the devices measured so far, and no pair of
+  // points either side of it can locate it. Off by default: it is device
+  // characterisation, worth doing once per device rather than every run.
+  bool sweep = false;
   // The expected-fill-pattern stage. Defaults are MEASURED, not assumed: a
   // cold analysis fills through ONE stream (uCache keys one entry per URL and
   // drains per entry, so the analysis thread count never reaches the write

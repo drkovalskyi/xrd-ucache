@@ -635,6 +635,8 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
         return 2;
       }
       opts.logPath = v;
+    } else if (a == "--sweep") {
+      opts.sweep = true;
     } else if (a == "--no-log") {
       opts.logPath.clear();
     } else if (!a.empty() && a[0] == '-') {
@@ -652,6 +654,19 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
       return 2;
     }
     paths.push_back(cfg.cacheDir);
+  }
+
+  // --threads is REQUIRED: the pattern measurements are quoted as "at your
+  // job's concurrency", and there is no honest way to supply that number on
+  // the user's behalf. Inheriting it from a queue-depth list, or reading it
+  // off nproc, both produced a figure nobody chose (nproc is 64 on the
+  // development box while the reference analysis runs 32).
+  if (opts.threads <= 0) {
+    std::fputs("bench: --threads N is required — it is the concurrency your analyses run at,\n"
+               "       and it is never guessed. It is NOT the core count unless they match.\n"
+               "       e.g. ucache bench --size 64g --measurement-duration 60 --threads 32 PATH\n",
+               stderr);
+    return 2;
   }
   return runDiskBench(paths, opts);
 }

@@ -28,6 +28,9 @@
 #ifndef UCACHE_VERSION
 #define UCACHE_VERSION "unknown"
 #endif
+#ifndef UCACHE_BUILD_ID
+#define UCACHE_BUILD_ID UCACHE_VERSION
+#endif
 
 namespace ucache {
 namespace {
@@ -589,6 +592,7 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
     t.join();
   double el = std::max(1e-9, nowS() - t0);
   s.mbps = static_cast<double>(bytes.load()) / 1e6 / el;
+  s.iops = static_cast<double>(bytes.load()) / static_cast<double>(blk) / el;
   return s;
 }
 
@@ -739,7 +743,9 @@ struct Result {
   double stdSeqReadMbps = 0;         // sequential, QD1
   // PATTERN — at this machine's job concurrency
   StreamStat patSeqRead;             // sequential, QD threads
-  std::vector<StreamStat> patRead;   // random 48 KiB / 512 KiB, QD threads
+  std::vector<StreamStat> patRead;   // random reads at patReadKib[], QD threads
+  std::vector<uint64_t> patReadKib;
+  StreamStat patReplicaRead;         // SEQUENTIAL 512 KiB — the replica tier
   FillStat fillBuf, fillDir;         // the fill, both modes
   int threads = 0;                   // resolved job concurrency
   double mixedReadIops = 0, mixedWriteMbps = 0;
@@ -806,21 +812,21 @@ std::string humanBlock(const Result& r) {
   char lb[80];
   std::snprintf(lb, sizeof lb, "sequential %llu KiB read (QD1)",
                 static_cast<unsigned long long>(r.blockKib));
-  appendf(s, "    %-40s%8.1f MB/s\n", lb, r.stdSeqReadMbps);
+  appendf(s, "    %-46s%8.1f MB/s\n", lb, r.stdSeqReadMbps);
   std::snprintf(lb, sizeof lb, "sequential %llu KiB write (QD1, in place)",
                 static_cast<unsigned long long>(r.blockKib));
-  appendf(s, "    %-40s%8.1f MB/s\n", lb, r.stdSeqWriteMbps);
+  appendf(s, "    %-46s%8.1f MB/s\n", lb, r.stdSeqWriteMbps);
   for (size_t i = 0; i < r.randr.size(); ++i) {
     const StreamStat& t = r.randr[i];
     std::snprintf(lb, sizeof lb, "random 4 KiB read (QD%d)", t.nEff);
-    appendf(s, "    %-40s%8.0f IOPS   p50 %.2f ms   p95 %.2f ms   p99 %.2f ms", lb, t.iops,
+    appendf(s, "    %-46s%8.0f IOPS   p50 %.2f ms   p95 %.2f ms   p99 %.2f ms", lb, t.iops,
             t.lat.p50 / 1e3, t.lat.p95 / 1e3, t.lat.p99 / 1e3);
     if (i > 0 && r.randr.front().iops > 0)
       appendf(s, "   (%.1fx QD1)", t.iops / r.randr.front().iops);
     appendf(s, "\n");
   }
   std::snprintf(lb, sizeof lb, "random 4 KiB write (QD%d)", kStdWriteQd);
-  appendf(s, "    %-40s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms\n", lb, r.randw.iops,
+  appendf(s, "    %-46s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms\n", lb, r.randw.iops,
           r.randw.lat.p50 / 1e3, r.randw.lat.p99 / 1e3);
 
   if (r.threads > 0)
@@ -830,26 +836,33 @@ std::string humanBlock(const Result& r) {
   if (r.threads > 0) {
     std::snprintf(lb, sizeof lb, "sequential %llu KiB read (QD%d)",
                   static_cast<unsigned long long>(r.blockKib), r.patSeqRead.nEff);
-    appendf(s, "    %-40s%8.1f MB/s", lb, r.patSeqRead.mbps);
+    appendf(s, "    %-46s%8.1f MB/s", lb, r.patSeqRead.mbps);
     if (r.stdSeqReadMbps > 0)
       appendf(s, "   (%.2fx QD1)", r.patSeqRead.mbps / r.stdSeqReadMbps);
     appendf(s, "\n");
   }
   for (size_t i = 0; i < r.patRead.size(); ++i) {
     const StreamStat& t = r.patRead[i];
-    std::snprintf(lb, sizeof lb, "random %llu KiB read (QD%d)  [%s tier]",
-                  static_cast<unsigned long long>(i == 0 ? 48 : 512), t.nEff,
-                  i == 0 ? "byte" : "replica");
-    appendf(s, "    %-40s%8.1f MB/s   %8.0f IOPS   p99 %.2f ms\n", lb, t.mbps, t.iops,
+    const uint64_t kib = i < r.patReadKib.size() ? r.patReadKib[i] : 0;
+    const char* tier = kib == 48 ? "  [byte tier]" : kib == 512 ? "  [replica tier]" : "";
+    std::snprintf(lb, sizeof lb, "random %llu KiB read (QD%d)%s",
+                  static_cast<unsigned long long>(kib), t.nEff, tier);
+    appendf(s, "    %-46s%8.1f MB/s   %8.0f IOPS   p99 %.2f ms\n", lb, t.mbps, t.iops,
             t.lat.p99 / 1e3);
   }
-  appendf(s, "    %-40s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", "fill pattern, buffered",
+  if (r.threads > 0) {
+    std::snprintf(lb, sizeof lb, "sequential 512 KiB read (QD%d)  [replica tier]",
+                  r.patReplicaRead.nEff);
+    appendf(s, "    %-46s%8.1f MB/s   %8.0f IOPS\n", lb, r.patReplicaRead.mbps,
+            r.patReplicaRead.iops);
+  }
+  appendf(s, "    %-46s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", "fill pattern, buffered",
           r.fillBuf.mbps, r.fillBuf.filesPerS, r.fillBuf.meanWriteKib);
-  appendf(s, "    %-40s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", "fill pattern, O_DIRECT",
+  appendf(s, "    %-46s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", "fill pattern, O_DIRECT",
           r.fillDir.mbps, r.fillDir.filesPerS, r.fillDir.meanWriteKib);
-  appendf(s, "    %-40s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms   (write %.1f MB/s)\n",
+  appendf(s, "    %-46s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms   (write %.1f MB/s)\n",
           "random 4 KiB read under writeback (QD4)", r.mixedReadIops, r.mixed.p50 / 1e3, r.mixed.p99 / 1e3, r.mixedWriteMbps);
-  appendf(s, "\n  Untimed\n    %-40s%8.0f /s   %8.0f /s\n", "create / unlink", r.createPs,
+  appendf(s, "\n  Untimed\n    %-46s%8.0f /s   %8.0f /s\n", "create / unlink", r.createPs,
           r.unlinkPs);
   return s;
 }
@@ -860,8 +873,8 @@ std::string contextBlock(const Result& r, const DiskBenchOpts& o) {
   const RunEnv& e = r.env;
   std::string s;
   appendf(s, "--- run context ---\n");
-  appendf(s, "  when      %s   (ucache %s, %.1f s wall)\n", e.startLocal.c_str(), UCACHE_VERSION,
-          e.wallS);
+  appendf(s, "  when      %s   (ucache %s, build %s, %.1f s wall)\n", e.startLocal.c_str(),
+          UCACHE_VERSION, UCACHE_BUILD_ID, e.wallS);
   appendf(s, "  command   %s\n", o.cmdline.c_str());
   appendf(s, "  machine   %s   %s %s   %ld cpu   %.1f GiB RAM\n", e.mach.host.c_str(),
           e.mach.kernel.c_str(), e.mach.arch.c_str(), e.mach.ncpu, e.mach.memGb);
@@ -937,13 +950,18 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
   // PREDICTIVE: tier-sized random reads at job concurrency, and the fill.
   appendf(s, ",\"threads\":%d", r.threads);
   if (r.threads > 0)
-    appendf(s, ",\"pat_seq_read_mbps\":%.1f", r.patSeqRead.mbps);
+    appendf(s, ",\"pat_seq_read_mbps\":%.1f,\"pat_replica_read_mbps\":%.1f,"
+               "\"pat_replica_read_iops\":%.0f",
+            r.patSeqRead.mbps, r.patReplicaRead.mbps, r.patReplicaRead.iops);
   for (size_t i = 0; i < r.patRead.size(); ++i)
-    appendf(s, ",\"pat_rand%s_read_mbps\":%.1f,\"pat_rand%s_read_iops\":%.0f,"
-               "\"pat_rand%s_read_us_p99\":%llu",
-            i == 0 ? "48k" : "512k", r.patRead[i].mbps, i == 0 ? "48k" : "512k",
-            r.patRead[i].iops, i == 0 ? "48k" : "512k",
+  {
+    const unsigned long long kib =
+        static_cast<unsigned long long>(i < r.patReadKib.size() ? r.patReadKib[i] : 0);
+    appendf(s, ",\"pat_rand%lluk_read_mbps\":%.1f,\"pat_rand%lluk_read_iops\":%.0f,"
+               "\"pat_rand%lluk_read_us_p99\":%llu",
+            kib, r.patRead[i].mbps, kib, r.patRead[i].iops, kib,
             static_cast<unsigned long long>(r.patRead[i].lat.p99));
+  }
   appendf(s, ",\"fill_writers\":%d,\"fill_block_kib\":%llu,\"fill_file_mib\":%llu,"
              "\"fill_buffered_mbps\":%.1f,\"fill_buffered_files_ps\":%.1f,"
              "\"fill_buffered_write_kib\":%.1f,\"fill_direct_mbps\":%.1f,"
@@ -969,7 +987,7 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
           r.stdSeqReadMbps, r.mixedReadIops, static_cast<unsigned long long>(r.mixed.p50),
           static_cast<unsigned long long>(r.mixed.p99), r.mixedWriteMbps, r.createPs, r.unlinkPs);
   // run context
-  appendf(s, ",\"time\":\"%s\",\"version\":\"%s\",\"cmd\":\"%s\",\"wall_s\":%.1f,"
+  appendf(s, ",\"time\":\"%s\",\"version\":\"%s\",\"build_id\":\"" UCACHE_BUILD_ID "\",\"cmd\":\"%s\",\"wall_s\":%.1f,"
              "\"kernel\":\"%s\",\"arch\":\"%s\",\"ncpu\":%ld,\"mem_gb\":%.1f,\"cpu_model\":\"%s\","
              "\"dirty_ratio\":%d,\"dirty_background_ratio\":%d,\"dirty_limit_gb\":%.1f",
           jesc(e.startIso).c_str(), UCACHE_VERSION, jesc(o.cmdline).c_str(), e.wallS,
@@ -1206,12 +1224,26 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     // 48 KiB is what the byte tier serves at, 512 KiB what a replica serves at.
     // Both sit between the standard 4 KiB and 4 MiB points, in the interval
     // where a device stops being op-bound and turns bandwidth-bound.
-    for (uint64_t blk : {48ull << 10, 512ull << 10}) {
+    // Byte tier: scattered (measured 733 KiB mean between consecutive writes,
+    // and reads follow the same basket layout) -> random.
+    // Replica tier: branch-major, so consecutive reads land adjacent, which is
+    // why it reaches ~599 KiB/op -> SEQUENTIAL, each thread in its own region.
+    static const uint64_t kTiers[] = {48ull << 10};
+    static const uint64_t kLadder[] = {4ull << 10,  8ull << 10,   16ull << 10,  32ull << 10,
+                                       48ull << 10, 128ull << 10, 512ull << 10, 4096ull << 10};
+    const uint64_t* sizes = o.sweep ? kLadder : kTiers;
+    const size_t nsizes = o.sweep ? sizeof kLadder / sizeof kLadder[0] : 1;
+    for (size_t i = 0; i < nsizes; ++i) {
       if (!direct)
         evict(rfd);
       r.patRead.push_back(
-          randSizeStage(tf, rflags, fsz, r.threads, blk, o.measurementSeconds, false));
+          randSizeStage(tf, rflags, fsz, r.threads, sizes[i], o.measurementSeconds, false));
+      r.patReadKib.push_back(sizes[i] / 1024);
     }
+    if (!direct)
+      evict(rfd);
+    r.patReplicaRead =
+        bigStage(tf, fsz, r.threads, 512ull << 10, o.measurementSeconds, false, direct);
   }
 
   // --- STANDARD random write, 4 KiB at queue depth 32 (the datasheet number;
@@ -1320,7 +1352,7 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   const int nStd = static_cast<int>(sizeof kStdQd / sizeof kStdQd[0]);
   const bool pat = o.threads > 0;
   const int measurements = 2 + nStd + 1              // standard
-                           + (pat ? 3 : 0) + 2 + 1;  // pattern (3 need --threads)
+                           + (pat ? (o.sweep ? 9 : 3) : 0) + 2 + 1; // pattern
   const double buildCap = std::max(W * 3, 10.0);
   const double total = (buildCap + W * measurements) * static_cast<double>(paths.size());
   std::string s;
@@ -1333,12 +1365,7 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   appendf(s, "\n");
   appendf(s, "  test file: build until %.1f GiB or %.0f s, whichever comes first\n",
           static_cast<double>(std::max<uint64_t>(o.fileBytes, kMinFile)) / (1ull << 30), buildCap);
-  if (pat)
-    appendf(s, "  threads: %d\n", o.threads);
-  else
-    appendf(s, "  threads: not set — the concurrency-dependent pattern measurements are\n"
-               "           SKIPPED (pass --threads N to measure at your job's concurrency;\n"
-               "           it is never guessed, because a number nobody chose is not one)\n");
+  appendf(s, "  threads: %d   (job concurrency; never guessed — see --threads)\n", o.threads);
   appendf(s, "\n  Standard measurements\n");
   appendf(s, "    sequential %llu KiB read, QD1\n",
           static_cast<unsigned long long>(o.blockBytes / 1024));
@@ -1351,8 +1378,16 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   if (pat) {
     appendf(s, "    sequential %llu KiB read, QD%d\n",
             static_cast<unsigned long long>(o.blockBytes / 1024), o.threads);
-    appendf(s, "    random 48 KiB read, QD%d          (byte tier)\n", o.threads);
-    appendf(s, "    random 512 KiB read, QD%d         (replica tier)\n", o.threads);
+    appendf(s, "    sequential 512 KiB read, QD%d     (replica tier — branch-major, so\n"
+               "                                      consecutive reads are adjacent)\n",
+            o.threads);
+    if (o.sweep)
+      appendf(s, "    random read block sweep, QD%d     (4,8,16,32,48,128,512,4096 KiB —\n"
+                 "                                      locates the op-bound/bandwidth knee)\n",
+              o.threads);
+    else {
+      appendf(s, "    random 48 KiB read, QD%d          (byte tier — scattered)\n", o.threads);
+    }
   }
   appendf(s, "    fill pattern, buffered           (%d writer(s), %llu KiB writes, %llu MiB "
              "files)\n",
