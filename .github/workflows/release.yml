@@ -46,7 +46,13 @@ jobs:
                 -DENABLE_READLINE=FALSE
           cmake --build /tmp/xrd/build -j"$(nproc)"
           cmake --install /tmp/xrd/build
+      # fetch-depth 0 so `git describe` can resolve the tag being released:
+      # at the default shallow depth with no tags it fails, and the build id
+      # falls back to the plain version — leaving the one artifact whose
+      # provenance is worth asserting unable to assert it.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: package (build against the 5.6.4 floor, produce RPM + tarball)
         run: UCACHE_PKG_XROOTD_ROOT="$XRD_PREFIX" bash scripts/package-el9.sh
       - name: assert the plugin declares the 5.6 handshake floor

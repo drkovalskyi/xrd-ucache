@@ -396,6 +396,7 @@ struct Machine {
   // across the fleet and explains an otherwise impossible write rate.
   int dirtyRatio = -1, dirtyBgRatio = -1;
   double dirtyLimitGb = 0;
+  bool dirtyAbsolute = false; // vm.dirty_bytes is set, so the ratio is ignored
 };
 
 Machine machineInfo() {
@@ -437,6 +438,7 @@ Machine machineInfo() {
     m.dirtyBgRatio = std::atoi(db.c_str());
   std::string dbytes = readFileTrim("/proc/sys/vm/dirty_bytes");
   uint64_t db_abs = dbytes.empty() ? 0 : std::strtoull(dbytes.c_str(), nullptr, 10);
+  m.dirtyAbsolute = db_abs != 0;
   m.dirtyLimitGb = db_abs ? static_cast<double>(db_abs) / (1ull << 30)
                           : (m.dirtyRatio > 0 ? m.memGb * m.dirtyRatio / 100.0 : 0);
   return m;
@@ -1006,9 +1008,16 @@ std::string contextBlock(const Result& r, const DiskBenchOpts& o) {
           e.mach.kernel.c_str(), e.mach.arch.c_str(), e.mach.ncpu, e.mach.memGb);
   if (!e.mach.cpuModel.empty())
     appendf(s, "  cpu       %s\n", e.mach.cpuModel.c_str());
-  if (e.mach.dirtyRatio >= 0)
-    appendf(s, "  writeback dirty_ratio %d%% / background %d%%  -> buffered writes are free "
-               "up to ~%.1f GiB\n",
+  // Say WHICH knob governs. The kernel reports dirty_ratio as 0 when
+  // vm.dirty_bytes is set, so printing both flat reads as a contradiction: a
+  // 0% ratio beside a real limit.
+  if (e.mach.dirtyAbsolute)
+    appendf(s, "  writeback vm.dirty_bytes is set (the ratio is ignored)  -> buffered writes "
+               "are free up to ~%.1f GiB\n",
+            e.mach.dirtyLimitGb);
+  else if (e.mach.dirtyRatio >= 0)
+    appendf(s, "  writeback dirty_ratio %d%% of RAM / background %d%%  -> buffered writes are "
+               "free up to ~%.1f GiB\n",
             e.mach.dirtyRatio, e.mach.dirtyBgRatio, e.mach.dirtyLimitGb);
   appendf(s, "  load      %.2f %.2f %.2f at start -> %.2f %.2f %.2f at end",
           e.load0.l1, e.load0.l5, e.load0.l15, e.load1.l1, e.load1.l5, e.load1.l15);
@@ -1145,11 +1154,12 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
   // run context
   appendf(s, ",\"time\":\"%s\",\"version\":\"%s\",\"build_id\":\"" UCACHE_BUILD_ID "\",\"cmd\":\"%s\",\"wall_s\":%.1f,"
              "\"kernel\":\"%s\",\"arch\":\"%s\",\"ncpu\":%ld,\"mem_gb\":%.1f,\"cpu_model\":\"%s\","
-             "\"dirty_ratio\":%d,\"dirty_background_ratio\":%d,\"dirty_limit_gb\":%.1f",
+             "\"dirty_ratio\":%d,\"dirty_background_ratio\":%d,\"dirty_limit_gb\":%.1f,"
+             "\"dirty_absolute\":%s",
           jesc(e.startIso).c_str(), UCACHE_VERSION, jesc(o.cmdline).c_str(), e.wallS,
           jesc(e.mach.kernel).c_str(), jesc(e.mach.arch).c_str(), e.mach.ncpu, e.mach.memGb,
           jesc(e.mach.cpuModel).c_str(), e.mach.dirtyRatio, e.mach.dirtyBgRatio,
-          e.mach.dirtyLimitGb);
+          e.mach.dirtyLimitGb, e.mach.dirtyAbsolute ? "true" : "false");
   appendf(s, ",\"mount\":\"%s\",\"mount_fstype\":\"%s\",\"mount_source\":\"%s\","
              "\"mount_opts\":\"%s\",\"mount_super_opts\":\"%s\",\"dev\":\"%u:%u\"",
           jesc(e.mnt.mountPoint).c_str(), jesc(e.mnt.fsType).c_str(), jesc(e.mnt.source).c_str(),

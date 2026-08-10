@@ -22,9 +22,14 @@ if (GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
   endif()
   # Without these the value is captured once and then silently goes stale: a
   # rebuild after new commits would embed a confidently wrong identity, which
-  # is worse than none.
+  # is worse than none. HEAD and index cover commits and dirtiness; the refs
+  # cover TAGGING, which writes neither — a clean tree at a freshly tagged
+  # commit once stamped the PREVIOUS tag because of exactly that gap. Loose
+  # tags land under refs/tags (the directory mtime moves), packed ones in
+  # packed-refs; watch both because git chooses either.
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-               "${CMAKE_SOURCE_DIR}/.git/HEAD" "${CMAKE_SOURCE_DIR}/.git/index")
+               "${CMAKE_SOURCE_DIR}/.git/HEAD" "${CMAKE_SOURCE_DIR}/.git/index"
+               "${CMAKE_SOURCE_DIR}/.git/refs/tags" "${CMAKE_SOURCE_DIR}/.git/packed-refs")
 endif()
 target_compile_definitions(ucache PRIVATE UCACHE_BUILD_ID="${UCACHE_BUILD_ID}")
 target_link_libraries(ucache PRIVATE ucache-core ${CMAKE_DL_LIBS}) # dl: doctor dlopen's the plugin

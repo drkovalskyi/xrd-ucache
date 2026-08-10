@@ -67,8 +67,11 @@ void usage() {
       "                    STANDARD measurements use pinned block sizes and\n"
       "                    queue depths, so they compare to a datasheet or to\n"
       "                    another machine; PATTERN measurements use the shapes\n"
-      "                    uCache generates, at --threads concurrency (default:\n"
-      "                    cores), so they predict what a job gets here.\n"
+      "                    uCache generates, at --threads concurrency, so they\n"
+      "                    predict what a job gets here. --threads is REQUIRED\n"
+      "                    and never guessed: it is the concurrency your\n"
+      "                    analyses run at, which is not the core count unless\n"
+      "                    they happen to match.\n"
       "                    -S is per MEASUREMENT; the run is measurements x S\n"
       "                    plus building the test file. The plan and the total\n"
       "                    print before anything runs. Default location: the\n"
@@ -573,7 +576,9 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
       char* end = nullptr;
       long n = v ? std::strtol(v, &end, 10) : 0;
       if (!v || end == v || n < 1 || n > 1024) {
-        std::fputs("bench: --threads needs a count in [1, 1024] (default: cores)\n", stderr);
+        std::fputs("bench: --threads needs a count in [1, 1024]; it is required and never "
+                   "guessed\n",
+                   stderr);
         return 2;
       }
       opts.threads = static_cast<int>(n);
