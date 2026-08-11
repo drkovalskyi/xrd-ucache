@@ -612,13 +612,13 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
             bad = true;
           else
             opts.fillWriters = static_cast<int>(w);
-        } else if (key == "block" || key == "file") {
+        } else if (key == "block" || key == "volume") {
           if (!parseSizeArg(std::string(val, std::strcspn(val, ",")).c_str(), num) || num == 0)
             bad = true;
           else if (key == "block")
             opts.fillBlock = num;
           else
-            opts.fillFile = num;
+            opts.fillVolume = num;
         } else {
           bad = true;
         }
@@ -628,8 +628,10 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
         p = comma + 1;
       }
       if (bad) {
-        std::fputs("bench: --fill takes writers=N,block=SZ,file=SZ "
-                   "(e.g. --fill writers=1,block=48k,file=256m)\n",
+        std::fputs("bench: --fill takes writers=N,block=SZ,volume=SZ "
+                   "(e.g. --fill writers=4,block=48k,volume=56g)\n"
+                   "       volume defaults to 1.5x the kernel's dirty limit, which is what\n"
+                   "       the fill must exceed to show the writeback throttle\n",
                    stderr);
         return 2;
       }

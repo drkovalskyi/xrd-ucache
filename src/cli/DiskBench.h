@@ -13,14 +13,19 @@
 // sparse holes measure nothing); every phase time-capped, so the tool still
 // finishes on a volume that delivers a few dozen IOPS.
 //
-// Two properties the numbers depend on, and which the output therefore
+// Three properties the numbers depend on, and which the output therefore
 // states outright:
-//   - Multi-stream phases cycle IN PLACE over per-stream slices of the one
-//     test file, so a long write window on a fast device cannot grow disk
-//     usage beyond --size.
-//   - A device write cache makes the first seconds of a write far faster
-//     than the steady state, so the build phase reports burst and sustained
-//     rates separately and the quotable figure is the sustained one.
+//   - The read and in-place write phases cycle inside the one test file, so a
+//     long window on a fast device cannot grow it beyond --size. The fill stage
+//     is the exception and is bounded by volume instead: it RETAINS what it
+//     writes, because a cache does.
+//   - Writing to fresh extents is not the same measurement as writing over
+//     allocated ones. The test-file build pays allocation and the in-place
+//     write does not, so their ratio is the cost of allocating on this device —
+//     nothing on one disk measured here, nearly 2x on another of the same model.
+//   - A rate is only a device property if the write finished. The build stage is
+//     time-capped, and a capped run reports what that slow episode achieved
+//     rather than what the device can do; `stopped at time cap` says which.
 //
 // Every run also appends a record to a log file (default `ucache-bench.txt`
 // in the working directory) carrying the numbers plus the context needed to
@@ -40,10 +45,10 @@ namespace ucache {
 struct DiskBenchOpts {
   uint64_t fileBytes = 1ull << 30;   // --size (test file ceiling; floor 16 MiB)
   double measurementSeconds = 5.0;   // --measurement-duration (per measurement)
-  // Job concurrency for the PATTERN measurements. One number, optional,
-  // defaulting to the core count: it used to be inherited from the queue-depth
-  // list, so a bare run measured "job concurrency" at 16 on a 64-core box.
-  int threads = 0;                   // --threads (0 = auto: nproc)
+  // Job concurrency for the PATTERN measurements. One number, REQUIRED: it is
+  // what the caller's analyses run at, and neither the queue-depth list nor the
+  // core count is an honest stand-in for that.
+  int threads = 0;                   // --threads (0 = not given; refused)
   uint64_t blockBytes = 4ull << 20;  // --block (sequential read/write size)
   // --sweep: measure the random read at a ladder of block sizes instead of
   // just the two tier sizes. The knee between op-bound and bandwidth-bound
@@ -51,14 +56,27 @@ struct DiskBenchOpts {
   // points either side of it can locate it. Off by default: it is device
   // characterisation, worth doing once per device rather than every run.
   bool sweep = false;
-  // The expected-fill-pattern stage. Defaults are MEASURED, not assumed: a
-  // cold analysis fills through ONE stream (uCache keys one entry per URL and
-  // drains per entry, so the analysis thread count never reaches the write
-  // path) in ~48 KiB writes (one contiguous run of requested pages — the
-  // basket, not the coalescing ceiling).
-  int fillWriters = 1;               // --fill writers=
-  uint64_t fillBlock = 48ull << 10;  // --fill block=
-  uint64_t fillFile = 256ull << 20;  // --fill file=
+  // The fill stage models a COLD FILL, and every element of it is there because
+  // the previous version's shape was measured against a real one and found to
+  // overstate it by ~1.7x on the same disk:
+  //   - writes land at SCATTERED offsets in a SPARSE file, so every write is a
+  //     first touch that allocates. Appending to a dense file instead let the
+  //     kernel merge 48 KiB writes into ~510 KiB device writes, which a cache
+  //     never gets: its writes go wherever the analysis read, and the next one
+  //     is somewhere else.
+  //   - files are RETAINED for the whole stage, so free space falls and
+  //     garbage-collection pressure rises as it does during a real fill. The
+  //     previous version unlinked each file and recycled the same blocks.
+  //   - nothing is synced until the end, because a cache does not sync either
+  //     (fsync defaults to off). That is also the only way the stage can reach
+  //     the kernel's writeback throttle, which any fill larger than the dirty
+  //     limit spends most of its life in.
+  // Bounded by VOLUME rather than by a window, since the throttle knee is at a
+  // byte count: default 1.5x the machine's dirty limit, enough to cross it and
+  // still measure a sustained rate afterwards.
+  int fillWriters = 4;               // --fill writers= (measured: ~4 in flight)
+  uint64_t fillBlock = 48ull << 10;  // --fill block=   (measured mean run)
+  uint64_t fillVolume = 0;           // --fill volume=  (0 = 1.5x dirty limit)
   std::string logPath = "ucache-bench.txt"; // --log; empty = --no-log
   std::string cmdline;               // the invocation, recorded in the log
 };

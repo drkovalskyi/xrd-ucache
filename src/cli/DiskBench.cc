@@ -516,24 +516,26 @@ uint64_t randLoop(int fd, uint64_t fsz, bool write, char* buf, double deadline,
   return ops;
 }
 
-// The expected-fill-pattern result. Reported alongside the rate because if the
-// filesystem did not issue the writes we asked for, that is the finding.
+// The cold-fill result. Two rates, and the difference between them is the point:
+// `appMbps` is what the writer saw, `devMbps` is what the disk did. With nothing
+// synced until the end they diverge by however much is still dirty, so only the
+// device figure is a storage measurement — a buffered leg measured 319 MB/s at
+// the application against 240 at the device, a 33% overstatement.
+constexpr int kFillBuckets = 8;
 struct FillStat {
-  double mbps = 0, filesPerS = 0, meanWriteKib = 0;
-  uint64_t writes = 0, bytes = 0, files = 0;
-  // One rate per completed file cycle. A 60 s window completes ~100 of them,
-  // so the distribution is already there — collapsing it to a mean is what
-  // made the build stage unreadable, and there is no reason to repeat that.
-  double p50 = 0, p10 = 0, p90 = 0;
-  size_t samples = 0;
-  // Percentiles alone cannot tell random scatter from a drift, because sorting
-  // discards the one thing that distinguishes them. If the within-window
-  // variation is systematic then the mean's uncertainty does NOT fall as
-  // 1/sqrt(n), and a between-run spread may be this same effect sampled at
-  // different phases rather than a separate mystery.
-  double q1 = 0, q4 = 0; // mean rate of the first and last quarter, IN ORDER
-  double lag1 = 0;       // lag-1 autocorrelation: catches a sawtooth that
-                         // quarter means would average flat
+  double appMbps = 0, devMbps = 0, meanWriteKib = 0;
+  double devWriteKib = 0; // what the DEVICE saw per write: the merging question
+  uint64_t writes = 0, bytes = 0, target = 0;
+  double seconds = 0, fsyncS = 0; // the closing flush, timed on its own
+  // Device MB/s over each eighth of the volume, in order. A throttled fill is
+  // fast until the dirty limit and slower after it, so the knee is at a byte
+  // count and this is the shape that shows it; a window-based quarter split
+  // cannot, because the two regimes have different durations.
+  double curve[kFillBuckets] = {};
+  int curveN = 0;
+  bool volumeReached = false; // false => the time cap stopped it
+  bool crossesDirtyLimit = false; // did the volume exceed the writeback threshold
+  double dirtyLimitGb = 0;    // where the knee is predicted, for the reader
 };
 
 // One stream-count result. `nEff` is what actually ran: a file too small to
@@ -647,137 +649,211 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
   return s;
 }
 
-// What the ORDERED per-file series says about the mean's reliability. The
-// direction matters and is easy to get backwards: a DRIFT or clustered slow
-// runs (positive autocorrelation) shrink the effective sample count, so the
-// mean is worse than sigma/sqrt(n) and a between-run spread may be this same
-// effect sampled at different phases. An ALTERNATING series (negative
-// autocorrelation) cancels, so the mean is BETTER determined than independent
-// sampling would give — it does not explain a between-run spread away.
+// What the ordered device-rate curve says. A fill that crosses the kernel's
+// dirty limit is fast until it does and throttled afterwards, so the shape is a
+// step in cumulative BYTES, not a drift in time — which is why the curve is
+// bucketed by volume and why a window-based quarter split could not find it.
 const char* fillShape(const FillStat& f) {
-  const double drift = f.q1 > 0 ? (f.q4 - f.q1) / f.q1 : 0.0;
-  if (std::fabs(drift) > 0.03)
-    return "   <- DRIFTS: mean depends on where the window fell, not sigma/sqrt(n)";
-  if (f.lag1 > 0.3)
-    return "   <- CLUSTERED: effective samples fewer than they look, mean is softer";
-  if (f.lag1 < -0.3)
-    return "   <- ALTERNATES: cancels, so the mean is TIGHTER than sigma/sqrt(n)";
-  return "   (no drift or correlation: samples look independent)";
+  if (f.curveN < 4)
+    return "";
+  double head = 0, tail = 0;
+  const int h = f.curveN / 4 > 0 ? f.curveN / 4 : 1;
+  for (int i = 0; i < h; ++i) {
+    head += f.curve[i];
+    tail += f.curve[f.curveN - 1 - i];
+  }
+  head /= h;
+  tail /= h;
+  if (head <= 0)
+    return "";
+  const double drop = (head - tail) / head;
+  if (!f.crossesDirtyLimit)
+    return drop > 0.15 ? "   <- SLOWS, but the volume never reached the dirty limit, so this is "
+                         "the device, not the writeback throttle"
+                       : "   (steady; volume below the dirty limit, so no throttle expected)";
+  if (drop > 0.15)
+    return "   <- THROTTLED: the tail is the sustained rate a long fill gets";
+  return "   (steady across the dirty limit: writeback kept up)";
 }
 
-// The write pattern a cold fill actually generates: N writers (measured: 1),
-// each creating its own file, extending it in `block`-sized writes, flushing,
-// closing, unlinking, and starting the next one — so allocation cost and file
-// turnover are inside the measurement, which is what makes a fill different
-// from writing to a file that already exists.
+// The write pattern a cold fill actually generates. Every element is here
+// because the previous shape (one writer APPENDING to a dense file, syncing and
+// unlinking each one) was measured against a real cold fill on the same disk and
+// overstated it by ~1.7x:
 //
-// BUFFERED is the real mode; the O_DIRECT pass is the control that shows
-// whether the kernel merged our small writes into larger device writes.
-// The fsync is INSIDE the timed window on purpose: without it a run smaller
-// than the machine's dirty limit measures RAM, not the disk.
+//   - SPARSE files, SCATTERED offsets. Each writer ftruncates its file to full
+//     size and then writes its blocks in a random permutation, so every write is
+//     a first touch that allocates, and no two consecutive writes are adjacent.
+//     That last part is what the old shape got wrong: appending let the kernel
+//     merge 48 KiB writes into ~510 KiB device writes (measured), and a cache
+//     never gets that, because its writes land wherever the analysis happened to
+//     read. Writing each block exactly once also makes the total exact.
+//   - RETAINED. Nothing is unlinked until the stage ends, so free space falls
+//     and garbage-collection pressure rises through the run. Recycling one
+//     file's blocks measures a disk that never fills up.
+//   - NOT SYNCED until the end. A cache does not sync either, and it is the only
+//     way to reach the writeback throttle: dirty pages accumulate to the kernel's
+//     limit and every writer is throttled from there on. That regime is where a
+//     fill larger than the dirty limit spends most of its life, and the old
+//     per-file sync bounded the dirty set at one file, so it could never be seen.
 //
-// Thread-safety: each writer owns its files, fd and buffer; only the totals
-// (atomics) are shared.
+// BUFFERED is what a cache does; the O_DIRECT leg is the control that says what
+// the page cache was worth at this shape.
+//
+// Thread-safety: each writer owns its file, fd, buffer and permutation; the byte
+// counters are atomics, and the caller thread samples them plus the device.
 FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
-                   double phase) {
+                   uint64_t target, const std::string& disk, double dirtyLimitGb,
+                   double timeCapS) {
   FillStat s;
   const int nw = std::max(1, o.fillWriters);
-  uint64_t blk = std::max<uint64_t>(kAlign, o.fillBlock / kAlign * kAlign);
-  // Space bound: every writer may hold one file at a time, AND the test file
-  // is still on disk, so the fill set gets a quarter of --size, not all of it.
-  uint64_t want = std::max<uint64_t>(o.fileBytes, kMinFile) / 4 / static_cast<uint64_t>(nw);
-  uint64_t fsize = std::min(o.fillFile, want) / blk * blk;
-  if (fsize < blk)
-    fsize = blk;
+  const uint64_t blk = std::max<uint64_t>(kAlign, o.fillBlock / kAlign * kAlign);
+  s.dirtyLimitGb = dirtyLimitGb;
+  // Per-file size follows from the volume: writing every block of every file
+  // exactly once, in random order, is what makes each write a first touch.
+  uint64_t per = target / static_cast<uint64_t>(nw) / blk * blk;
+  if (per < blk)
+    per = blk;
+  s.target = per * static_cast<uint64_t>(nw);
+  s.crossesDirtyLimit = dirtyLimitGb > 0 &&
+                        static_cast<double>(s.target) > dirtyLimitGb * (1ull << 30);
 
-  std::atomic<uint64_t> bytes{0}, writes{0}, files{0};
-  std::mutex rmu;
-  std::vector<double> rates; // MB/s per completed file cycle
-  double t0 = nowS(), deadline = t0 + phase;
+  std::atomic<uint64_t> bytes{0}, writes{0};
+  // Counts writers still going, so the sampling loop below ends when the work
+  // does. Without it a writer that cannot even open its file would leave the
+  // caller spinning until the time cap with nothing being measured.
+  std::atomic<int> live{nw};
+  std::vector<int> fds(static_cast<size_t>(nw), -1);
+  std::vector<std::string> names(static_cast<size_t>(nw));
+  const double t0 = nowS(), deadline = t0 + timeCapS;
+  DiskCounters d0 = diskCounters(disk);
+
   std::vector<std::thread> pool;
   pool.reserve(static_cast<size_t>(nw));
   for (int t = 0; t < nw; ++t)
     pool.emplace_back([&, t] {
+      struct Done {
+        std::atomic<int>* n;
+        ~Done() { n->fetch_sub(1); }
+      } done{&live}; // every exit path counts, including the early returns below
+      char nm[4300];
+      std::snprintf(nm, sizeof nm, "%s/fill%02d", dir.c_str(), t);
+      names[static_cast<size_t>(t)] = nm;
+      int fd = ::open(nm, O_WRONLY | O_CREAT | O_TRUNC | (direct ? O_DIRECT : 0), 0600);
+      if (fd < 0)
+        return;
+      fds[static_cast<size_t>(t)] = fd;
+      // Sparse: the size is declared, no blocks are allocated yet.
+      if (::ftruncate(fd, static_cast<off_t>(per)) != 0)
+        return;
       char* buf = alignedBuf(blk);
       if (!buf)
         return;
-      uint64_t lb = 0, lw = 0, lf = 0;
-      std::vector<double> mine;
-      for (int seq = 0; nowS() < deadline; ++seq) {
-        const double fileT0 = nowS();
-        uint64_t fileBytes = 0;
-        char nm[4300];
-        std::snprintf(nm, sizeof nm, "%s/fill%02d-%06d", dir.c_str(), t, seq);
-        int fd = ::open(nm, O_WRONLY | O_CREAT | O_TRUNC | (direct ? O_DIRECT : 0), 0600);
-        if (fd < 0)
+      const uint64_t slots = per / blk;
+      std::vector<uint64_t> order(static_cast<size_t>(slots));
+      for (uint64_t i = 0; i < slots; ++i)
+        order[static_cast<size_t>(i)] = i;
+      std::mt19937_64 rng(700 + static_cast<uint64_t>(t));
+      for (uint64_t i = slots; i > 1; --i)
+        std::swap(order[static_cast<size_t>(i - 1)],
+                  order[static_cast<size_t>(rng() % i)]);
+      uint64_t lb = 0, lw = 0;
+      for (uint64_t i = 0; i < slots; ++i) {
+        if (nowS() >= deadline)
           break;
-        for (uint64_t off = 0; off < fsize && nowS() < deadline; off += blk) {
-          if (::pwrite(fd, buf, blk, static_cast<off_t>(off)) != static_cast<ssize_t>(blk))
-            break;
-          lb += blk;
-          fileBytes += blk;
-          ++lw;
+        const off_t off = static_cast<off_t>(order[static_cast<size_t>(i)] * blk);
+        if (::pwrite(fd, buf, blk, off) != static_cast<ssize_t>(blk))
+          break;
+        lb += blk;
+        ++lw;
+        // Publish often enough that the caller's bucket boundaries are sharp.
+        if ((lw & 0x3f) == 0) {
+          bytes += lb;
+          writes += lw;
+          lb = 0;
+          lw = 0;
         }
-        ::fdatasync(fd); // inside the window: otherwise this measures RAM
-        ::close(fd);
-        ::unlink(nm);
-        ++lf;
-        // Only WHOLE cycles enter the distribution: the last file is usually
-        // cut off by the deadline, and a partial slice is not a rate.
-        double dt = nowS() - fileT0;
-        if (fileBytes == fsize && dt > 0)
-          mine.push_back(static_cast<double>(fileBytes) / 1e6 / dt);
-      }
-      ::free(buf);
-      {
-        std::lock_guard<std::mutex> g(rmu);
-        rates.insert(rates.end(), mine.begin(), mine.end());
       }
       bytes += lb;
       writes += lw;
-      files += lf;
+      ::free(buf);
     });
+
+  // The curve buckets on DEVICE bytes, not on the byte counter, and it covers
+  // the closing flush as well as the write loop. Both parts are necessary: below
+  // the dirty limit the application finishes into RAM at several GB/s and the
+  // disk does nearly all of its work during the flush, so a curve bucketed on
+  // application bytes fires all eight boundaries before the device has moved
+  // (measured: `199 185 0 0 0 0 0` for a 2 GiB volume against a 37.4 GiB limit).
+  DiskCounters bucket0 = d0;
+  double bucketT0 = t0;
+  int filled = 0;
+  auto sample = [&] {
+    const DiskCounters dn = diskCounters(disk);
+    if (!dn.valid || !d0.valid)
+      return;
+    const uint64_t done = (dn.wrSect - d0.wrSect) * 512ull;
+    while (filled < kFillBuckets &&
+           done >= s.target / kFillBuckets * static_cast<uint64_t>(filled + 1)) {
+      const double dt = nowS() - bucketT0;
+      if (dt > 0)
+        s.curve[filled] = static_cast<double>(dn.wrSect - bucket0.wrSect) * 512.0 / 1e6 / dt;
+      bucket0 = dn;
+      bucketT0 = nowS();
+      ++filled;
+    }
+  };
+  const struct timespec kTick { 0, 20 * 1000 * 1000 };
+  while (live.load(std::memory_order_relaxed) > 0 && nowS() < deadline) {
+    sample();
+    ::nanosleep(&kTick, nullptr);
+  }
   for (auto& th : pool)
     th.join();
-  double el = std::max(1e-9, nowS() - t0);
+  const double writeS = std::max(1e-9, nowS() - t0);
+
+  // The closing flush, timed separately: it is a real cost of the fill, but
+  // folding it into the rate would hide how much of the run was never on disk.
+  // It runs on its own thread so the curve keeps being sampled through it, and
+  // it is NOT deadline-bounded — abandoning it would leave dirty pages that the
+  // unlink below then discards, which would silently shrink the measurement.
+  const double f0 = nowS();
+  std::atomic<bool> flushed{false};
+  std::thread closer([&] {
+    for (size_t i = 0; i < fds.size(); ++i)
+      if (fds[i] >= 0)
+        ::fdatasync(fds[i]);
+    flushed.store(true);
+  });
+  while (!flushed.load(std::memory_order_relaxed)) {
+    sample();
+    ::nanosleep(&kTick, nullptr);
+  }
+  closer.join();
+  s.fsyncS = nowS() - f0;
+  sample();
+  s.curveN = filled;
+  DiskCounters d1 = diskCounters(disk);
+  for (size_t i = 0; i < fds.size(); ++i)
+    if (fds[i] >= 0)
+      ::close(fds[i]);
+  // Retained for the whole stage, removed only now.
+  for (const auto& n : names)
+    if (!n.empty())
+      ::unlink(n.c_str());
+
   s.bytes = bytes.load();
   s.writes = writes.load();
-  s.files = files.load();
-  s.mbps = static_cast<double>(s.bytes) / 1e6 / el;
-  s.filesPerS = static_cast<double>(s.files) / el;
+  s.seconds = writeS;
+  s.volumeReached = s.bytes >= s.target;
+  s.appMbps = static_cast<double>(s.bytes) / 1e6 / writeS;
   s.meanWriteKib = s.writes ? static_cast<double>(s.bytes) / s.writes / 1024.0 : 0;
-  if (rates.size() >= 8) {
-    // ORDER-SENSITIVE statistics first, before sorting destroys the order.
-    const size_t n = rates.size(), q = n / 4;
-    double a = 0, b = 0;
-    for (size_t i = 0; i < q; ++i) {
-      a += rates[i];
-      b += rates[n - 1 - i];
-    }
-    s.q1 = a / static_cast<double>(q);
-    s.q4 = b / static_cast<double>(q);
-    double mean = 0;
-    for (double v : rates)
-      mean += v;
-    mean /= static_cast<double>(n);
-    double num = 0, den = 0;
-    for (size_t i = 0; i < n; ++i) {
-      double d = rates[i] - mean;
-      den += d * d;
-      if (i + 1 < n)
-        num += d * (rates[i + 1] - mean);
-    }
-    s.lag1 = den > 0 ? num / den : 0;
-  }
-  if (!rates.empty()) {
-    std::sort(rates.begin(), rates.end());
-    auto at = [&rates](double q) {
-      return rates[std::min(rates.size() - 1, static_cast<size_t>(rates.size() * q))];
-    };
-    s.p50 = at(0.50);
-    s.p10 = at(0.10);
-    s.p90 = at(0.90);
-    s.samples = rates.size();
+  const double total = writeS + s.fsyncS;
+  if (d0.valid && d1.valid && total > 0) {
+    const double devMb = static_cast<double>(d1.wrSect - d0.wrSect) * 512.0 / 1e6;
+    const double devOps = static_cast<double>(d1.writes - d0.writes);
+    s.devMbps = devMb / total;
+    s.devWriteKib = devOps > 0 ? devMb * 1e6 / devOps / 1024.0 : 0;
   }
   return s;
 }
@@ -864,7 +940,8 @@ struct Result {
   std::vector<StreamStat> patRead;   // random reads at patReadKib[], QD threads
   std::vector<uint64_t> patReadKib;
   StreamStat patReplicaRead;         // SEQUENTIAL 512 KiB — the replica tier
-  FillStat fillBuf, fillDir;         // the fill, both modes
+  FillStat fillBuf, fillDir;         // the cold fill, both caching modes
+  int fillWriters = 0;               // resolved, so the table identifies itself
   int threads = 0;                   // resolved job concurrency
   double mixedReadIops = 0, mixedWriteMbps = 0;
   Pct mixed;
@@ -974,20 +1051,44 @@ std::string humanBlock(const Result& r) {
     appendf(s, "    %-46s%8.1f MB/s   %8.0f IOPS\n", lb, r.patReplicaRead.mbps,
             r.patReplicaRead.iops);
   }
-  auto fillLine = [&s](const char* label, const FillStat& f) {
-    appendf(s, "    %-46s%8.1f MB/s   %5.1f files/s   %.1f KiB writes\n", label, f.mbps,
-            f.filesPerS, f.meanWriteKib);
-    if (f.samples >= 4)
-      appendf(s, "      per file: p50 %.1f   p10 %.1f   p90 %.1f MB/s   (%zu files, "
-                 "p90/p10 %.2fx)\n",
-              f.p50, f.p10, f.p90, f.samples, f.p10 > 0 ? f.p90 / f.p10 : 0.0);
-    if (f.samples >= 8)
-      appendf(s, "      in order: first quarter %.1f -> last quarter %.1f MB/s (%+.1f%%), "
-                 "lag-1 autocorr %+.2f%s\n",
-              f.q1, f.q4, f.q1 > 0 ? 100.0 * (f.q4 - f.q1) / f.q1 : 0.0, f.lag1, fillShape(f));
+  // The fill is reported DEVICE-side. With nothing synced until the end, the
+  // application is ahead of the disk by whatever is still dirty, so the
+  // application rate is shown only as the size of that gap.
+  auto fillLine = [&s](const char* label, const FillStat& f, int writers) {
+    char lb2[80];
+    std::snprintf(lb2, sizeof lb2, "%s (%d writer%s, sparse, retained)", label, writers,
+                  writers == 1 ? "" : "s");
+    appendf(s, "    %-46s%8.1f MB/s   %.1f KiB device writes\n", lb2, f.devMbps, f.devWriteKib);
+    // A quick check writes megabytes and the convention run writes tens of
+    // gigabytes; one fixed unit renders one of them as 0.0.
+    const bool gib = f.target >= (1ull << 30);
+    const double div = static_cast<double>(gib ? (1ull << 30) : (1ull << 20));
+    appendf(s, "      wrote %.1f of %.1f %s in %.0f s = %.0f s writing + %.0f s closing "
+               "flush%s\n",
+            static_cast<double>(f.bytes) / div, static_cast<double>(f.target) / div,
+            gib ? "GiB" : "MiB", f.seconds + f.fsyncS, f.seconds, f.fsyncS,
+            f.volumeReached ? "" : " — STOPPED AT TIME CAP");
+    // The gap between the two rates is how far ahead of the disk the writer got,
+    // i.e. how much of this was RAM. It is the reason the device figure is the
+    // one reported: a buffered leg once read 319 MB/s at the application against
+    // 240 at the device.
+    appendf(s, "      application saw %.1f MB/s, %+.0f%% vs the device%s\n", f.appMbps,
+            f.devMbps > 0 ? 100.0 * (f.appMbps - f.devMbps) / f.devMbps : 0.0,
+            f.appMbps > 2 * f.devMbps ? "  <- mostly RAM: the writer never waited for the disk"
+                                      : "");
+    if (f.curveN >= 2) {
+      appendf(s, "      by eighth of volume:");
+      for (int i = 0; i < f.curveN; ++i)
+        appendf(s, " %.0f", f.curve[i]);
+      appendf(s, " MB/s%s\n", fillShape(f));
+    }
+    if (f.dirtyLimitGb > 0)
+      appendf(s, "      writeback threshold at %.1f GiB — %s\n", f.dirtyLimitGb,
+              f.crossesDirtyLimit ? "crossed inside this run, so the tail is the throttled rate"
+                                  : "NOT reached: this run cannot show the throttle");
   };
-  fillLine("fill pattern, buffered", r.fillBuf);
-  fillLine("fill pattern, O_DIRECT", r.fillDir);
+  fillLine("cold fill, buffered", r.fillBuf, r.fillWriters);
+  fillLine("cold fill, O_DIRECT", r.fillDir, r.fillWriters);
   appendf(s, "    %-46s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms   (write %.1f MB/s)\n",
           "random 4 KiB read under writeback (QD4)", r.mixedReadIops, r.mixed.p50 / 1e3, r.mixed.p99 / 1e3, r.mixedWriteMbps);
   appendf(s, "\n  Untimed\n    %-46s%8.0f /s   %8.0f /s\n", "create / unlink", r.createPs,
@@ -1118,23 +1219,30 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
             kib, r.patRead[i].mbps, kib, r.patRead[i].iops, kib,
             static_cast<unsigned long long>(r.patRead[i].lat.p99));
   }
-  appendf(s, ",\"fill_writers\":%d,\"fill_block_kib\":%llu,\"fill_file_mib\":%llu,"
-             "\"fill_buffered_mbps\":%.1f,\"fill_buffered_files_ps\":%.1f,"
-             "\"fill_buffered_write_kib\":%.1f,\"fill_direct_mbps\":%.1f,"
-             "\"fill_direct_files_ps\":%.1f,\"fill_direct_write_kib\":%.1f,"
-             "\"fill_buffered_p50_mbps\":%.1f,\"fill_buffered_p10_mbps\":%.1f,"
-             "\"fill_buffered_p90_mbps\":%.1f,\"fill_buffered_samples\":%zu,"
-             "\"fill_direct_p50_mbps\":%.1f,\"fill_direct_p10_mbps\":%.1f,"
-             "\"fill_direct_p90_mbps\":%.1f,\"fill_direct_samples\":%zu,"
-             "\"fill_buffered_q1_mbps\":%.1f,\"fill_buffered_q4_mbps\":%.1f,"
-             "\"fill_buffered_lag1\":%.3f,\"fill_direct_q1_mbps\":%.1f,"
-             "\"fill_direct_q4_mbps\":%.1f,\"fill_direct_lag1\":%.3f",
-          o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024),
-          static_cast<unsigned long long>(o.fillFile >> 20), r.fillBuf.mbps,
-          r.fillBuf.filesPerS, r.fillBuf.meanWriteKib, r.fillDir.mbps, r.fillDir.filesPerS,
-          r.fillDir.meanWriteKib, r.fillBuf.p50, r.fillBuf.p10, r.fillBuf.p90, r.fillBuf.samples,
-          r.fillDir.p50, r.fillDir.p10, r.fillDir.p90, r.fillDir.samples, r.fillBuf.q1,
-          r.fillBuf.q4, r.fillBuf.lag1, r.fillDir.q1, r.fillDir.q4, r.fillDir.lag1);
+  // The cold fill. New key names because this is NOT the quantity the old
+  // fill_* keys held: those measured one writer APPENDING to a dense file and
+  // syncing every 256 MiB, which merged into ~510 KiB device writes and never
+  // reached the writeback throttle. Reusing the names would have silently
+  // compared two different measurements across the fleet's records.
+  appendf(s, ",\"fill_writers\":%d,\"fill_block_kib\":%llu,\"fill_volume_mib\":%.0f",
+          r.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024),
+          static_cast<double>(r.fillBuf.target) / (1ull << 20));
+  auto fillJson = [&s](const char* tag, const FillStat& f) {
+    appendf(s, ",\"coldfill_%s_dev_mbps\":%.1f,\"coldfill_%s_app_mbps\":%.1f,"
+               "\"coldfill_%s_dev_write_kib\":%.1f,\"coldfill_%s_app_write_kib\":%.1f,"
+               "\"coldfill_%s_mib\":%.0f,\"coldfill_%s_seconds\":%.1f,"
+               "\"coldfill_%s_fsync_s\":%.1f,\"coldfill_%s_volume_reached\":%s,"
+               "\"coldfill_%s_crosses_dirty_limit\":%s,\"coldfill_%s_curve\":[",
+            tag, f.devMbps, tag, f.appMbps, tag, f.devWriteKib, tag, f.meanWriteKib, tag,
+            static_cast<double>(f.bytes) / (1ull << 20), tag, f.seconds, tag, f.fsyncS, tag,
+            f.volumeReached ? "true" : "false", tag,
+            f.crossesDirtyLimit ? "true" : "false", tag);
+    for (int i = 0; i < f.curveN; ++i)
+      appendf(s, "%s%.1f", i ? "," : "", f.curve[i]);
+    appendf(s, "]");
+  };
+  fillJson("buffered", r.fillBuf);
+  fillJson("direct", r.fillDir);
   appendf(s, ",\"std_qds\":[");
   for (size_t i = 0; i < r.randr.size(); ++i)
     appendf(s, "%s%d", i ? "," : "", r.randr[i].nEff);
@@ -1185,6 +1293,32 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
             e.devReadMb(), e.devWriteMb(), e.devReads(), e.devWrites(), e.devUtilPct());
   appendf(s, "}\n");
   return s;
+}
+
+// How much the cold fill writes. The writeback knee is at a byte count — the
+// kernel's dirty limit — so the volume must exceed it with enough left over to
+// measure the throttled rate: 1.5x. The floor keeps the stage meaningful where
+// the limit is tiny (one host has vm.dirty_bytes set to 0.10 GiB), and the clamp
+// keeps it from filling the disk. Both are visible in the output rather than
+// silently applied: the record states the volume, whether it was reached, and
+// whether it crossed the limit at all.
+uint64_t fillVolume(const DiskBenchOpts& o, double dirtyLimitGb, uint64_t testFileBytes) {
+  if (o.fillVolume) // asked for explicitly: honoured, and the space is the caller's problem
+    return std::max<uint64_t>(kAlign, o.fillVolume / kAlign * kAlign);
+  constexpr uint64_t kFloor = 4ull << 30;
+  uint64_t want = dirtyLimitGb > 0
+                      ? static_cast<uint64_t>(dirtyLimitGb * 1.5 * static_cast<double>(1ull << 30))
+                      : kFloor;
+  if (want < kFloor)
+    want = kFloor;
+  // --size is the caller's space budget for the whole run. The test file is
+  // removed before the fill starts (nothing reads it after the writeback mix),
+  // so peak usage is the LARGER of the two rather than their sum — and capping
+  // the default volume here keeps that promise on a small --size, where the
+  // alternative was a quick 32 MiB check quietly writing 4 GiB.
+  if (want > testFileBytes)
+    want = testFileBytes;
+  return std::max<uint64_t>(kAlign, want / kAlign * kAlign);
 }
 
 // Evict the file's pages so buffered-mode reads see the device, not RAM.
@@ -1495,12 +1629,25 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   }
   ::close(rfd);
 
-  // --- EXPECTED FILL PATTERN (both modes). Buffered is what uCache does;
-  // --- the O_DIRECT pass is the control that shows whether the kernel merged
-  // --- our small writes into larger device writes.
-  r.fillBuf = fillStage(dir, o, /*direct=*/false, o.measurementSeconds);
-  r.fillDir = fillStage(dir, o, /*direct=*/true, o.measurementSeconds);
-  r.env.ownWriteBytes += r.fillBuf.bytes + r.fillDir.bytes;
+  // --- COLD FILL (both caching modes). Buffered is what a cache does; the
+  // --- O_DIRECT leg says what the page cache was worth at this shape.
+  // --- Bounded by volume, not by a window, because the writeback knee is at a
+  // --- byte count. The legs run one after the other and each removes its files
+  // --- at the end, so peak usage is one leg's volume, not both.
+  // Nothing reads the test file after the writeback mix, and the fill needs the
+  // space more: removing it here means peak usage is max(test file, fill volume)
+  // rather than their sum, which is what lets --size stay the whole run's budget.
+  ::unlink(tf.c_str());
+  {
+    const uint64_t vol = fillVolume(o, r.env.mach.dirtyLimitGb, fsz);
+    const double cap = std::max(o.measurementSeconds * 6, 120.0);
+    r.fillWriters = std::max(1, o.fillWriters);
+    r.fillBuf = fillStage(dir, o, /*direct=*/false, vol, r.env.mnt.diskName,
+                          r.env.mach.dirtyLimitGb, cap);
+    r.fillDir = fillStage(dir, o, /*direct=*/true, vol, r.env.mnt.diskName,
+                          r.env.mach.dirtyLimitGb, cap);
+    r.env.ownWriteBytes += r.fillBuf.bytes + r.fillDir.bytes;
+  }
 
   // --- create / unlink (the cleanup / eviction pattern) -------------------
   {
@@ -1545,12 +1692,18 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   // ladder, and the sequential and replica measurements still run either way —
   // so it is 10, not 9, and an estimate short by one whole window is exactly
   // the arithmetic the plan exists to remove.
-  const int measurements = 2 + nStd + 1                          // standard
-                           + (pat ? (o.sweep ? 10 : 3) : 0) + 2 + 1; // pattern
+  // The two cold-fill legs are NOT window-bounded — they run until their volume
+  // is written — so they are counted separately, at their time cap, or the
+  // estimate would understate a slow device by minutes.
+  const int measurements = 2 + nStd + 1                      // standard
+                           + (pat ? (o.sweep ? 10 : 3) : 0) + 1; // pattern, fills excluded
   const double buildCap = std::max(W * 3, 10.0);
-  const double total = (buildCap + W * measurements) * static_cast<double>(paths.size());
+  const double fillCap = std::max(W * 6, 120.0);
+  const double total =
+      (buildCap + W * measurements + 2 * fillCap) * static_cast<double>(paths.size());
   std::string s;
-  appendf(s, "run plan: %.1f s per measurement, %d measurements  ->  ~%.0f s", W, measurements,
+  appendf(s, "run plan: %.1f s per measurement, %d measurements + 2 cold fills  ->  up to %.0f s",
+          W, measurements,
           total);
   if (total >= 120)
     appendf(s, " (%.0f min)", total / 60.0);
@@ -1583,11 +1736,11 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
       appendf(s, "    random 48 KiB read, QD%d          (byte tier — scattered)\n", o.threads);
     }
   }
-  appendf(s, "    fill pattern, buffered           (%d writer(s), %llu KiB writes, %llu MiB "
-             "files)\n",
-          o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024),
-          static_cast<unsigned long long>(o.fillFile >> 20));
-  appendf(s, "    fill pattern, O_DIRECT           (same)\n");
+  appendf(s, "    cold fill, buffered              (%d writer(s), %llu KiB writes into SPARSE\n"
+             "                                      files at scattered offsets, RETAINED, not\n"
+             "                                      synced until the end)\n",
+          o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024));
+  appendf(s, "    cold fill, O_DIRECT              (same shape, no page cache)\n");
   appendf(s, "    random 4 KiB read under writeback, QD4\n");
   appendf(s, "\n  Untimed\n    fdatasync (5 samples), create / unlink\n\n");
   return s;
@@ -1619,7 +1772,7 @@ std::string comparisonBlock(const std::vector<Result>& results) {
   row("seq read MB/s (QD1)", [](const Result& r) { return r.stdSeqReadMbps; }, "  %16.1f");
   row("seq read MB/s (threads)", lastRead, "  %16.1f");
   row("seq write MB/s (QD1)", lastWrite, "  %16.1f");
-  row("fill buffered MB/s", [](const Result& r) { return r.fillBuf.mbps; }, "  %16.1f");
+  row("cold fill MB/s (dev)", [](const Result& r) { return r.fillBuf.devMbps; }, "  %16.1f");
   row("rand write IOPS (QD32)", [](const Result& r) { return r.randw.iops; }, "  %16.0f");
   row("rand read IOPS (1)", firstRand, "  %16.0f");
   row("rand read IOPS (N)", lastRand, "  %16.0f");
