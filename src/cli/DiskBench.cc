@@ -1508,15 +1508,24 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   // pre-flighted with the arithmetic spelled out rather than discovered as a
   // half-finished stage.
   const uint64_t vol = fillVolume(o, r.env.mach.dirtyLimitGb, want);
-  const double needB = static_cast<double>(want) + 2.0 * static_cast<double>(vol) + (1ull << 30);
+  // With --cache-path the uCache-path sample is held alongside everything else,
+  // and its automatic size is at least 2x the dirty limit. Use that lower bound
+  // up front; the stage itself clamps to what is actually free when it starts.
+  const double cacheB =
+      o.cachePath ? (o.cacheSample ? static_cast<double>(o.cacheSample)
+                                   : r.env.mach.dirtyLimitGb * 2.0 * static_cast<double>(1ull << 30))
+                  : 0.0;
+  const double needB =
+      static_cast<double>(want) + 2.0 * static_cast<double>(vol) + cacheB + (1ull << 30);
   if (r.freeGb * static_cast<double>(1ull << 30) < needB) {
     char msg[256];
     std::snprintf(msg, sizeof msg,
                   "not enough free space: need %.1f GiB = %.1f test file + 2 x %.1f fill "
-                  "(both legs held at once) + 1 GiB slack, have %.1f GiB",
+                  "+ %.1f uCache-path sample (all held at once) + 1 GiB slack, have %.1f GiB",
                   needB / static_cast<double>(1ull << 30),
                   static_cast<double>(want) / static_cast<double>(1ull << 30),
-                  static_cast<double>(vol) / static_cast<double>(1ull << 30), r.freeGb);
+                  static_cast<double>(vol) / static_cast<double>(1ull << 30),
+                  cacheB / static_cast<double>(1ull << 30), r.freeGb);
     r.error = msg;
     return r;
   }
@@ -1803,13 +1812,9 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     r.fillDir = fillStage(dir, "dir", o, /*direct=*/true, vol, r.env.mnt.diskName,
                           r.env.mach.dirtyLimitGb, cap);
     r.env.ownWriteBytes += r.fillBuf.bytes + r.fillDir.bytes;
-    // Now that no write test remains, free both legs.
-    for (int t = 0; t < r.fillWriters; ++t)
-      for (const char* tag : {"buf", "dir"}) {
-        char nm[4300];
-        std::snprintf(nm, sizeof nm, "%s/fill-%s%02d", dir, tag, t);
-        ::unlink(nm);
-      }
+    // NOT freed here: the uCache-path stage below is also a write measurement,
+    // and handing it this volume as one contiguous free region is the artifact
+    // that inflated a leg by 1.6x. Both legs are released after it.
   }
 
   // --- THE SAME STORAGE THROUGH uCACHE'S OWN CODE (--cache-path) ----------
@@ -1852,6 +1857,16 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     r.env.ownWriteBytes += r.cachePath.fill.bytes;
     r.env.ownReadBytes += r.cachePath.readByte.bytes + r.cachePath.readReplica.bytes;
   }
+
+  // Every write measurement is done: release the fill legs. Until this point
+  // nothing this run wrote had been freed, so no write measurement allocated into
+  // space another one released.
+  for (int t = 0; t < r.fillWriters; ++t)
+    for (const char* tag : {"buf", "dir"}) {
+      char nm[4300];
+      std::snprintf(nm, sizeof nm, "%s/fill-%s%02d", dir, tag, t);
+      ::unlink(nm);
+    }
 
   // --- create / unlink (the cleanup / eviction pattern) -------------------
   {
