@@ -163,6 +163,52 @@ void syncPaths(const std::vector<std::string>& paths) {
     x.join();
 }
 
+// Buckets a phase's rate by DEVICE bytes into eighths of the volume, in order.
+// Both phases get one: an aggregate cannot show a rate that drifts through the
+// pass, and the fill had this while the reads did not.
+struct Curve {
+  CachePhase& p;
+  const std::string& disk;
+  uint64_t target;
+  bool write;
+  Dev d0, bucket0;
+  double bucketT0;
+  int filled = 0;
+  std::atomic<bool> running{true};
+  std::thread th;
+  Curve(CachePhase& ph, const std::string& dk, uint64_t tgt, bool wr, const Dev& start, double t0)
+      : p(ph), disk(dk), target(tgt), write(wr), d0(start), bucket0(start), bucketT0(t0) {
+    th = std::thread([this] {
+      const struct timespec tick { 0, 50 * 1000 * 1000 };
+      while (running.load(std::memory_order_relaxed) && filled < kCacheCurveBuckets) {
+        const Dev dn = devRead(disk);
+        if (dn.valid && d0.valid) {
+          const uint64_t s0 = write ? d0.wrSect : d0.rdSect;
+          const uint64_t sn = write ? dn.wrSect : dn.rdSect;
+          const uint64_t sb = write ? bucket0.wrSect : bucket0.rdSect;
+          const uint64_t done = (sn - s0) * 512ull;
+          while (filled < kCacheCurveBuckets &&
+                 done >= target / kCacheCurveBuckets * static_cast<uint64_t>(filled + 1)) {
+            const double dt = nowS() - bucketT0;
+            if (dt > 0)
+              p.curve[filled] = static_cast<double>(sn - sb) * 512.0 / 1e6 / dt;
+            bucket0 = dn;
+            bucketT0 = nowS();
+            ++filled;
+          }
+        }
+        ::nanosleep(&tick, nullptr);
+      }
+    });
+  }
+  void stop() {
+    running.store(false);
+    if (th.joinable())
+      th.join();
+    p.curveN = filled;
+  }
+};
+
 void finish(CachePhase& p, const Dev& d0, const Dev& d1, double elapsed, bool write) {
   p.seconds = elapsed;
   p.payloadMbps = elapsed > 0 ? static_cast<double>(p.bytes) / 1e6 / elapsed : 0;
@@ -359,6 +405,7 @@ CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
     std::mutex mu;
     const Dev d0 = devRead(o.diskName);
     const double t0 = nowS();
+    Curve curve(p, o.diskName, r.sampleBytes, /*write=*/false, d0, t0);
     std::vector<std::thread> pool;
     for (int t = 0; t < std::max(1, o.threads); ++t)
       pool.emplace_back([&] {
@@ -397,6 +444,7 @@ CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
       });
     for (auto& t : pool)
       t.join();
+    curve.stop();
     const double t1 = nowS();
     const Dev d1 = devRead(o.diskName);
     p.bytes = bytes.load();

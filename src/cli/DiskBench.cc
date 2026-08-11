@@ -787,7 +787,7 @@ std::string humanBlock(const Result& r) {
             r.buildWriteMbps, r.buildWindowS);
   }
   appendf(s, "  fdatasync               %8.2f ms (p50)\n", r.fsyncP50Ms);
-  appendf(s, "\n  Standard measurements (same configuration on every machine)\n");
+  appendf(s, "\n  Standard measurements\n");
   char lb[80];
   std::snprintf(lb, sizeof lb, "sequential %llu KiB read (QD1)",
                 static_cast<unsigned long long>(r.blockKib));
@@ -840,26 +840,28 @@ std::string humanBlock(const Result& r) {
           r.mixed.p99 / 1e3, r.mixedWriteMbps);
   if (r.haveCachePath) {
     const CacheBenchResult& c = r.cachePath;
-    appendf(s, "\n  Through uCache's own code (build %s — these move when the write path does)\n",
-            UCACHE_BUILD_ID);
+    appendf(s, "\n  Through uCache's own code\n");
     if (!c.error.empty()) {
       appendf(s, "    FAILED: %s\n", c.error.c_str());
     } else {
       auto line = [&s](const char* label, const CachePhase& p) {
         appendf(s, "    %-46s%8.1f MB/s   (device %.1f, %.1f KiB/op, QD %.1f)   p99 %.2f ms\n",
                 label, p.payloadMbps, p.devMbps, p.devOpKib, p.devQueueDepth, p.p99Us / 1e3);
+        // Every phase shows how its rate moved through the pass, not just where
+        // it ended: an aggregate cannot show a drift, and a read pass can drift
+        // for the same reasons a write one can.
+        if (p.curveN >= 2) {
+          appendf(s, "      by eighth of volume:");
+          for (int i = 0; i < p.curveN; ++i)
+            appendf(s, " %.0f", p.curve[i]);
+          appendf(s, " MB/s\n");
+        }
       };
       appendf(s, "    sample %.1f GiB over %d entries, %llu KiB arrival runs, %d writers, "
                  "fill_buffer_mb %d\n",
               static_cast<double>(c.sampleBytes) / (1ull << 30), c.entries,
               static_cast<unsigned long long>(c.fillBlockKib), c.writers, c.fillBufferMb);
       line("cold fill (writes only: staged pages serve reads)", c.fill);
-      if (c.fill.curveN >= 2) {
-        appendf(s, "      by eighth of volume:");
-        for (int i = 0; i < c.fill.curveN; ++i)
-          appendf(s, " %.0f", c.fill.curve[i]);
-        appendf(s, " MB/s\n");
-      }
       appendf(s, "      closing sync %.0f s; product drained %llu runs averaging %.0f KiB\n",
               c.fill.syncS, static_cast<unsigned long long>(c.flushRuns),
               c.flushRuns ? static_cast<double>(c.flushRunBytes) / c.flushRuns / 1024.0 : 0.0);
@@ -1049,14 +1051,15 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
               p.seconds, tag, static_cast<double>(p.bytes) / (1ull << 20), tag,
               static_cast<unsigned long long>(p.p50Us), tag,
               static_cast<unsigned long long>(p.p99Us));
+      appendf(s, ",\"cachepath_%s_curve\":[", tag);
+      for (int i = 0; i < p.curveN; ++i)
+        appendf(s, "%s%.1f", i ? "," : "", p.curve[i]);
+      appendf(s, "]");
     };
     pj("fill", c.fill);
     pj("read_byte", c.readByte);
     pj("read_replica", c.readReplica);
-    appendf(s, ",\"cachepath_fill_sync_s\":%.1f,\"cachepath_fill_curve\":[", c.fill.syncS);
-    for (int i = 0; i < c.fill.curveN; ++i)
-      appendf(s, "%s%.1f", i ? "," : "", c.fill.curve[i]);
-    appendf(s, "]");
+    appendf(s, ",\"cachepath_fill_sync_s\":%.1f", c.fill.syncS);
   }
   appendf(s, ",\"std_qds\":[");
   for (size_t i = 0; i < r.randr.size(); ++i)
