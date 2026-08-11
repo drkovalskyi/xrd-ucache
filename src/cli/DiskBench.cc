@@ -1316,6 +1316,11 @@ uint64_t fillVolume(const DiskBenchOpts& o, double dirtyLimitGb, uint64_t testFi
   // so peak usage is the LARGER of the two rather than their sum — and capping
   // the default volume here keeps that promise on a small --size, where the
   // alternative was a quick 32 MiB check quietly writing 4 GiB.
+  //
+  // Cap on what was ASKED, not on what the build achieved. Capping on the
+  // achieved size made the fill volume depend on whether an unrelated stage hit
+  // its time cap: two disks measured back to back got 56.1 and 40.3 GiB, which
+  // are different measurements of different things.
   if (want > testFileBytes)
     want = testFileBytes;
   return std::max<uint64_t>(kAlign, want / kAlign * kAlign);
@@ -1639,7 +1644,8 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   // rather than their sum, which is what lets --size stay the whole run's budget.
   ::unlink(tf.c_str());
   {
-    const uint64_t vol = fillVolume(o, r.env.mach.dirtyLimitGb, fsz);
+    const uint64_t vol =
+        fillVolume(o, r.env.mach.dirtyLimitGb, std::max<uint64_t>(o.fileBytes, kMinFile));
     const double cap = std::max(o.measurementSeconds * 6, 120.0);
     r.fillWriters = std::max(1, o.fillWriters);
     r.fillBuf = fillStage(dir, o, /*direct=*/false, vol, r.env.mnt.diskName,
