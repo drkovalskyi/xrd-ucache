@@ -316,6 +316,11 @@ CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
   // The product's own view of what it just did.
   r.stalls = store.stats().bufferStalls.load();
   r.stallMs = static_cast<double>(store.stats().bufferStallUs.load()) / 1000.0;
+  // Against total writer thread-time, not wall time: with N writers there are N
+  // seconds of thread-time per second, and it is the fraction of that spent
+  // waiting for the disk that says the disk was the constraint.
+  const double threadS = r.fill.seconds * static_cast<double>(r.writers);
+  r.stallShare = threadS > 0 ? (r.stallMs / 1000.0) / threadS : 0;
   r.flushRuns = store.stats().flushRuns.load();
   r.flushRunBytes = store.stats().flushRunBytes.load();
 

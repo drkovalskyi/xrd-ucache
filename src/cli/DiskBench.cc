@@ -1175,10 +1175,13 @@ std::string humanBlock(const Result& r) {
               c.flushRuns ? static_cast<double>(c.flushRunBytes) / c.flushRuns / 1024.0 : 0.0);
       // THE ACCEPTANCE CHECK: if the fill threads never blocked on the staging
       // cap, the generator was slower than the disk and this is a CPU number.
-      appendf(s, "      %s (%llu staging stalls, %.1f s)\n",
-              c.stalls ? "outran the disk, so this is a storage measurement"
-                       : "!! NEVER STALLED: the harness may be the bottleneck, not the disk",
-              static_cast<unsigned long long>(c.stalls), c.stallMs / 1000.0);
+      // The stall SHARE, not the count: the count is volume/cap arithmetic and is
+      // identical on a fast disk and a slow one, so it can never fail.
+      appendf(s, "      writers blocked on the disk %.0f%% of their time%s\n",
+              100.0 * c.stallShare,
+              c.stallShare >= 0.25
+                  ? " — the disk was the constraint, so this is a storage measurement"
+                  : " — !! TOO LITTLE: the generator may be the bottleneck, not the disk");
       char rl[96];
       std::snprintf(rl, sizeof rl, "warm read, byte tier (scattered %llu KiB, QD%d)",
                     static_cast<unsigned long long>(c.byteReadKib), c.threads);
@@ -1347,12 +1350,13 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
     const CacheBenchResult& c = r.cachePath;
     appendf(s, ",\"cachepath_error\":\"%s\",\"cachepath_sample_mib\":%.0f,"
                "\"cachepath_stalls\":%llu,\"cachepath_stall_s\":%.1f,"
+               "\"cachepath_stall_share\":%.3f,"
                "\"cachepath_flush_runs\":%llu,\"cachepath_flush_run_kib\":%.1f,"
                "\"cachepath_crosses_dirty_limit\":%s,\"cachepath_entries\":%d,"
                "\"cachepath_writers\":%d,\"cachepath_threads\":%d,"
                "\"cachepath_fill_block_kib\":%llu,\"cachepath_fill_buffer_mb\":%d",
             jesc(c.error).c_str(), static_cast<double>(c.sampleBytes) / (1ull << 20),
-            static_cast<unsigned long long>(c.stalls), c.stallMs / 1000.0,
+            static_cast<unsigned long long>(c.stalls), c.stallMs / 1000.0, c.stallShare,
             static_cast<unsigned long long>(c.flushRuns),
             c.flushRuns ? static_cast<double>(c.flushRunBytes) / c.flushRuns / 1024.0 : 0.0,
             c.crossedDirtyLimit ? "true" : "false", c.entries, c.writers, c.threads,

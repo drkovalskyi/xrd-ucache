@@ -79,8 +79,15 @@ struct CacheBenchResult {
   int entries = 0, writers = 0, threads = 0;
   uint64_t fillBlockKib = 0, byteReadKib = 0, replicaReadKib = 0;
   int fillBufferMb = 0;
-  uint64_t stalls = 0;      // fill threads blocked on the staging cap ...
-  double stallMs = 0;       // ... which is the proof the harness outran the disk
+  // Fill threads blocked in a cap-triggered drain. The COUNT is arithmetic —
+  // volume / buffer cap, the same on a fast disk and a slow one (measured: 1592
+  // on both of two disks, against 1596 predicted) — so it can never fail and is
+  // not evidence of anything. The TIME is the evidence: the share of writer
+  // thread-time spent blocked says whether the disk or the generator was the
+  // constraint.
+  uint64_t stalls = 0;
+  double stallMs = 0;
+  double stallShare = 0;    // blocked thread-time / total writer thread-time
   uint64_t flushRuns = 0, flushRunBytes = 0; // what the product's drains looked like
   uint64_t hitDiskReads = 0, hitDiskBytes = 0; // and its read path
   bool crossedDirtyLimit = false;
