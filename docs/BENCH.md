@@ -701,8 +701,60 @@ Two rules follow:
 | `--block KB` | `4096` | block size for the sequential measurements; 4–65536 KiB, multiple of 4 |
 | `--fill k=v,...` | `writers=1,block=48k,file=256m` | fill-pattern parameters |
 | `--sweep` | off | replace the single byte-tier point with a block ladder (4, 8, 16, 32, 48, 128, 512, 4096 KiB) to locate the operation-bound/bandwidth knee. 19 measurements instead of 12 |
+| `--cache-path` | off | also measure this storage **through uCache's own fill and read code** — see below |
+| `--cache-sample SZ` | automatic | volume for that stage; implies `--cache-path`. Automatic is `max(2 × the kernel dirty limit, 30 s × this run's measured sequential write rate)` |
 | `--log FILE` | `./ucache-bench.txt` | append the record here |
 | `--no-log` | | print only, write nothing |
+
+---
+
+## Measuring through uCache's own code (`--cache-path`)
+
+Every other stage in this tool measures **raw storage**: it issues its own
+`pread`/`pwrite` calls in patterns chosen to resemble what a cache does. Those
+stages are a frozen yardstick and stay comparable across versions.
+
+`--cache-path` answers a different question — *what does uCache get on this
+storage* — by driving `FileEntry`/`CacheStore` directly. Staging, the per-entry
+buffer cap, offset-sorted coalesced drains, checksum-at-staging, bitmap
+publication, sidecar rewrites, read-run coalescing and per-page verification are
+all the product's own code rather than an imitation of it. **The only thing
+modelled is the order in which offsets arrive.**
+
+Its numbers are properties of a **release**, not of the device alone: change the
+write path and they move. The record carries the build id for that reason, and
+these figures should not be compared across versions the way the standard block
+can be.
+
+Two phases, because they are the two different passes a real workload makes:
+
+- **cold fill** — a cold pass does essentially no cache-disk reads, since pages
+  staged in memory serve the client directly. So a cold pass is a *write* load,
+  and this measures it: entries created sparse, bytes arriving at scattered
+  offsets, nothing synced until the end, nothing released early.
+- **warm read** — the page cache is dropped, then every byte is read back exactly
+  once (a second pass would answer from RAM), at both serving shapes: scattered
+  ~48 KiB like the byte cache, and sequential ~512 KiB like a replica.
+
+**Read the stall line first.** Making the source "infinitely fast" means
+generating bytes, which costs a memory copy and a checksum per page. If the fill
+threads never blocked on the staging cap, the generator was slower than the disk
+and the number is a CPU measurement wearing a storage label. The stage says which
+happened, every time.
+
+Two more things it reports that are easy to misread. The **device** figures
+include the filesystem's own writes — an extent and a journal record per
+scattered allocation — so device traffic legitimately exceeds the payload, and the
+mean device request size can fall below the block for the same reason. And the
+per-eighth curve is bucketed by *device* bytes, so a throttle knee lands at the
+byte count where it really happens; the line says whether the volume crossed the
+writeback threshold at all, because below it there is no throttle to see.
+
+Sizing is automatic and worth understanding: the volume must exceed the kernel's
+dirty limit to show the throttle, and be long enough to be stable on a fast
+device, hence `max(2 × dirty limit, 30 s × measured write rate)`. The write rate
+comes from the standard block earlier in the same run. Peak disk usage is the
+sample, on top of whatever the standard stages hold.
 
 ---
 

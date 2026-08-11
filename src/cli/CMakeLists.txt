@@ -2,7 +2,7 @@
 # no XRootD, no runtime Python. When the transposer library is available
 # (codec libs present), `materialize` also works natively;
 # otherwise it requires --import (the Python-bridge overlay). Installed to bin/.
-add_executable(ucache main.cc DiskBench.cc)
+add_executable(ucache main.cc DiskBench.cc CacheBench.cc)
 target_compile_definitions(ucache PRIVATE UCACHE_VERSION="${PROJECT_VERSION}") # `ucache --version`
 
 # Build identity for measurement records. The version alone cannot distinguish

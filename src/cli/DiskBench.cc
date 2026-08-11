@@ -1,5 +1,7 @@
 #include "DiskBench.h"
 
+#include "CacheBench.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -296,6 +298,15 @@ MountInfo mountFor(const std::string& path) {
 struct DiskCounters {
   bool valid = false;
   uint64_t reads = 0, rdSect = 0, writes = 0, wrSect = 0, ticksMs = 0;
+  // /proc/diskstats field 14, weighted ms in flight. Its delta divided by the
+  // elapsed ms is the AVERAGE QUEUE DEPTH — the one number that separates "this
+  // path is slower" from "this path presents fewer requests to the device", which
+  // is the whole question about buffered writeback: the kernel drains the page
+  // cache from essentially one writeback context per device, while N application
+  // threads doing O_DIRECT present N.
+  uint64_t weightedMs = 0;
+  // Field 9, writes merged by the block layer before reaching the device.
+  uint64_t wrMerged = 0;
 };
 
 DiskCounters diskCounters(const std::string& disk) {
@@ -318,6 +329,8 @@ DiskCounters diskCounters(const std::string& disk) {
     d.writes = std::strtoull(tok[7].c_str(), nullptr, 10);
     d.wrSect = std::strtoull(tok[9].c_str(), nullptr, 10);
     d.ticksMs = std::strtoull(tok[12].c_str(), nullptr, 10);
+    d.weightedMs = std::strtoull(tok[13].c_str(), nullptr, 10);
+    d.wrMerged = std::strtoull(tok[8].c_str(), nullptr, 10);
     break;
   }
   return d;
@@ -537,6 +550,8 @@ struct FillStat {
   // device write size falls below the block for the same reason — small metadata
   // writes in the mean, not split data writes.
   double devWriteKib = 0;
+  double devQueueDepth = 0; // average requests in flight at the device
+  double mergedPct = 0;     // share of device writes the block layer merged away
   uint64_t writes = 0, bytes = 0, target = 0;
   double seconds = 0, fsyncS = 0; // the closing flush, timed on its own
   // Device MB/s over each eighth of the volume, in order. A throttled fill is
@@ -878,6 +893,9 @@ FillStat fillStage(const std::string& dir, const char* tag, const DiskBenchOpts&
     const double devOps = static_cast<double>(d1.writes - d0.writes);
     s.devMbps = devMb / total;
     s.devWriteKib = devOps > 0 ? devMb * 1e6 / devOps / 1024.0 : 0;
+    s.devQueueDepth = static_cast<double>(d1.weightedMs - d0.weightedMs) / (total * 1000.0);
+    const double merged = static_cast<double>(d1.wrMerged - d0.wrMerged);
+    s.mergedPct = (merged + devOps) > 0 ? 100.0 * merged / (merged + devOps) : 0;
   }
   return s;
 }
@@ -965,6 +983,9 @@ struct Result {
   std::vector<uint64_t> patReadKib;
   StreamStat patReplicaRead;         // SEQUENTIAL 512 KiB — the replica tier
   FillStat fillBuf, fillDir;         // the cold fill, both caching modes
+  CacheBenchResult cachePath;        // --cache-path: the same storage through
+                                     // uCache's own code (CacheBench.h)
+  bool haveCachePath = false;
   int fillWriters = 0;               // resolved, so the table identifies itself
   int threads = 0;                   // resolved job concurrency
   double mixedReadIops = 0, mixedWriteMbps = 0;
@@ -1082,8 +1103,8 @@ std::string humanBlock(const Result& r) {
     char lb2[80];
     std::snprintf(lb2, sizeof lb2, "%s (%d writer%s, sparse, retained)", label, writers,
                   writers == 1 ? "" : "s");
-    appendf(s, "    %-46s%8.1f MB/s   (device traffic %.1f, %.1f KiB/write)\n", lb2, f.appMbps,
-            f.devMbps, f.devWriteKib);
+    appendf(s, "    %-46s%8.1f MB/s   (device traffic %.1f, %.1f KiB/write, QD %.1f)\n", lb2,
+            f.appMbps, f.devMbps, f.devWriteKib, f.devQueueDepth);
     // A quick check writes megabytes and the convention run writes tens of
     // gigabytes; one fixed unit renders one of them as 0.0.
     const bool gib = f.target >= (1ull << 30);
@@ -1108,8 +1129,8 @@ std::string humanBlock(const Result& r) {
     // is not read as a measurement error.
     if (f.devMbps > 0 && f.appMbps > 0)
       appendf(s, "      device wrote %+.0f%% more than the payload (extent + journal per "
-                 "scattered write)\n",
-              100.0 * (f.devMbps - f.appMbps) / f.appMbps);
+                 "scattered write), %.0f%% of writes merged\n",
+              100.0 * (f.devMbps - f.appMbps) / f.appMbps, f.mergedPct);
     if (f.curveN >= 2) {
       appendf(s, "      by eighth of volume:");
       for (int i = 0; i < f.curveN; ++i)
@@ -1125,6 +1146,48 @@ std::string humanBlock(const Result& r) {
   fillLine("cold fill, O_DIRECT", r.fillDir, r.fillWriters);
   appendf(s, "    %-46s%8.0f IOPS   p50 %.2f ms   p99 %.2f ms   (write %.1f MB/s)\n",
           "random 4 KiB read under writeback (QD4)", r.mixedReadIops, r.mixed.p50 / 1e3, r.mixed.p99 / 1e3, r.mixedWriteMbps);
+  if (r.haveCachePath) {
+    const CacheBenchResult& c = r.cachePath;
+    appendf(s, "\n  Through uCache's own code (build %s — these move when the write path does)\n",
+            UCACHE_BUILD_ID);
+    if (!c.error.empty()) {
+      appendf(s, "    FAILED: %s\n", c.error.c_str());
+    } else {
+      auto line = [&s](const char* label, const CachePhase& p) {
+        appendf(s, "    %-46s%8.1f MB/s   (device %.1f, %.1f KiB/op, QD %.1f)   p99 %.2f ms\n",
+                label, p.payloadMbps, p.devMbps, p.devOpKib, p.devQueueDepth, p.p99Us / 1e3);
+      };
+      appendf(s, "    sample %.1f GiB over %d entries, %llu KiB arrival runs, %d writers, "
+                 "fill_buffer_mb %d\n",
+              static_cast<double>(c.sampleBytes) / (1ull << 30), c.entries,
+              static_cast<unsigned long long>(c.fillBlockKib), c.writers, c.fillBufferMb);
+      line("cold fill (writes only: staged pages serve reads)", c.fill);
+      if (c.fill.curveN >= 2) {
+        appendf(s, "      by eighth of volume:");
+        for (int i = 0; i < c.fill.curveN; ++i)
+          appendf(s, " %.0f", c.fill.curve[i]);
+        appendf(s, " MB/s%s\n",
+                c.crossedDirtyLimit ? "   (crossed the dirty limit: the tail is throttled)"
+                                    : "   (volume below the dirty limit: no throttle expected)");
+      }
+      appendf(s, "      closing sync %.0f s; product drained %llu runs averaging %.0f KiB\n",
+              c.fill.syncS, static_cast<unsigned long long>(c.flushRuns),
+              c.flushRuns ? static_cast<double>(c.flushRunBytes) / c.flushRuns / 1024.0 : 0.0);
+      // THE ACCEPTANCE CHECK: if the fill threads never blocked on the staging
+      // cap, the generator was slower than the disk and this is a CPU number.
+      appendf(s, "      %s (%llu staging stalls, %.1f s)\n",
+              c.stalls ? "outran the disk, so this is a storage measurement"
+                       : "!! NEVER STALLED: the harness may be the bottleneck, not the disk",
+              static_cast<unsigned long long>(c.stalls), c.stallMs / 1000.0);
+      char rl[96];
+      std::snprintf(rl, sizeof rl, "warm read, byte tier (scattered %llu KiB, QD%d)",
+                    static_cast<unsigned long long>(c.byteReadKib), c.threads);
+      line(rl, c.readByte);
+      std::snprintf(rl, sizeof rl, "warm read, replica tier (sequential %llu KiB, QD%d)",
+                    static_cast<unsigned long long>(c.replicaReadKib), c.threads);
+      line(rl, c.readReplica);
+    }
+  }
   appendf(s, "\n  Untimed\n    %-46s%8.0f /s   %8.0f /s\n", "create / unlink", r.createPs,
           r.unlinkPs);
   return s;
@@ -1265,11 +1328,12 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
     appendf(s, ",\"coldfill_%s_dev_mbps\":%.1f,\"coldfill_%s_app_mbps\":%.1f,"
                "\"coldfill_%s_write_phase_mbps\":%.1f,"
                "\"coldfill_%s_dev_write_kib\":%.1f,\"coldfill_%s_app_write_kib\":%.1f,"
+               "\"coldfill_%s_dev_queue_depth\":%.2f,\"coldfill_%s_merged_pct\":%.0f,"
                "\"coldfill_%s_mib\":%.0f,\"coldfill_%s_seconds\":%.1f,"
                "\"coldfill_%s_fsync_s\":%.1f,\"coldfill_%s_volume_reached\":%s,"
                "\"coldfill_%s_crosses_dirty_limit\":%s,\"coldfill_%s_curve\":[",
             tag, f.devMbps, tag, f.appMbps, tag, f.writePhaseMbps, tag, f.devWriteKib, tag,
-            f.meanWriteKib, tag,
+            f.meanWriteKib, tag, f.devQueueDepth, tag, f.mergedPct, tag,
             static_cast<double>(f.bytes) / (1ull << 20), tag, f.seconds, tag, f.fsyncS, tag,
             f.volumeReached ? "true" : "false", tag,
             f.crossesDirtyLimit ? "true" : "false", tag);
@@ -1279,6 +1343,38 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
   };
   fillJson("buffered", r.fillBuf);
   fillJson("direct", r.fillDir);
+  if (r.haveCachePath) {
+    const CacheBenchResult& c = r.cachePath;
+    appendf(s, ",\"cachepath_error\":\"%s\",\"cachepath_sample_mib\":%.0f,"
+               "\"cachepath_stalls\":%llu,\"cachepath_stall_s\":%.1f,"
+               "\"cachepath_flush_runs\":%llu,\"cachepath_flush_run_kib\":%.1f,"
+               "\"cachepath_crosses_dirty_limit\":%s,\"cachepath_entries\":%d,"
+               "\"cachepath_writers\":%d,\"cachepath_threads\":%d,"
+               "\"cachepath_fill_block_kib\":%llu,\"cachepath_fill_buffer_mb\":%d",
+            jesc(c.error).c_str(), static_cast<double>(c.sampleBytes) / (1ull << 20),
+            static_cast<unsigned long long>(c.stalls), c.stallMs / 1000.0,
+            static_cast<unsigned long long>(c.flushRuns),
+            c.flushRuns ? static_cast<double>(c.flushRunBytes) / c.flushRuns / 1024.0 : 0.0,
+            c.crossedDirtyLimit ? "true" : "false", c.entries, c.writers, c.threads,
+            static_cast<unsigned long long>(c.fillBlockKib), c.fillBufferMb);
+    auto pj = [&s](const char* tag, const CachePhase& p) {
+      appendf(s, ",\"cachepath_%s_mbps\":%.1f,\"cachepath_%s_dev_mbps\":%.1f,"
+                 "\"cachepath_%s_dev_op_kib\":%.1f,\"cachepath_%s_qd\":%.2f,"
+                 "\"cachepath_%s_seconds\":%.1f,\"cachepath_%s_mib\":%.0f,"
+                 "\"cachepath_%s_us_p50\":%llu,\"cachepath_%s_us_p99\":%llu",
+              tag, p.payloadMbps, tag, p.devMbps, tag, p.devOpKib, tag, p.devQueueDepth, tag,
+              p.seconds, tag, static_cast<double>(p.bytes) / (1ull << 20), tag,
+              static_cast<unsigned long long>(p.p50Us), tag,
+              static_cast<unsigned long long>(p.p99Us));
+    };
+    pj("fill", c.fill);
+    pj("read_byte", c.readByte);
+    pj("read_replica", c.readReplica);
+    appendf(s, ",\"cachepath_fill_sync_s\":%.1f,\"cachepath_fill_curve\":[", c.fill.syncS);
+    for (int i = 0; i < c.fill.curveN; ++i)
+      appendf(s, "%s%.1f", i ? "," : "", c.fill.curve[i]);
+    appendf(s, "]");
+  }
   appendf(s, ",\"std_qds\":[");
   for (size_t i = 0; i < r.randr.size(); ++i)
     appendf(s, "%s%d", i ? "," : "", r.randr[i].nEff);
@@ -1714,6 +1810,47 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
         std::snprintf(nm, sizeof nm, "%s/fill-%s%02d", dir, tag, t);
         ::unlink(nm);
       }
+  }
+
+  // --- THE SAME STORAGE THROUGH uCACHE'S OWN CODE (--cache-path) ----------
+  // Sized max(2x dirty limit, 30 s x the sequential write rate MEASURED EARLIER
+  // IN THIS RUN) — the first term crosses the kernel writeback threshold with
+  // enough of the run past it to see the throttled rate, the second keeps the
+  // window long enough on a fast device. Taking the rate from this run removes
+  // the chicken-and-egg of needing a rate to choose a size.
+  if (o.cachePath) {
+    uint64_t sample = o.cacheSample;
+    if (sample == 0) {
+      const double byLimit = r.env.mach.dirtyLimitGb * 2.0 * static_cast<double>(1ull << 30);
+      const double byTime = r.stdSeqWriteMbps * 1e6 * 30.0;
+      sample = static_cast<uint64_t>(std::max(std::max(byLimit, byTime),
+                                              static_cast<double>(4ull << 30)));
+    }
+    // Clamp to what is actually free NOW: the test file and both fill legs are
+    // still on disk, and running out mid-phase would measure ENOSPC.
+    struct ::statvfs now;
+    if (::statvfs(path.c_str(), &now) == 0) {
+      const double freeB = static_cast<double>(now.f_bavail) * now.f_frsize;
+      const double room = freeB - static_cast<double>(4ull << 30);
+      if (room > 0 && static_cast<double>(sample) > room)
+        sample = static_cast<uint64_t>(room);
+    }
+    CacheBenchOpts co;
+    co.dir = dir;
+    co.diskName = r.env.mnt.diskName;
+    co.sampleBytes = sample;
+    co.threads = std::max(1, r.threads);
+    co.writers = std::max(1, o.fillWriters);
+    co.fillBlock = o.fillBlock;
+    co.dirtyLimitGb = r.env.mach.dirtyLimitGb;
+    // Entries big enough that each holds many blocks, and numerous enough that
+    // several drains are in flight: the per-entry lock and the staging cap only
+    // show up with more than one.
+    co.entries = std::max(o.fillWriters * 2, 8);
+    r.cachePath = runCacheBench(co);
+    r.haveCachePath = true;
+    r.env.ownWriteBytes += r.cachePath.fill.bytes;
+    r.env.ownReadBytes += r.cachePath.readByte.bytes + r.cachePath.readReplica.bytes;
   }
 
   // --- create / unlink (the cleanup / eviction pattern) -------------------

@@ -77,6 +77,13 @@ struct DiskBenchOpts {
   int fillWriters = 4;               // --fill writers= (measured: ~4 in flight)
   uint64_t fillBlock = 48ull << 10;  // --fill block=   (measured mean run)
   uint64_t fillVolume = 0;           // --fill volume=  (0 = 1.5x dirty limit)
+  // --cache-path: measure the storage through uCache's OWN fill and read code
+  // rather than through an imitation of it (docs plan; CacheBench.h). Opt-in for
+  // now: it changes the run's space and time profile substantially, and it is
+  // new. --cache-sample overrides the automatic volume, which is otherwise
+  // max(2x the kernel dirty limit, 30 s x the measured sequential write rate).
+  bool cachePath = false;            // --cache-path
+  uint64_t cacheSample = 0;          // --cache-sample (0 = automatic)
   std::string logPath = "ucache-bench.txt"; // --log; empty = --no-log
   std::string cmdline;               // the invocation, recorded in the log
 };

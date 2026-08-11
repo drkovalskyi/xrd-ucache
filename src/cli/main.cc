@@ -62,7 +62,8 @@ void usage() {
       "  enable | disable  turn caching on/off (flips the plugin conf)\n"
       "  status            cache location, budget, usage, and aggregated stats\n"
       "  bench [PATH ...] [--size SZ] [--measurement-duration S] [--threads N]\n"
-      "                    [--block KB] [--fill k=v,...] [--log FILE | --no-log]\n"
+      "                    [--block KB] [--fill k=v,...] [--cache-path]\n"
+      "                    [--cache-sample SZ] [--log FILE | --no-log]\n"
       "                    measure a cache location's raw storage performance.\n"
       "                    STANDARD measurements use pinned block sizes and\n"
       "                    queue depths, so they compare to a datasheet or to\n"
@@ -642,6 +643,18 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
         return 2;
       }
       opts.logPath = v;
+    } else if (a == "--cache-path") {
+      opts.cachePath = true;
+    } else if (a == "--cache-sample" || a.rfind("--cache-sample=", 0) == 0) {
+      const char* v = flagValue(argc, argv, i, 14);
+      if (!v || !parseSizeArg(v, opts.cacheSample) || opts.cacheSample == 0) {
+        std::fputs("bench: --cache-sample needs a size (e.g. 8g); it overrides the automatic\n"
+                   "       volume, which is max(2x the kernel dirty limit, 30 s x this run's\n"
+                   "       measured sequential write rate)\n",
+                   stderr);
+        return 2;
+      }
+      opts.cachePath = true; // asking for a size means asking for the stage
     } else if (a == "--sweep") {
       opts.sweep = true;
     } else if (a == "--no-log") {
