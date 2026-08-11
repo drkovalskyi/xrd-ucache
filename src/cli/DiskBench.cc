@@ -523,8 +523,20 @@ uint64_t randLoop(int fd, uint64_t fsz, bool write, char* buf, double deadline,
 // the application against 240 at the device, a 33% overstatement.
 constexpr int kFillBuckets = 8;
 struct FillStat {
-  double appMbps = 0, devMbps = 0, meanWriteKib = 0;
-  double devWriteKib = 0; // what the DEVICE saw per write: the merging question
+  // Application data over TOTAL elapsed — writing plus the closing flush. That
+  // total is the fill's throughput: the bytes are not on disk until the flush
+  // ends, so charging them only to the write phase reported 1266 MB/s for a leg
+  // whose disk was doing 269.
+  double appMbps = 0;
+  double writePhaseMbps = 0; // over the write phase alone: how far ahead of the
+                             // disk the writer got, i.e. how much of it was RAM
+  double devMbps = 0, meanWriteKib = 0;
+  // Device TRAFFIC, not application data: filling a sparse file at random
+  // offsets journals an extent per write, and that metadata was measured at
+  // 9.5% on top of the payload. So devMbps > appMbps is expected here, and the
+  // device write size falls below the block for the same reason — small metadata
+  // writes in the mean, not split data writes.
+  double devWriteKib = 0;
   uint64_t writes = 0, bytes = 0, target = 0;
   double seconds = 0, fsyncS = 0; // the closing flush, timed on its own
   // Device MB/s over each eighth of the volume, in order. A throttled fill is
@@ -846,7 +858,8 @@ FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
   s.writes = writes.load();
   s.seconds = writeS;
   s.volumeReached = s.bytes >= s.target;
-  s.appMbps = static_cast<double>(s.bytes) / 1e6 / writeS;
+  s.writePhaseMbps = static_cast<double>(s.bytes) / 1e6 / writeS;
+  s.appMbps = static_cast<double>(s.bytes) / 1e6 / std::max(1e-9, writeS + s.fsyncS);
   s.meanWriteKib = s.writes ? static_cast<double>(s.bytes) / s.writes / 1024.0 : 0;
   const double total = writeS + s.fsyncS;
   if (d0.valid && d1.valid && total > 0) {
@@ -1058,7 +1071,8 @@ std::string humanBlock(const Result& r) {
     char lb2[80];
     std::snprintf(lb2, sizeof lb2, "%s (%d writer%s, sparse, retained)", label, writers,
                   writers == 1 ? "" : "s");
-    appendf(s, "    %-46s%8.1f MB/s   %.1f KiB device writes\n", lb2, f.devMbps, f.devWriteKib);
+    appendf(s, "    %-46s%8.1f MB/s   (device traffic %.1f, %.1f KiB/write)\n", lb2, f.appMbps,
+            f.devMbps, f.devWriteKib);
     // A quick check writes megabytes and the convention run writes tens of
     // gigabytes; one fixed unit renders one of them as 0.0.
     const bool gib = f.target >= (1ull << 30);
@@ -1072,10 +1086,19 @@ std::string humanBlock(const Result& r) {
     // i.e. how much of this was RAM. It is the reason the device figure is the
     // one reported: a buffered leg once read 319 MB/s at the application against
     // 240 at the device.
-    appendf(s, "      application saw %.1f MB/s, %+.0f%% vs the device%s\n", f.appMbps,
-            f.devMbps > 0 ? 100.0 * (f.appMbps - f.devMbps) / f.devMbps : 0.0,
-            f.appMbps > 2 * f.devMbps ? "  <- mostly RAM: the writer never waited for the disk"
-                                      : "");
+    // The headline is data over TOTAL time. This line is the diagnostic: how fast
+    // the writer THOUGHT it was going while the pages were still in RAM.
+    appendf(s, "      during the write phase the writer saw %.1f MB/s%s\n", f.writePhaseMbps,
+            f.writePhaseMbps > 2 * f.appMbps
+                ? "  <- mostly RAM: it never waited for the disk, the flush did"
+                : "");
+    // Device traffic exceeds the payload by the filesystem's own writes — an
+    // extent and a journal record per scattered allocation. Named so the excess
+    // is not read as a measurement error.
+    if (f.devMbps > 0 && f.appMbps > 0)
+      appendf(s, "      device wrote %+.0f%% more than the payload (extent + journal per "
+                 "scattered write)\n",
+              100.0 * (f.devMbps - f.appMbps) / f.appMbps);
     if (f.curveN >= 2) {
       appendf(s, "      by eighth of volume:");
       for (int i = 0; i < f.curveN; ++i)
@@ -1229,11 +1252,13 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
           static_cast<double>(r.fillBuf.target) / (1ull << 20));
   auto fillJson = [&s](const char* tag, const FillStat& f) {
     appendf(s, ",\"coldfill_%s_dev_mbps\":%.1f,\"coldfill_%s_app_mbps\":%.1f,"
+               "\"coldfill_%s_write_phase_mbps\":%.1f,"
                "\"coldfill_%s_dev_write_kib\":%.1f,\"coldfill_%s_app_write_kib\":%.1f,"
                "\"coldfill_%s_mib\":%.0f,\"coldfill_%s_seconds\":%.1f,"
                "\"coldfill_%s_fsync_s\":%.1f,\"coldfill_%s_volume_reached\":%s,"
                "\"coldfill_%s_crosses_dirty_limit\":%s,\"coldfill_%s_curve\":[",
-            tag, f.devMbps, tag, f.appMbps, tag, f.devWriteKib, tag, f.meanWriteKib, tag,
+            tag, f.devMbps, tag, f.appMbps, tag, f.writePhaseMbps, tag, f.devWriteKib, tag,
+            f.meanWriteKib, tag,
             static_cast<double>(f.bytes) / (1ull << 20), tag, f.seconds, tag, f.fsyncS, tag,
             f.volumeReached ? "true" : "false", tag,
             f.crossesDirtyLimit ? "true" : "false", tag);
