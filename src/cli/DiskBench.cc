@@ -829,12 +829,22 @@ FillStat fillStage(const std::string& dir, const char* tag, const DiskBenchOpts&
   // It runs on its own thread so the curve keeps being sampled through it, and
   // it is NOT deadline-bounded — abandoning it would leave dirty pages that the
   // unlink below then discards, which would silently shrink the measurement.
+  // ONE THREAD PER FILE, not a loop. A serial flush finishes one inode before
+  // starting the next, so the tail of the leg runs at a fraction of the device
+  // concurrency the write phase used — and that tail was 34-80% of the buffered
+  // leg's wall clock, which is enough on its own to make O_DIRECT look faster
+  // than buffered. The flush has to be issued at the same width as the writes or
+  // it measures the harness instead of the disk.
   const double f0 = nowS();
   std::atomic<bool> flushed{false};
   std::thread closer([&] {
+    std::vector<std::thread> fl;
+    fl.reserve(fds.size());
     for (size_t i = 0; i < fds.size(); ++i)
       if (fds[i] >= 0)
-        ::fdatasync(fds[i]);
+        fl.emplace_back([fd = fds[i]] { ::fdatasync(fd); });
+    for (auto& t : fl)
+      t.join();
     flushed.store(true);
   });
   while (!flushed.load(std::memory_order_relaxed)) {
