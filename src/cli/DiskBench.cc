@@ -714,7 +714,7 @@ const char* fillShape(const FillStat& f) {
 //
 // Thread-safety: each writer owns its file, fd, buffer and permutation; the byte
 // counters are atomics, and the caller thread samples them plus the device.
-FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
+FillStat fillStage(const std::string& dir, const char* tag, const DiskBenchOpts& o, bool direct,
                    uint64_t target, const std::string& disk, double dirtyLimitGb,
                    double timeCapS) {
   FillStat s;
@@ -749,7 +749,7 @@ FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
         ~Done() { n->fetch_sub(1); }
       } done{&live}; // every exit path counts, including the early returns below
       char nm[4300];
-      std::snprintf(nm, sizeof nm, "%s/fill%02d", dir.c_str(), t);
+      std::snprintf(nm, sizeof nm, "%s/fill-%s%02d", dir.c_str(), tag, t);
       names[static_cast<size_t>(t)] = nm;
       int fd = ::open(nm, O_WRONLY | O_CREAT | O_TRUNC | (direct ? O_DIRECT : 0), 0600);
       if (fd < 0)
@@ -849,10 +849,11 @@ FillStat fillStage(const std::string& dir, const DiskBenchOpts& o, bool direct,
   for (size_t i = 0; i < fds.size(); ++i)
     if (fds[i] >= 0)
       ::close(fds[i]);
-  // Retained for the whole stage, removed only now.
-  for (const auto& n : names)
-    if (!n.empty())
-      ::unlink(n.c_str());
+  // NOT removed here. Both legs' data stays on disk until every write test is
+  // done, because freeing the first leg's volume hands the second one a single
+  // large contiguous free region to allocate into — which is not what a fill
+  // finds, and it favoured whichever leg ran second. Buffered runs first so the
+  // leg that models the product gets the cleaner state.
 
   s.bytes = bytes.load();
   s.writes = writes.load();
@@ -1395,8 +1396,22 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   r.freeGb = static_cast<double>(vfs.f_bavail) * vfs.f_frsize / (1ull << 30);
   uint64_t want = std::max<uint64_t>(o.fileBytes, kMinFile);
   r.wantMb = static_cast<double>(want) / (1 << 20);
-  if (r.freeGb * (1ull << 30) < static_cast<double>(want) + (64ull << 20)) {
-    r.error = "not enough free space for the test file (need --size + 64 MiB)";
+  // Peak usage is the test file PLUS both fill legs: nothing is released until
+  // the run ends, so that no write measurement allocates into space another one
+  // freed. That is a real cost of measuring allocation honestly, so it is
+  // pre-flighted with the arithmetic spelled out rather than discovered as a
+  // half-finished stage.
+  const uint64_t vol = fillVolume(o, r.env.mach.dirtyLimitGb, want);
+  const double needB = static_cast<double>(want) + 2.0 * static_cast<double>(vol) + (1ull << 30);
+  if (r.freeGb * static_cast<double>(1ull << 30) < needB) {
+    char msg[256];
+    std::snprintf(msg, sizeof msg,
+                  "not enough free space: need %.1f GiB = %.1f test file + 2 x %.1f fill "
+                  "(both legs held at once) + 1 GiB slack, have %.1f GiB",
+                  needB / static_cast<double>(1ull << 30),
+                  static_cast<double>(want) / static_cast<double>(1ull << 30),
+                  static_cast<double>(vol) / static_cast<double>(1ull << 30), r.freeGb);
+    r.error = msg;
     return r;
   }
 
@@ -1664,20 +1679,31 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   // --- Bounded by volume, not by a window, because the writeback knee is at a
   // --- byte count. The legs run one after the other and each removes its files
   // --- at the end, so peak usage is one leg's volume, not both.
-  // Nothing reads the test file after the writeback mix, and the fill needs the
-  // space more: removing it here means peak usage is max(test file, fill volume)
-  // rather than their sum, which is what lets --size stay the whole run's budget.
-  ::unlink(tf.c_str());
+  // The test file STAYS, even though nothing reads it after the writeback mix.
+  // Freeing it here would hand the buffered leg a single large contiguous free
+  // region to allocate into — the same artifact that inflated the O_DIRECT leg
+  // by 1.6x when it followed a leg that had just freed its volume. No write
+  // measurement in this run allocates into space another one released.
   {
     const uint64_t vol =
         fillVolume(o, r.env.mach.dirtyLimitGb, std::max<uint64_t>(o.fileBytes, kMinFile));
     const double cap = std::max(o.measurementSeconds * 6, 120.0);
     r.fillWriters = std::max(1, o.fillWriters);
-    r.fillBuf = fillStage(dir, o, /*direct=*/false, vol, r.env.mnt.diskName,
+    // Buffered FIRST and both retained: see fillStage. The leg that models the
+    // product gets the cleaner disk, and neither leg allocates into space the
+    // other just freed.
+    r.fillBuf = fillStage(dir, "buf", o, /*direct=*/false, vol, r.env.mnt.diskName,
                           r.env.mach.dirtyLimitGb, cap);
-    r.fillDir = fillStage(dir, o, /*direct=*/true, vol, r.env.mnt.diskName,
+    r.fillDir = fillStage(dir, "dir", o, /*direct=*/true, vol, r.env.mnt.diskName,
                           r.env.mach.dirtyLimitGb, cap);
     r.env.ownWriteBytes += r.fillBuf.bytes + r.fillDir.bytes;
+    // Now that no write test remains, free both legs.
+    for (int t = 0; t < r.fillWriters; ++t)
+      for (const char* tag : {"buf", "dir"}) {
+        char nm[4300];
+        std::snprintf(nm, sizeof nm, "%s/fill-%s%02d", dir, tag, t);
+        ::unlink(nm);
+      }
   }
 
   // --- create / unlink (the cleanup / eviction pattern) -------------------
@@ -1767,11 +1793,32 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
       appendf(s, "    random 48 KiB read, QD%d          (byte tier — scattered)\n", o.threads);
     }
   }
-  appendf(s, "    cold fill, buffered              (%d writer(s), %llu KiB writes into SPARSE\n"
-             "                                      files at scattered offsets, RETAINED, not\n"
-             "                                      synced until the end)\n",
-          o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024));
-  appendf(s, "    cold fill, O_DIRECT              (same shape, no page cache)\n");
+  {
+    // The volume is what the reader needs to size the run: it decides both the
+    // duration (it is written twice, at whatever the device does) and the peak
+    // disk usage, which is 2x it because both legs are held at once.
+    const double volGb =
+        static_cast<double>(fillVolume(o, machineInfo().dirtyLimitGb,
+                                       std::max<uint64_t>(o.fileBytes, kMinFile))) /
+        static_cast<double>(1ull << 30);
+    appendf(s, "    cold fill, buffered              (%d writer(s), %llu KiB writes into SPARSE\n"
+               "                                      files at scattered offsets, RETAINED, not\n"
+               "                                      synced until the end)\n",
+            o.fillWriters, static_cast<unsigned long long>(o.fillBlock / 1024));
+    appendf(s, "    cold fill, O_DIRECT              (same shape, no page cache)\n");
+    // One line, and in whichever unit does not round to zero: a quick check runs
+    // at megabyte scale and the convention run at tens of gigabytes.
+    const double tfB = static_cast<double>(std::max<uint64_t>(o.fileBytes, kMinFile));
+    const double volB = volGb * static_cast<double>(1ull << 30);
+    const bool gib = (tfB + 2 * volB) >= static_cast<double>(1ull << 30);
+    const double div = static_cast<double>(gib ? (1ull << 30) : (1ull << 20));
+    const char* u = gib ? "GiB" : "MiB";
+    appendf(s, "      each leg writes %.1f %s, and NOTHING is freed until the run ends, so no\n"
+               "      write test allocates into space another one released\n",
+            volB / div, u);
+    appendf(s, "      Peak disk usage is %.1f %s = %.1f test file + 2 x %.1f fill\n",
+            (tfB + 2 * volB) / div, u, tfB / div, volB / div);
+  }
   appendf(s, "    random 4 KiB read under writeback, QD4\n");
   appendf(s, "\n  Untimed\n    fdatasync (5 samples), create / unlink\n\n");
   return s;
