@@ -19,8 +19,9 @@ is good; it produces the evidence you decide with.
 Contents: [running it](#running-it) · [what it does to the
 disk](#what-a-run-does-to-the-disk) · [the two groups of
 numbers](#the-two-groups-of-numbers) · [every measurement in
-detail](#every-measurement-in-detail) · [the fill stage](#the-fill-stage-in-detail)
-· [the run context](#the-run-context-block) · [reading a whole
+detail](#every-measurement-in-detail) · [through uCache's own
+code](#measuring-through-ucaches-own-code---cache-path) · [the run
+context](#the-run-context-block) · [reading a whole
 record](#reading-a-whole-record) · [what reproduces](#what-reproduces-and-what-does-not)
 · [pitfalls](#pitfalls) · [options](#options-reference) · [JSON
 fields](#json-field-reference)
@@ -109,7 +110,7 @@ Everything happens inside one directory it creates and removes:
 ```
 <path>/.ucache-bench.<pid>/
     testfile          # --size, or as much as the time cap allowed
-    fill00-000000     # one at a time during the fill stage, unlinked as it goes
+    ucache-path/      # only with --cache-path: a real cache, filled and read back
     m0000 … m0199     # 200 tiny files, during the create/unlink stage
 ```
 
@@ -117,18 +118,12 @@ Everything happens inside one directory it creates and removes:
 write stage cycles *in place* inside it rather than extending it — so however
 long a window runs, that file stays the size it was built to.
 
-Peak usage is a little above `--size`, during the fill stage: the test file is
-still there while each writer holds one fill file. A fill file is
-`min(--fill file, --size / 4 / writers)`, so the fill set adds at most a quarter
-of `--size`, and with the defaults it adds 256 MiB per writer. In round numbers,
-budget `--size` + 256 MiB for a normal run, or 1.25 × `--size` when `--size` is
-under 1 GiB.
-
-The tool's own pre-flight only checks for `--size` + 64 MiB, which is less than
-that peak. If the disk is that tight the fill stage simply cannot create its
-files and reports a very low rate rather than an error, so **leave real headroom
-rather than the bare minimum** — and treat an implausibly low fill number on a
-nearly full disk as suspect.
+So a plain run needs `--size` plus a little slack. **`--cache-path` is the
+exception**: it builds a real cache alongside the test file and holds both, so
+budget `--size` + the sample (see that section). Nothing is released early —
+allocating into space another measurement just freed inflated a figure by 1.6×
+when it was allowed, so every write measurement here starts on space nobody in
+this run has handed back.
 
 You need free space, not just a big disk — and on a **cache** directory,
 remember that a 64 GiB test file is 64 GiB the cache cannot use while the run
@@ -334,11 +329,6 @@ is worth *on this device*. Where bandwidth is the constraint the two rows are
 close. Where operations are priced — an IOPS-quota volume — the gap between them
 is the whole reason to complete a recompression.
 
-### Fill pattern, buffered and O_DIRECT — `fill_buffered_*`, `fill_direct_*`
-
-The write pattern a cold fill generates. This is the most subtle measurement in
-the tool and has [its own section below](#the-fill-stage-in-detail).
-
 ### Random 4 KiB reads under writeback, QD4 — `mixed_*`
 
 **Mechanics.** One writer streams `--block` blocks through the test file
@@ -357,103 +347,6 @@ disk that is simultaneously being filled.
 200 tiny files created then removed, timed as two batches. These are the
 metadata rates behind eviction and cleanup. On latency-bound filesystems unlink
 rate is what makes a large cleanup take minutes rather than seconds.
-
----
-
-## The fill stage, in detail
-
-### What it models
-
-A cold fill writes through **one stream** at roughly **48 KiB per write**,
-regardless of how many threads the analysis runs — because cache entries are
-keyed per file and drained per entry. The stage reproduces that: each writer
-creates a file, extends it with `block`-sized writes, `fdatasync`s, closes,
-unlinks, and starts the next one. File creation and turnover are *inside* the
-measurement, which is what makes a fill different from writing to a file that
-already exists.
-
-Defaults, and why they are what they are:
-
-| parameter | default | why |
-|---|---|---|
-| `writers` | 1 | measured: a fill drains one entry at a time, identical at 8 and 32 analysis threads |
-| `block` | 48 KiB | measured mean write size of a real cold fill |
-| `file` | 256 MiB | representative cached-file size; also bounded by `--size`/4 per writer |
-
-Override with `--fill writers=2,block=64k,file=512m`. The mean write size the
-filesystem actually issued is reported back (`48.0 KiB writes`) — if that
-disagrees with what you asked for, the filesystem changed your writes, and *that*
-is the finding.
-
-**The `fdatasync` is inside the timed window on purpose.** Without it, a fill
-smaller than the machine's dirty-page limit measures RAM, not the disk. The
-context block prints that limit so you can see how much headroom there was.
-
-### Why there are two modes
-
-**Buffered is the real one** — it is what a cache does. **O_DIRECT is the
-control**: it shows what the device does with 48 KiB writes when the kernel is
-not allowed to merge them. Buffered faster than O_DIRECT means the kernel is
-merging small writes into larger device writes, and by how much.
-
-The comparison is machine-specific, and it inverts. On a host with a 37 GiB
-dirty limit, buffering won clearly; on a host where `vm.dirty_bytes` was set to
-about 107 MB, it did not. This is why the writeback configuration is in the
-context block.
-
-### The distribution, and the order statistics
-
-A 60 s window completes roughly 100 whole file cycles, so there is a
-distribution rather than a single number, and the tool reports it. Only
-**complete** cycles count — the last file is usually cut off by the deadline, and
-a partial slice is not a rate.
-
-```
-fill pattern, buffered        420.3 MB/s   1.6 files/s   48.0 KiB writes
-  per file: p50 432.4   p10 370.9   p90 438.5 MB/s   (94 files, p90/p10 1.18x)
-  in order: first quarter 398.0 -> last quarter 433.6 MB/s (+9.0%), lag-1 autocorr +0.74
-            <- DRIFTS: mean depends on where the window fell, not sigma/sqrt(n)
-```
-
-Percentiles alone cannot tell random scatter from a trend, because sorting throws
-away the one thing that distinguishes them. So the tool also reports two
-**order-sensitive** statistics, computed before the sort:
-
-- **first quarter → last quarter**, in order. A drift.
-- **lag-1 autocorrelation** — how much each cycle resembles the one before it.
-  Near 0 = independent samples. Positive = slow cycles cluster. Negative =
-  alternating.
-
-The verdict line spells out what they mean for the mean:
-
-| verdict | condition | what it means |
-|---|---|---|
-| `DRIFTS` | quarters differ by >3% | The mean depends on where the window fell. Averaging more runs does **not** shrink the uncertainty — the effect is systematic, not noise. |
-| `CLUSTERED` | lag-1 > +0.3 | Effective sample count is smaller than it looks; the mean is softer than `σ/√n`. |
-| `ALTERNATES` | lag-1 < −0.3 | Deviations cancel; the mean is **better** determined than independent sampling would give. |
-| independent | neither | `σ/√n` applies, and repeating runs genuinely helps. |
-
-### Reading it in practice
-
-Two worked observations, both from repeated runs on one SATA SSD.
-
-**A large per-file spread is not necessarily instability.** A run showing
-p10 371 vs p90 439 (1.18×) also showed the quarters rising +9.0% with lag-1
-+0.74. That is a *warm-up ramp*, not scatter: p10 is the early files and p90 is
-steady state. The same command's mean reproduced across runs to 1.1%.
-
-**Which figure is stable can differ from the headline.** Across runs at two
-different `--size` values, the buffered *means* differed by 3.4% (420 vs 435)
-while `p50` and the last quarter agreed to ~1% (432 vs 436, 434 vs 433). The
-mean differed only because a larger test file leaves more residual writeback to
-drain, so more warm-up sat inside the window. **When the shape says `DRIFTS`,
-p50 is the more transferable number.**
-
-**And the two modes do not have the same reliability.** On that device the
-buffered mean reproduced to about 1% at fixed settings, while the O_DIRECT mean
-ranged over 9.5% across nine runs with no accompanying drift, load, or device
-counter to explain it. Treat the O_DIRECT fill as ±5% and do not read a
-350-vs-380 difference between two machines as real.
 
 ---
 
@@ -570,8 +463,6 @@ A worked pass over one real run — 64 GiB test file, 60 s measurements,
     sequential 4096 KiB read (QD32)               567.7 MB/s  (1.02x QD1)
     random 48 KiB read (QD32)  [byte tier]        550.9 MB/s   11209 IOPS  p99 2.94 ms
     sequential 512 KiB read (QD32) [replica tier] 567.8 MB/s    1083 IOPS
-    fill pattern, buffered                        420.3 MB/s
-    fill pattern, O_DIRECT                        352.2 MB/s
     random 4 KiB read under writeback (QD4)         755 IOPS  p50 6.45 ms  p99 14.87 ms
 ```
 
@@ -646,9 +537,7 @@ whether a difference between two machines is real.
 | sequential write in place, QD1 | ~6% | the quotable write figure |
 | random 4 KiB read, all depths | ~1–2% | the most stable numbers in the tool |
 | byte-tier and replica-tier reads | ~1% | |
-| fill, buffered (mean) | ~1% at fixed `--size` | but see below |
-| fill, buffered (p50) | ~1% across `--size` values | more transferable than the mean |
-| fill, O_DIRECT (mean) | **~9.5%** | unexplained; treat as ±5% |
+| uCache-path fill | not yet characterised | version-bound; repeat before comparing |
 | test-file creation | **up to 68%** | not a device measurement |
 | reads under writeback | not characterised | |
 
@@ -671,10 +560,6 @@ Two rules follow:
   run; it means about 15 minutes. Read the plan the tool prints.
 - **`--size` is a ceiling.** Check for `stopped at time cap` before comparing a
   file-size-dependent number against another machine.
-- **`--size` silently bounds the fill file.** The fill file is capped at a
-  quarter of `--size` per writer, so `--size 32m` gives 8 MiB fill files no
-  matter what `--fill file=` says. Small `--size` values do not just shorten the
-  run, they change what the fill measures.
 - **The default log is the working directory.** Running from a directory that
   holds curated records will append to them.
 - **Do not quote `build_write_mbps`.** Use `seq_write_mbps`.
@@ -683,9 +568,9 @@ Two rules follow:
   `<path>/.ucache-bench.*` by hand.
 - **Running it on a live cache directory consumes the space.** The test file is
   real, and on a near-full cache it can trigger eviction.
-- **A nearly full disk degrades the fill silently.** The pre-flight reserves
-  `--size` + 64 MiB, but the peak is `--size` plus the fill files. With too
-  little headroom the fill stage reports a low rate instead of failing.
+- **`--cache-path` needs its sample on top of `--size`.** The pre-flight states
+  the arithmetic; a run that cannot fit says so up front rather than discovering
+  it in a half-finished stage.
 - **`--threads` is not the core count.** It is what your jobs use.
 
 ---
@@ -699,7 +584,7 @@ Two rules follow:
 | `--size SZ` | `1g` | test-file ceiling (floor 16 MiB); also caps the fill file at `SZ/4` per writer |
 | `--measurement-duration S` | `5` | seconds per measurement, 0–300. Aliases: `--phase-seconds`, `--seconds` |
 | `--block KB` | `4096` | block size for the sequential measurements; 4–65536 KiB, multiple of 4 |
-| `--fill k=v,...` | `writers=1,block=48k,file=256m` | fill-pattern parameters |
+| `--fill k=v,...` | `writers=4,block=48k` | the arrival pattern the uCache-path stage generates |
 | `--sweep` | off | replace the single byte-tier point with a block ladder (4, 8, 16, 32, 48, 128, 512, 4096 KiB) to locate the operation-bound/bandwidth knee. 19 measurements instead of 12 |
 | `--cache-path` | off | also measure this storage **through uCache's own fill and read code** — see below |
 | `--cache-sample SZ` | automatic | volume for that stage; implies `--cache-path`. Automatic is `max(2 × the kernel dirty limit, 30 s × this run's measured sequential write rate)` |
@@ -815,19 +700,6 @@ Present only when `--threads` was given.
 | `pat_rand48k_read_mbps`, `_iops`, `_us_p99` | byte tier: random 48 KiB. With `--sweep`, one set per ladder size as `pat_rand<N>k_read_*` |
 | `pat_replica_read_mbps`, `pat_replica_read_iops` | replica tier: sequential 512 KiB |
 | `mixed_read_iops`, `mixed_us_p50/p99`, `mixed_write_mbps` | random 4 KiB reads under writeback, and what the competing writer got |
-
-### Fill pattern
-
-`fill_buffered_*` and `fill_direct_*`, with identical shapes:
-
-| field | meaning |
-|---|---|
-| `fill_writers`, `fill_block_kib`, `fill_file_mib` | the parameters used (note `--size` may have lowered the file size) |
-| `fill_*_mbps` | mean rate over the window |
-| `fill_*_files_ps`, `fill_*_write_kib` | file turnover, and the write size the filesystem actually issued |
-| `fill_*_p10/p50/p90_mbps`, `fill_*_samples` | the per-file distribution over complete cycles |
-| `fill_*_q1_mbps`, `fill_*_q4_mbps` | mean of the first and last quarter, **in order** |
-| `fill_*_lag1` | lag-1 autocorrelation of the ordered series |
 
 ### Run context
 

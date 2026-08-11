@@ -76,7 +76,6 @@ struct DiskBenchOpts {
   // still measure a sustained rate afterwards.
   int fillWriters = 4;               // --fill writers= (measured: ~4 in flight)
   uint64_t fillBlock = 48ull << 10;  // --fill block=   (measured mean run)
-  uint64_t fillVolume = 0;           // --fill volume=  (0 = 1.5x dirty limit)
   // --cache-path: measure the storage through uCache's OWN fill and read code
   // rather than through an imitation of it (docs plan; CacheBench.h). Opt-in for
   // now: it changes the run's space and time profile substantially, and it is
