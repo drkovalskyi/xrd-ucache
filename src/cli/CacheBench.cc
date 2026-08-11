@@ -64,6 +64,23 @@ Dev devRead(const std::string& disk) {
   return d;
 }
 
+// Dirty pages right now, in GiB. Sampled through the fill so the record can say
+// whether the kernel's writeback threshold was actually approached, rather than
+// only whether the volume was large enough that it might have been.
+double dirtyMib() {
+  std::ifstream f("/proc/meminfo");
+  std::string k;
+  unsigned long long v = 0;
+  while (f >> k) {
+    if (k == "Dirty:") {
+      f >> v;
+      return static_cast<double>(v) / 1024.0;
+    }
+    std::getline(f, k);
+  }
+  return 0;
+}
+
 void pct(std::vector<uint32_t>& us, CachePhase& p) {
   if (us.empty())
     return;
@@ -177,7 +194,8 @@ CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
   r.fillBlockKib = blk / 1024;
   r.byteReadKib = std::max<uint64_t>(4096, o.byteReadBlock) / 1024;
   r.replicaReadKib = std::max<uint64_t>(4096, o.replicaReadBlock) / 1024;
-  r.crossedDirtyLimit =
+  r.dirtyLimitMib = o.dirtyLimitGb * 1024.0;
+  r.volumeExceedsDirtyLimit =
       o.dirtyLimitGb > 0 &&
       static_cast<double>(r.sampleBytes) > o.dirtyLimitGb * static_cast<double>(1ull << 30);
 
@@ -249,6 +267,7 @@ CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
     std::thread sampler([&] {
       const struct timespec tick { 0, 50 * 1000 * 1000 };
       while (filling.load(std::memory_order_relaxed) && filled < kCacheCurveBuckets) {
+        r.peakDirtyMib = std::max(r.peakDirtyMib, dirtyMib());
         const Dev dn = devRead(o.diskName);
         if (dn.valid && d0.valid) {
           const uint64_t done = (dn.wrSect - d0.wrSect) * 512ull;
@@ -263,6 +282,12 @@ CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
             ++filled;
           }
         }
+        ::nanosleep(&tick, nullptr);
+      }
+      // The buckets can fill before the writing does; dirty keeps moving until
+      // the last drain, so keep watching it until the phase ends.
+      while (filling.load(std::memory_order_relaxed)) {
+        r.peakDirtyMib = std::max(r.peakDirtyMib, dirtyMib());
         ::nanosleep(&tick, nullptr);
       }
     });

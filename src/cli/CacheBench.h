@@ -90,7 +90,16 @@ struct CacheBenchResult {
   double stallShare = 0;    // blocked thread-time / total writer thread-time
   uint64_t flushRuns = 0, flushRunBytes = 0; // what the product's drains looked like
   uint64_t hitDiskReads = 0, hitDiskBytes = 0; // and its read path
-  bool crossedDirtyLimit = false;
+  // Two different claims, kept apart because conflating them made the record say
+  // "the tail is the throttled rate" when nothing was throttled. The volume
+  // exceeding the limit only means a throttle was POSSIBLE; whether dirty pages
+  // actually accumulated to it is a measurement, and it is the one that matters.
+  bool volumeExceedsDirtyLimit = false;
+  // In MiB. GiB at two decimals rendered a 256 MiB run's peak as 0.00 and broke
+  // an assertion on it — the third time today a GiB field has rounded a real
+  // value to zero. Small units, and let the display pick.
+  double peakDirtyMib = 0;  // max /proc/meminfo Dirty observed during the fill
+  double dirtyLimitMib = 0; // what it would have had to reach
   std::string error; // empty on success
 };
 

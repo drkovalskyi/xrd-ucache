@@ -1166,9 +1166,7 @@ std::string humanBlock(const Result& r) {
         appendf(s, "      by eighth of volume:");
         for (int i = 0; i < c.fill.curveN; ++i)
           appendf(s, " %.0f", c.fill.curve[i]);
-        appendf(s, " MB/s%s\n",
-                c.crossedDirtyLimit ? "   (crossed the dirty limit: the tail is throttled)"
-                                    : "   (volume below the dirty limit: no throttle expected)");
+        appendf(s, " MB/s\n");
       }
       appendf(s, "      closing sync %.0f s; product drained %llu runs averaging %.0f KiB\n",
               c.fill.syncS, static_cast<unsigned long long>(c.flushRuns),
@@ -1177,6 +1175,19 @@ std::string humanBlock(const Result& r) {
       // cap, the generator was slower than the disk and this is a CPU number.
       // The stall SHARE, not the count: the count is volume/cap arithmetic and is
       // identical on a fast disk and a slow one, so it can never fail.
+      // The volume exceeding the limit only makes a throttle POSSIBLE. Whether
+      // dirty pages actually got there is measured, and it is what decides
+      // whether the tail of the curve is a throttled rate or just the tail.
+      if (c.dirtyLimitMib > 0) {
+        const double pct = 100.0 * c.peakDirtyMib / c.dirtyLimitMib;
+        const bool g = c.peakDirtyMib >= 1024;
+        appendf(s, "      writeback threshold %.1f GiB; volume %s it, and dirty pages peaked at "
+                   "%.1f %s (%.0f%%) — %s\n",
+                c.dirtyLimitMib / 1024.0, c.volumeExceedsDirtyLimit ? "exceeds" : "stays under",
+                g ? c.peakDirtyMib / 1024.0 : c.peakDirtyMib, g ? "GiB" : "MiB", pct,
+                pct >= 90 ? "the throttle WAS reached, so the tail is a throttled rate"
+                          : "writeback kept up, so no throttle was reached");
+      }
       appendf(s, "      writers blocked on the disk %.0f%% of their time%s\n",
               100.0 * c.stallShare,
               c.stallShare >= 0.25
@@ -1352,14 +1363,17 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
                "\"cachepath_stalls\":%llu,\"cachepath_stall_s\":%.1f,"
                "\"cachepath_stall_share\":%.3f,"
                "\"cachepath_flush_runs\":%llu,\"cachepath_flush_run_kib\":%.1f,"
-               "\"cachepath_crosses_dirty_limit\":%s,\"cachepath_entries\":%d,"
+               "\"cachepath_volume_exceeds_dirty_limit\":%s,"
+               "\"cachepath_peak_dirty_mib\":%.0f,\"cachepath_dirty_limit_mib\":%.0f,"
+               "\"cachepath_entries\":%d,"
                "\"cachepath_writers\":%d,\"cachepath_threads\":%d,"
                "\"cachepath_fill_block_kib\":%llu,\"cachepath_fill_buffer_mb\":%d",
             jesc(c.error).c_str(), static_cast<double>(c.sampleBytes) / (1ull << 20),
             static_cast<unsigned long long>(c.stalls), c.stallMs / 1000.0, c.stallShare,
             static_cast<unsigned long long>(c.flushRuns),
             c.flushRuns ? static_cast<double>(c.flushRunBytes) / c.flushRuns / 1024.0 : 0.0,
-            c.crossedDirtyLimit ? "true" : "false", c.entries, c.writers, c.threads,
+            c.volumeExceedsDirtyLimit ? "true" : "false", c.peakDirtyMib, c.dirtyLimitMib,
+            c.entries, c.writers, c.threads,
             static_cast<unsigned long long>(c.fillBlockKib), c.fillBufferMb);
     auto pj = [&s](const char* tag, const CachePhase& p) {
       appendf(s, ",\"cachepath_%s_mbps\":%.1f,\"cachepath_%s_dev_mbps\":%.1f,"
