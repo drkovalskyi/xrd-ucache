@@ -100,6 +100,15 @@ struct CacheBenchResult {
   // value to zero. Small units, and let the display pick.
   double peakDirtyMib = 0;  // max /proc/meminfo Dirty observed during the fill
   double dirtyLimitMib = 0; // what it would have had to reach
+  // A fill that ran out of space must not report a RATE. writePages returns void
+  // by design — a failed cache write is fail-open, the client's read still
+  // succeeds — so the loss is invisible at the call site and the byte counter
+  // would advance over bytes that never reached the device. Failing writes are
+  // fast, so the rate would come out INFLATED. The product already reports the
+  // loss (it counts a fail-open event, warns, and drops the staged pages), so
+  // these two carry it up: bytes the drains actually wrote, and events observed.
+  uint64_t fillFlushedBytes = 0;
+  uint64_t fillFailopens = 0;
   std::string error; // empty on success
 };
 

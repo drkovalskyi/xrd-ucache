@@ -75,6 +75,11 @@ run plan: 60.0 s per measurement, 10 measurements  ->  ~780 s (13 min)
   test file: build until 64.0 GiB or 180 s, whichever comes first
   threads: 32
 
+  disk budget for /data/cache (1787.6 GiB total, 291.8 GiB free)
+    test file                          64.0 GiB
+    kept free                          50.0 GiB  (10% of the filesystem, capped at 50)
+    peak                               64.0 GiB of 291.8 GiB free   OK
+
   Standard measurements
     sequential 4096 KiB read, QD1
     ...
@@ -137,6 +142,39 @@ this run has handed back.
 You need free space, not just a big disk — and on a **cache** directory,
 remember that a 64 GiB test file is 64 GiB the cache cannot use while the run
 lasts. If the cache is near its limit, that alone can trigger eviction.
+
+### The disk budget, decided and stated before anything is written
+
+You should not have to work out whether a command is safe. The tool computes its
+own budget, prints it in the plan, and holds itself to it:
+
+```
+  disk budget for /tmp/dmytro (159.4 GiB total, 146.0 GiB free)
+    test file                          32.0 GiB
+    uCache-path sample             up to 98.0 GiB  (max(2x the 25.7 GiB writeback limit, 30 s x this run's write rate), held to this ceiling)
+    kept free                          15.9 GiB  (10% of the filesystem, capped at 50)
+    peak                              130.0 GiB of 146.0 GiB free   OK
+```
+
+**The reserve is deliberately the same formula uCache's own free-space floor
+uses** — `min(50 GiB, 10% of the volume)`. A benchmark should not leave a
+filesystem in a state the product itself would have evicted to avoid. It also
+matters more than it looks: on one fleet machine `/tmp` is a directory on `/`, so
+"the disk is nearly full" there means the OS is nearly out of room, which is a
+different class of consequence than a slow benchmark.
+
+Four outcomes, all decided up front:
+
+| situation | what happens |
+|---|---|
+| everything fits | runs, `peak … OK` |
+| the test file plus the reserve does not fit | **refuses**, naming the `--size` that would fit |
+| an **explicit** `--cache-sample` does not fit | **refuses**, naming a size that does. An explicit request is never silently shrunk — that would defeat the point of asking |
+| the **automatic** sample does not fit | trims it and **says so with both numbers**: `NOTE: uCache-path sample reduced 85.4 -> 66.0 GiB to keep 15.9 GiB free` |
+
+A trimmed sample can fall below the writeback limit, at which point the fill
+stops being a throttled-rate measurement. The tool says that too, in the plan and
+again at the trim — it does not leave you to infer it from the sample size.
 
 Cleanup covers every way the measurement can end, including a failure partway
 through. It does **not** cover signals: if you interrupt a run with Ctrl-C or
@@ -606,9 +644,11 @@ of writing to the device, not of the measurement. Three rules follow:
   `<path>/.ucache-bench.*` by hand.
 - **Running it on a live cache directory consumes the space.** The test file is
   real, and on a near-full cache it can trigger eviction.
-- **`--cache-path` needs its sample on top of `--size`.** The pre-flight states
-  the arithmetic; a run that cannot fit says so up front rather than discovering
-  it in a half-finished stage.
+- **`--cache-path` needs its sample on top of `--size`.** You no longer have to
+  compute it: the plan prints the budget, the tool keeps `min(50 GiB, 10% of the
+  filesystem)` free, and it refuses or trims-and-announces rather than filling a
+  disk. What it cannot do is protect you from *another* writer on the same
+  filesystem during the run.
 - **`--threads` is not the core count.** It is what your jobs use.
 
 ---
@@ -751,8 +791,21 @@ faster source would tip it over.
 Sizing is automatic and worth understanding: the volume must exceed the kernel's
 dirty limit to show the throttle, and be long enough to be stable on a fast
 device, hence `max(2 × dirty limit, 30 s × measured write rate)`. The write rate
-comes from the standard block earlier in the same run. Peak disk usage is the
-sample, on top of whatever the standard stages hold.
+comes from the standard block earlier in the same run, and the result is held to
+the ceiling the plan printed — see [the disk
+budget](#the-disk-budget-decided-and-stated-before-anything-is-written). Peak disk
+usage is the sample, on top of whatever the standard stages hold.
+
+Note which term binds where. On slow storage it is the dirty limit; on **fast**
+storage it is the time term, and it grows without regard to the filesystem — 30 s
+at 3 GB/s asks for 85 GiB. That is why the ceiling exists.
+
+**A fill that runs out of space reports an error, not a number.** `writePages`
+returns void on purpose: a failed cache write is fail-open, so the client's read
+still succeeds and the failure is invisible at the call site. The stage therefore
+checks the product's own drain accounting afterwards, and refuses to publish a
+rate that is short — failing writes are fast, so an out-of-space fill would
+otherwise read *high*.
 
 ---
 
@@ -831,6 +884,8 @@ every other group, they describe a *release* on this storage.
 | `cachepath_volume_exceeds_dirty_limit` | false means the sample never reached the writeback threshold, so the fill figure is a RAM-absorption rate |
 | `cachepath_peak_dirty_mib`, `cachepath_dirty_limit_mib` | peak dirty pages during the fill, against the limit |
 | `cachepath_fill_sync_s` | the closing sync, excluded from the fill rate but part of the wall a real fill pays |
+| `cachepath_fill_flushed_mib` | bytes the product's drains actually wrote. Equal to the sample on a healthy fill; **short means the fill did not complete**, and the run reports an error rather than a rate |
+| `cachepath_fill_failopens` | fail-open events during the fill (a cache write that failed). Non-zero voids the fill: `writePages` returns void by design, so this is how a full disk becomes visible instead of becoming an inflated rate |
 
 Then one set per phase, with `<p>` one of `fill`, `read_byte`, `read_replica`:
 

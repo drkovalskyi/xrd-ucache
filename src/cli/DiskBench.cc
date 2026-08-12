@@ -457,6 +457,76 @@ Machine machineInfo() {
   return m;
 }
 
+// How much space this tool refuses to consume, whatever the sizing rule asks
+// for. Deliberately the SAME formula uCache's own free-space floor uses
+// (min(50 GiB, 10% of the volume)): the benchmark should not leave a filesystem
+// in a state the product would have evicted to avoid. A flat few GiB is too
+// little on a large volume and meaningless where the target sits on the root
+// filesystem — one fleet machine's /tmp is a directory on /, so "nearly full"
+// there means the OS is nearly out of room, which is a different class of
+// consequence than a slow benchmark.
+// Below this a sample measures nothing useful, so the stage is refused rather
+// than run for form's sake.
+constexpr uint64_t kMinCacheSample = 4ull << 30;
+
+uint64_t reserveForFs(uint64_t totalBytes) {
+  const uint64_t tenth = totalBytes / 10;
+  const uint64_t cap = 50ull << 30;
+  return std::max<uint64_t>(4ull << 30, std::min<uint64_t>(cap, tenth));
+}
+
+struct FsSpace {
+  uint64_t total = 0, freeB = 0;
+  bool ok = false;
+};
+
+FsSpace fsSpace(const std::string& path) {
+  FsSpace s;
+  struct ::statvfs vfs;
+  if (::statvfs(path.c_str(), &vfs) != 0)
+    return s;
+  s.total = static_cast<uint64_t>(vfs.f_blocks) * vfs.f_frsize;
+  s.freeB = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+  // Test hook: the interesting branches of the space policy (trim, refuse,
+  // sample below the writeback limit) are otherwise reachable only by actually
+  // filling a filesystem, which no hermetic gate can do without privileges.
+  if (const char* f = ::getenv("UCACHE_TEST_FREE_BYTES")) {
+    const unsigned long long v = std::strtoull(f, nullptr, 10);
+    if (v > 0) {
+      s.freeB = v;
+      if (s.total < v)
+        s.total = v;
+    }
+  }
+  s.ok = true;
+  return s;
+}
+
+double gib(uint64_t b) { return static_cast<double>(b) / static_cast<double>(1ull << 30); }
+
+// What the uCache-path stage may use, and what is left for it after the test
+// file. Returned in one place so the plan and the stage cannot disagree — the
+// plan promising a budget the stage then exceeds is worse than no plan.
+struct CacheBudget {
+  uint64_t reserve = 0;  // kept free, always
+  uint64_t ceiling = 0;  // most the sample may be (0 = the stage cannot run)
+  uint64_t testFile = 0; // what the test file will hold at peak
+  bool fits = false;     // a sample of any useful size is possible
+  bool crossesDirty = false; // ... and it can exceed the writeback limit
+};
+
+CacheBudget cacheBudget(const FsSpace& s, uint64_t testFileBytes, double dirtyLimitGb) {
+  CacheBudget b;
+  b.testFile = testFileBytes;
+  b.reserve = reserveForFs(s.total);
+  const uint64_t committed = testFileBytes + b.reserve;
+  b.ceiling = s.freeB > committed ? s.freeB - committed : 0;
+  b.fits = b.ceiling >= kMinCacheSample;
+  b.crossesDirty =
+      dirtyLimitGb > 0 && static_cast<double>(b.ceiling) > dirtyLimitGb * (1ull << 30);
+  return b;
+}
+
 std::string stamp(const char* fmt) {
   std::time_t t = std::time(nullptr);
   struct std::tm tmv;
@@ -1034,14 +1104,17 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
                "\"cachepath_peak_dirty_mib\":%.0f,\"cachepath_dirty_limit_mib\":%.0f,"
                "\"cachepath_entries\":%d,"
                "\"cachepath_writers\":%d,\"cachepath_threads\":%d,"
-               "\"cachepath_fill_block_kib\":%llu,\"cachepath_fill_buffer_mb\":%d",
+               "\"cachepath_fill_block_kib\":%llu,\"cachepath_fill_buffer_mb\":%d,"
+               "\"cachepath_fill_flushed_mib\":%.0f,\"cachepath_fill_failopens\":%llu",
             jesc(c.error).c_str(), static_cast<double>(c.sampleBytes) / (1ull << 20),
             static_cast<unsigned long long>(c.stalls), c.stallMs / 1000.0, c.stallShare,
             static_cast<unsigned long long>(c.flushRuns),
             c.flushRuns ? static_cast<double>(c.flushRunBytes) / c.flushRuns / 1024.0 : 0.0,
             c.volumeExceedsDirtyLimit ? "true" : "false", c.peakDirtyMib, c.dirtyLimitMib,
             c.entries, c.writers, c.threads,
-            static_cast<unsigned long long>(c.fillBlockKib), c.fillBufferMb);
+            static_cast<unsigned long long>(c.fillBlockKib), c.fillBufferMb,
+            static_cast<double>(c.fillFlushedBytes) / (1ull << 20),
+            static_cast<unsigned long long>(c.fillFailopens));
     auto pj = [&s](const char* tag, const CachePhase& p) {
       appendf(s, ",\"cachepath_%s_mbps\":%.1f,\"cachepath_%s_dev_mbps\":%.1f,"
                  "\"cachepath_%s_dev_op_kib\":%.1f,\"cachepath_%s_qd\":%.2f,"
@@ -1158,26 +1231,57 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   uint64_t want = std::max<uint64_t>(o.fileBytes, kMinFile);
   r.wantMb = static_cast<double>(want) / (1 << 20);
   // Peak usage is the test file plus, when --cache-path is given, the uCache-path
-  // sample — which is held alongside it so that no write measurement allocates
-  // into space another one freed. Pre-flighted with the arithmetic spelled out
-  // rather than discovered as a half-finished stage. The automatic sample size
-  // is at least 2x the dirty limit, which is the lower bound used here; the
-  // stage clamps to what is actually free when it starts.
-  const double cacheB =
-      o.cachePath ? (o.cacheSample ? static_cast<double>(o.cacheSample)
-                                   : r.env.mach.dirtyLimitGb * 2.0 * static_cast<double>(1ull << 30))
-                  : 0.0;
-  const double needB = static_cast<double>(want) + cacheB + (1ull << 30);
-  if (r.freeGb * static_cast<double>(1ull << 30) < needB) {
-    char msg[256];
+  // sample — held alongside it, so that no write measurement allocates into
+  // space another one freed. Everything below is decided BEFORE anything is
+  // written, and printed, because the alternative is what this replaced: a
+  // caller having to compute the machine's dirty limit by hand to find out
+  // whether their command was safe.
+  const FsSpace space = fsSpace(path);
+  const uint64_t reserve = reserveForFs(space.total);
+  if (space.freeB < want + reserve) {
+    char msg[320];
     std::snprintf(msg, sizeof msg,
-                  "not enough free space: need %.1f GiB = %.1f test file%s + 1 GiB slack, "
-                  "have %.1f GiB",
-                  needB / static_cast<double>(1ull << 30),
-                  static_cast<double>(want) / static_cast<double>(1ull << 30),
-                  cacheB > 0 ? " + the uCache-path sample (held alongside it)" : "", r.freeGb);
+                  "not enough free space: the %.1f GiB test file plus a %.1f GiB reserve "
+                  "(10%% of the filesystem, capped at 50) needs %.1f GiB, and %.1f GiB is free. %s",
+                  gib(want), gib(reserve), gib(want + reserve), gib(space.freeB),
+                  space.freeB > reserve + kMinFile
+                      ? ("reduce --size to " +
+                         std::to_string(static_cast<int>(gib(space.freeB - reserve))) +
+                         "g or less").c_str()
+                      : "This filesystem is too full for any run: free space first");
     r.error = msg;
     return r;
+  }
+  // The uCache-path sample is sized in-run (it needs the write rate this run
+  // measures), so what can be promised here is its CEILING — and the stage is
+  // held to it. A caller who is short on space learns it now, with the
+  // arithmetic, rather than from a quietly smaller sample an hour later.
+  if (o.cachePath) {
+    const CacheBudget b = cacheBudget(space, want, r.env.mach.dirtyLimitGb);
+    if (o.cacheSample && o.cacheSample > b.ceiling) {
+      char msg[400];
+      std::snprintf(msg, sizeof msg,
+                    "--cache-sample %.1f GiB does not fit: %.1f GiB free, minus the %.1f GiB "
+                    "test file and a %.1f GiB reserve, leaves %.1f GiB. Ask for %.0fg or less, "
+                    "or reduce --size. (An explicit sample is never silently shrunk.)",
+                    gib(o.cacheSample), gib(space.freeB), gib(want), gib(b.reserve),
+                    gib(b.ceiling), gib(b.ceiling));
+      r.error = msg;
+      return r;
+    }
+    if (!b.fits) {
+      char msg[320];
+      std::snprintf(msg, sizeof msg,
+                    "no room for the uCache-path stage: %.1f GiB free, minus the %.1f GiB test "
+                    "file and a %.1f GiB reserve, leaves %.1f GiB. Reduce --size to %.0fg, or "
+                    "drop --cache-path",
+                    gib(space.freeB), gib(want), gib(b.reserve), gib(b.ceiling),
+                    space.freeB > b.reserve + kMinCacheSample
+                        ? gib(space.freeB - b.reserve - kMinCacheSample)
+                        : 0.0);
+      r.error = msg;
+      return r;
+    }
   }
 
   char dir[4096];
@@ -1453,14 +1557,33 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       sample = static_cast<uint64_t>(std::max(std::max(byLimit, byTime),
                                               static_cast<double>(4ull << 30)));
     }
-    // Clamp to what is actually free NOW: the test file is still on disk and
-    // nothing has been released, and running out mid-phase would measure ENOSPC.
-    struct ::statvfs now;
-    if (::statvfs(path.c_str(), &now) == 0) {
-      const double freeB = static_cast<double>(now.f_bavail) * now.f_frsize;
-      const double room = freeB - static_cast<double>(4ull << 30);
-      if (room > 0 && static_cast<double>(sample) > room)
-        sample = static_cast<uint64_t>(room);
+    // Hold the sample to what is free NOW, minus the reserve — the test file is
+    // on disk and nothing has been released. Three rules, each of which was a
+    // defect first:
+    //   - the reserve is scaled to the filesystem, not a flat few GiB, and it is
+    //     kept even when free space is below it (the old guard was `room > 0`,
+    //     so it stopped protecting exactly when protection mattered);
+    //   - a trim is ANNOUNCED with both numbers. Silently returning a smaller
+    //     sample made the record's own `sample N GiB` line the only evidence,
+    //     and only for a reader who knew what to expect;
+    //   - an EXPLICIT --cache-sample is never trimmed; that case is refused in
+    //     the pre-flight above, before anything is written.
+    const FsSpace now = fsSpace(path);
+    if (now.ok) {
+      const uint64_t reserveNow = reserveForFs(now.total);
+      const uint64_t room = now.freeB > reserveNow ? now.freeB - reserveNow : 0;
+      if (sample > room) {
+        std::printf("  NOTE: uCache-path sample reduced %.1f -> %.1f GiB to keep %.1f GiB free "
+                    "(10%% of the filesystem, capped at 50)\n",
+                    gib(sample), gib(room), gib(reserveNow));
+        if (r.env.mach.dirtyLimitGb > 0 &&
+            static_cast<double>(room) < r.env.mach.dirtyLimitGb * (1ull << 30))
+          std::printf("        it is now BELOW the %.1f GiB writeback limit, so the fill will "
+                      "measure first-touch write cost, not a throttled rate\n",
+                      r.env.mach.dirtyLimitGb);
+        std::fflush(stdout);
+        sample = room;
+      }
     }
     CacheBenchOpts co;
     co.dir = dir;
@@ -1540,6 +1663,41 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   appendf(s, "  test file: build until %.1f GiB or %.0f s, whichever comes first\n",
           static_cast<double>(std::max<uint64_t>(o.fileBytes, kMinFile)) / (1ull << 30), buildCap);
   appendf(s, "  threads: %d\n", o.threads);
+  // The disk budget, per path, BEFORE anything is written. This exists because
+  // deciding whether a command was safe otherwise meant knowing the machine's
+  // dirty limit, the sizing rule and the free space by hand.
+  {
+    const Machine mach = machineInfo();
+    const uint64_t want = std::max<uint64_t>(o.fileBytes, kMinFile);
+    for (const auto& p : paths) {
+      const FsSpace sp = fsSpace(p);
+      if (!sp.ok)
+        continue;
+      const CacheBudget b = cacheBudget(sp, want, mach.dirtyLimitGb);
+      appendf(s, "\n  disk budget for %s (%.1f GiB total, %.1f GiB free)\n", p.c_str(),
+              gib(sp.total), gib(sp.freeB));
+      appendf(s, "    test file                      %8.1f GiB\n", gib(want));
+      if (o.cachePath) {
+        if (o.cacheSample)
+          appendf(s, "    uCache-path sample             %8.1f GiB  (--cache-sample)\n",
+                  gib(o.cacheSample));
+        else
+          appendf(s, "    uCache-path sample             up to %.1f GiB  (max(2x the %.1f GiB "
+                     "writeback limit, 30 s x this run's write rate), held to this ceiling)\n",
+                  gib(b.ceiling), mach.dirtyLimitGb);
+      }
+      appendf(s, "    kept free                      %8.1f GiB  (10%% of the filesystem, capped "
+                 "at 50)\n",
+              gib(b.reserve));
+      const uint64_t peak = want + (o.cachePath ? (o.cacheSample ? o.cacheSample : b.ceiling) : 0);
+      appendf(s, "    peak                           %8.1f GiB of %.1f GiB free   %s\n", gib(peak),
+              gib(sp.freeB), peak + b.reserve <= sp.freeB ? "OK" : "DOES NOT FIT");
+      if (o.cachePath && b.fits && !b.crossesDirty)
+        appendf(s, "    NOTE: the ceiling is below the %.1f GiB writeback limit, so the fill will "
+                   "measure first-touch write cost rather than a throttled rate\n",
+                mach.dirtyLimitGb);
+    }
+  }
   appendf(s, "\n  Standard measurements\n");
   appendf(s, "    sequential %llu KiB read, QD1\n",
           static_cast<unsigned long long>(o.blockBytes / 1024));

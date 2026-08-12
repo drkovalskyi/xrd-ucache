@@ -382,6 +382,44 @@ CacheBenchResult runCacheBench(const CacheBenchOpts& o) {
     finish(r.fill, d0, d1, t1 - t0, /*write=*/true);
     r.fill.curveN = filled;
     r.fill.ok = r.fill.bytes > 0;
+
+    // Did the bytes actually land? writePages cannot tell us — a failed cache
+    // write is fail-open by design and returns void — so ask the product what
+    // its drains wrote and whether any of them failed. A short fill means the
+    // rate above is over bytes that were never written, i.e. inflated, and the
+    // read phases would then be reading holes: stop rather than measure that.
+    r.fillFlushedBytes = store.stats().flushRunBytes.load();
+    r.fillFailopens = store.stats().failopenEvents.load();
+    // Test hook, in the BENCHMARK only — never in the product's write path. The
+    // branch below is the one that stops an out-of-space fill from publishing an
+    // inflated rate, and it is otherwise reachable only by filling a real
+    // filesystem, which a hermetic gate cannot do. Faking the accounting tests
+    // the DECISION; the accounting itself is checked on every healthy run
+    // (flushed == sample).
+    if (const char* lose = ::getenv("UCACHE_TEST_CACHE_LOSE_MIB")) {
+      const uint64_t mib = std::strtoull(lose, nullptr, 10) << 20;
+      r.fillFlushedBytes = r.fillFlushedBytes > mib ? r.fillFlushedBytes - mib : 0;
+    }
+    const uint64_t offered = r.fill.bytes;
+    // The byte comparison only holds while pages are STAGED: with
+    // fill_buffer_mb = 0 the product writes through and never records a drain,
+    // so flushed would read 0 and the check would fire on a healthy fill. The
+    // fail-open count is meaningful either way.
+    const bool staged = o.fillBufferMb != 0;
+    if (r.fillFailopens > 0 || (staged && r.fillFlushedBytes + blk < offered)) {
+      char msg[256];
+      std::snprintf(msg, sizeof msg,
+                    "fill did not complete: %.1f of %.1f GiB reached the disk in %llu drains, "
+                    "%llu write failure(s) — out of space? The rate is NOT a measurement (failing "
+                    "writes are fast, so it reads high); free space and rerun",
+                    static_cast<double>(r.fillFlushedBytes) / (1ull << 30),
+                    static_cast<double>(offered) / (1ull << 30),
+                    static_cast<unsigned long long>(store.stats().flushRuns.load()),
+                    static_cast<unsigned long long>(r.fillFailopens));
+      r.error = msg;
+      r.fill.ok = false;
+      return r;
+    }
   }
 
   // The product's own view of what it just did.
