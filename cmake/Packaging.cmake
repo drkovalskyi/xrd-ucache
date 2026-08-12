@@ -8,10 +8,20 @@
 # liblzma.so.5, libzstd.so.1, libz.so.1) — any XRootD 5.x client install
 # satisfies them; on EL9 that is EPEL's xrootd-client-libs.
 
+# The installed set must be CLOSED under the pointers it contains: a doc that
+# tells the reader to see another doc, which the package does not carry, is a
+# dead end on exactly the machine where they cannot go and fetch it. Closure is
+# TRANSITIVE and that is the whole reason to gate it rather than eyeball it —
+# both guides point at BENCH.md, which points at STATS.md, which points at
+# FORMAT.md. The packaging gate computes the closure and refuses to build a
+# package that breaks it (scripts/package-el9.sh).
 install(FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/docs/USER_GUIDE.md
   ${CMAKE_CURRENT_SOURCE_DIR}/docs/CACHE_MANAGEMENT.md
   ${CMAKE_CURRENT_SOURCE_DIR}/docs/TROUBLESHOOTING.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/docs/BENCH.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/docs/STATS.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/docs/FORMAT.md
   ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/xrd-ucache)
 

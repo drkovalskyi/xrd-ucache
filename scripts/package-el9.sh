@@ -62,6 +62,32 @@ case "${UCACHE_PKG_XROOTD_ROOT:+skip}$PLUGVER" in
   *) echo "FATAL: plugin handshake version '$PLUGVER' is not the 5.6 floor"; exit 1 ;;
 esac
 
+# Hard gate: the installed docs must be CLOSED under their own pointers. A
+# shipped guide that says "see docs/X.md" for a file the package omits is a
+# dead end precisely where the reader cannot fetch it — v0.18.4 shipped two
+# such pointers, and nothing noticed until a kit was unpacked by hand.
+# Stage a FRESH install rather than probing the build tree: a leftover doc dir
+# from an earlier run is stale by construction, and an empty or absent one makes
+# the loop below pass with nothing to check — which is how the first version of
+# this gate went green on a package that was already broken.
+DOCSTAGE=$(mktemp -d)
+env -u LD_LIBRARY_PATH "$CMAKE" --install "$BUILD" --prefix "$DOCSTAGE/usr" >/dev/null \
+  || { echo "FATAL: staging install for the doc gate failed"; exit 1; }
+DOCDIR=$(find "$DOCSTAGE" -type d -name xrd-ucache -path '*/doc/*' | head -1)
+[ -n "$DOCDIR" ] && [ -e "$DOCDIR/USER_GUIDE.md" ] \
+  || { echo "FATAL: doc gate found no installed docs (staged in $DOCSTAGE)"; exit 1; }
+MISSINGDOC=""
+for ref in $(grep -oh 'docs/[A-Za-z_]*\.md' "$DOCDIR"/*.md 2>/dev/null | sort -u); do
+  [ -e "$DOCDIR/$(basename "$ref")" ] || MISSINGDOC="$MISSINGDOC $ref"
+done
+if [ -n "$MISSINGDOC" ]; then
+  echo "FATAL: installed docs point at files the package does not ship:$MISSINGDOC"
+  echo "       add them to install(FILES ...) in cmake/Packaging.cmake, or stop citing them"
+  exit 1
+fi
+echo "installed docs are closed under their own pointers ($(ls "$DOCDIR"/*.md | wc -l) docs)"
+rm -rf "$DOCSTAGE"
+
 # Host quirk guard: rpm's brp-ldconfig hardcodes /sbin/ldconfig, which some
 # hosts (this dev box) lack; the script is a buildroot no-op for us anyway.
 RPM_ARGS=()
