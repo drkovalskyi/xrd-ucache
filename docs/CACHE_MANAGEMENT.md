@@ -441,7 +441,7 @@ use — not the core count, unless they are the same. The **standard**
 measurements are pinned at queue depths 1, 16 and 32 on every machine, which
 is what makes them comparable.
 
-The numbers come in two groups, because they answer different questions.
+The numbers come in three groups, because they answer different questions.
 **`docs/BENCH.md` documents every measurement, how to read it, and how well each
 one reproduces**; what follows is the summary.
 
@@ -460,7 +460,6 @@ concurrency, so they predict what a job will get here:
 
 | metric | what it corresponds to in uCache |
 |---|---|
-| fill pattern MB/s, buffered and O_DIRECT | the cold fill: one writer, ~48 KiB writes, new files created and extended. The pair shows whether the kernel merges those small writes into larger device writes |
 | random 48 KiB read at job concurrency | the byte cache, which serves at ~42 KiB with no locality between reads |
 | sequential 512 KiB read at job concurrency | a replica, which is branch-major, so consecutive reads land adjacent and reach ~599 KiB per operation |
 | sequential large-block read at job concurrency | streaming bandwidth under concurrency; **flat scaling vs QD1 means one stream already saturates the disk** |
@@ -473,10 +472,20 @@ where a device stops being operation-bound and turns bandwidth-bound, so neither
 can be interpolated from the standard measures. `--sweep` measures that curve
 directly.
 
+**Through uCache's own code** (`--cache-path`, off by default) — the third
+group, and the only one that is not an imitation. It fills a real cache on this
+storage and reads it back through the product's fill and read code, so it
+answers "what does uCache get here" instead of "what shape does this device
+like". There is no fill row among the pattern measures above for exactly this
+reason: a synthetic one measured 1.4× faster than a real cold fill of the same
+data on the same disk, and was retired rather than tuned. The price is that
+these figures belong to a **release** — they move when the write path does, so
+they are not comparable across versions the way the two groups above are.
+
 The write measurements cycle in place inside the one test file, so however long
-a window runs the file never grows past `--size`. Peak disk usage is a little
-above it — the fill stage holds its own file alongside — so budget
-`--size` + 256 MiB.
+a window runs the file never grows past `--size`, and peak disk usage is a
+little above it. `--cache-path` is the exception: it holds a real cache
+alongside the test file, so budget `--size` + the sample it reports in the plan.
 
 **Which write number to trust.** Building the test file is not a device
 measurement: it pays allocation, runs before anything has warmed up, and its

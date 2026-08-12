@@ -1341,8 +1341,8 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   // ===== probed. A number nobody chose, whether inherited from a queue-depth
   // ===== list or read off nproc, produces a "job concurrency" figure that is
   // ===== wrong wherever the job does not use every core. Without --threads
-  // ===== they are skipped; the fill and the writeback mix still run, because
-  // ===== their configuration is fully determined without it.
+  // ===== they are skipped; the writeback mix still runs, because its
+  // ===== configuration is fully determined without it.
   if (r.threads > 0) {
     if (!direct)
       evict(rfd);
@@ -1453,8 +1453,8 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       sample = static_cast<uint64_t>(std::max(std::max(byLimit, byTime),
                                               static_cast<double>(4ull << 30)));
     }
-    // Clamp to what is actually free NOW: the test file and both fill legs are
-    // still on disk, and running out mid-phase would measure ENOSPC.
+    // Clamp to what is actually free NOW: the test file is still on disk and
+    // nothing has been released, and running out mid-phase would measure ENOSPC.
     struct ::statvfs now;
     if (::statvfs(path.c_str(), &now) == 0) {
       const double freeB = static_cast<double>(now.f_bavail) * now.f_frsize;
@@ -1523,9 +1523,6 @@ std::string planBlock(const std::vector<std::string>& paths, const DiskBenchOpts
   // ladder, and the sequential and replica measurements still run either way —
   // so it is 10, not 9, and an estimate short by one whole window is exactly
   // the arithmetic the plan exists to remove.
-  // The two cold-fill legs are NOT window-bounded — they run until their volume
-  // is written — so they are counted separately, at their time cap, or the
-  // estimate would understate a slow device by minutes.
   const int measurements = 2 + nStd + 1                      // standard
                            + (pat ? (o.sweep ? 10 : 3) : 0) + 1; // pattern
   const double buildCap = std::max(W * 3, 10.0);

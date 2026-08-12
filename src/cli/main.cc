@@ -593,8 +593,8 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
       }
       opts.blockBytes = kb * 1024;
     } else if (a == "--fill" || a.rfind("--fill=", 0) == 0) {
-      // One flag, keyword list, so a sixth parameter later does not add a
-      // sixth flag: --fill writers=1,block=48k,file=256m
+      // One flag, keyword list, so a later parameter does not add another
+      // flag: --fill writers=4,block=48k
       const char* v = flagValue(argc, argv, i, 6);
       bool bad = !v || !*v;
       for (const char* p = v; !bad && *p;) {

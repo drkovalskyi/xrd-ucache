@@ -1,11 +1,14 @@
 // `ucache bench`: raw storage self-test of the cache dir (or any
 // candidate dir). Measures the access patterns ucache actually generates —
-// scattered small writes + fsync (the fill), random small reads at several
-// stream counts (hit serving; flat scaling exposes QoS quotas), large-block
-// reads and writes at several stream counts (the replica pattern and the
-// batched fill), sequential read, reads under writeback (the observed
+// random small reads at several stream counts (hit serving; flat scaling
+// exposes QoS quotas), large-block reads and writes at several stream counts
+// (the replica pattern), sequential read, reads under writeback (the observed
 // production killer mode), create/unlink (cleanup). RAW numbers only — no
 // verdicts; recommendations become a doctor feature once fleet data exists.
+// The FILL is deliberately not among them: an imitation of it measured 1.4x
+// FASTER than a real cold fill of the same data on the same disk, so it was
+// retired rather than tuned and the product's own code measures it instead
+// (--cache-path, CacheBench.h).
 //
 // Methodology (hardened by field probe failures): O_DIRECT when the
 // filesystem supports it (else buffered + posix_fadvise-evict, and the mode
@@ -15,10 +18,10 @@
 //
 // Three properties the numbers depend on, and which the output therefore
 // states outright:
-//   - The read and in-place write phases cycle inside the one test file, so a
-//     long window on a fast device cannot grow it beyond --size. The fill stage
-//     is the exception and is bounded by volume instead: it RETAINS what it
-//     writes, because a cache does.
+//   - Every phase cycles inside the one test file, so a long window on a fast
+//     device cannot grow it beyond --size. The --cache-path stage is the
+//     exception and is bounded by volume instead: it RETAINS what it writes,
+//     because a cache does.
 //   - Writing to fresh extents is not the same measurement as writing over
 //     allocated ones. The test-file build pays allocation and the in-place
 //     write does not, so their ratio is the cost of allocating on this device —
@@ -56,30 +59,17 @@ struct DiskBenchOpts {
   // points either side of it can locate it. Off by default: it is device
   // characterisation, worth doing once per device rather than every run.
   bool sweep = false;
-  // The fill stage models a COLD FILL, and every element of it is there because
-  // the previous version's shape was measured against a real one and found to
-  // overstate it by ~1.7x on the same disk:
-  //   - writes land at SCATTERED offsets in a SPARSE file, so every write is a
-  //     first touch that allocates. Appending to a dense file instead let the
-  //     kernel merge 48 KiB writes into ~510 KiB device writes, which a cache
-  //     never gets: its writes go wherever the analysis read, and the next one
-  //     is somewhere else.
-  //   - files are RETAINED for the whole stage, so free space falls and
-  //     garbage-collection pressure rises as it does during a real fill. The
-  //     previous version unlinked each file and recycled the same blocks.
-  //   - nothing is synced until the end, because a cache does not sync either
-  //     (fsync defaults to off). That is also the only way the stage can reach
-  //     the kernel's writeback throttle, which any fill larger than the dirty
-  //     limit spends most of its life in.
-  // Bounded by VOLUME rather than by a window, since the throttle knee is at a
-  // byte count: default 1.5x the machine's dirty limit, enough to cross it and
-  // still measure a sustained rate afterwards.
+  // The ARRIVAL PATTERN handed to the --cache-path stage: how many clients are
+  // filling at once and how long a contiguous run each one delivers before
+  // moving elsewhere. Both are measured from real jobs, and they are the ONLY
+  // thing about a fill this tool models — everything downstream of them
+  // (staging, sorting, coalescing, checksums, sidecars) is the product's code.
   int fillWriters = 4;               // --fill writers= (measured: ~4 in flight)
   uint64_t fillBlock = 48ull << 10;  // --fill block=   (measured mean run)
   // --cache-path: measure the storage through uCache's OWN fill and read code
-  // rather than through an imitation of it (docs plan; CacheBench.h). Opt-in for
-  // now: it changes the run's space and time profile substantially, and it is
-  // new. --cache-sample overrides the automatic volume, which is otherwise
+  // rather than through an imitation of it (CacheBench.h). Opt-in for now: it
+  // changes the run's space and time profile substantially, and it is new.
+  // --cache-sample overrides the automatic volume, which is otherwise
   // max(2x the kernel dirty limit, 30 s x the measured sequential write rate).
   bool cachePath = false;            // --cache-path
   uint64_t cacheSample = 0;          // --cache-sample (0 = automatic)

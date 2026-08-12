@@ -17,8 +17,8 @@ model does.
 is good; it produces the evidence you decide with.
 
 Contents: [running it](#running-it) · [what it does to the
-disk](#what-a-run-does-to-the-disk) · [the two groups of
-numbers](#the-two-groups-of-numbers) · [every measurement in
+disk](#what-a-run-does-to-the-disk) · [the three groups of
+numbers](#the-three-groups-of-numbers) · [every measurement in
 detail](#every-measurement-in-detail) · [through uCache's own
 code](#measuring-through-ucaches-own-code---cache-path) · [the run
 context](#the-run-context-block) · [reading a whole
@@ -36,7 +36,12 @@ The convention run, once per cache device:
 ucache bench --size 64g --measurement-duration 60 --threads 32 /path/to/cache
 ```
 
-That takes about 15 minutes. For a quick look, the defaults are much shorter:
+That takes about 13 minutes. Add `--cache-path` to measure the same storage
+through uCache's own code as well; that stage runs to a *volume* rather than a
+window, so it adds time the plan cannot price in advance (see [that
+section](#measuring-through-ucaches-own-code---cache-path)).
+
+For a quick look, the defaults are much shorter:
 
 ```sh
 ucache bench --threads 32                 # the configured cache dir, ~1 min
@@ -66,7 +71,7 @@ tool runs. A run is `measurements × duration`, plus building the test file. The
 tool prints that arithmetic up front so it never has to be guessed:
 
 ```
-run plan: 60.0 s per measurement, 12 measurements  ->  ~900 s (15 min)
+run plan: 60.0 s per measurement, 10 measurements  ->  ~780 s (13 min)
   test file: build until 64.0 GiB or 180 s, whichever comes first
   threads: 32
 
@@ -75,9 +80,13 @@ run plan: 60.0 s per measurement, 12 measurements  ->  ~900 s (15 min)
     ...
 ```
 
-12 measurements is the default shape (with `--threads`). `--sweep` raises it to
-19. The build stage gets **three times** the measurement window as its time cap,
+10 measurements is the default shape (with `--threads`). `--sweep` raises it to
+17. The build stage gets **three times** the measurement window as its time cap,
 which is why the total is larger than a first guess.
+
+The plan also lists the `--cache-path` stage when it is on, but **excludes it
+from the estimate and says so**: it is bounded by bytes, not seconds, so pricing
+it at the measurement duration would be a made-up number.
 
 Every measurement is time-boxed. That is what lets the tool finish on a volume
 delivering a few dozen IOPS, and it is why `--size` is a **ceiling, not a
@@ -165,15 +174,16 @@ cannot see, and it does not predict what a cold job gets.
 Build the file → `fdatasync` samples → random 4 KiB reads at QD1, 16, 32 →
 sequential read → sequential write → *(pattern reads: sequential at job
 concurrency, byte tier, replica tier)* → random 4 KiB write → reads under
-writeback → fill buffered → fill O_DIRECT → create/unlink.
+writeback → *(the uCache-path stage, with `--cache-path`)* → create/unlink.
 
-The order is fixed, and it matters: each stage inherits whatever device state
-its predecessor left. The fills run late, right after a stage that deliberately
-saturates the device with writes.
+The order is fixed, and it matters: each stage inherits whatever device state its
+predecessor left. The uCache-path stage runs last of the measurements, on a disk
+that the preceding stages have filled and written hard — which is the state a
+cache fill actually meets, and never a freshly trimmed one.
 
 ---
 
-## The two groups of numbers
+## The three groups of numbers
 
 They answer different questions and should not be mixed.
 
@@ -186,6 +196,13 @@ predictive of your job, because your job does not read like a datasheet.
 concurrency. They predict what a job gets on this storage. They are not
 comparable to anything published, and only comparable across machines if
 `--threads` matches.
+
+**The uCache-path stage** (`--cache-path`, off by default) is neither: it is not
+a pattern chosen to resemble the product, it *is* the product's fill and read
+code writing and reading a real cache on this storage. It answers "what does
+uCache get here", and its numbers belong to a **release** as much as to a device.
+Both groups above are frozen yardsticks that stay comparable as uCache changes;
+this one deliberately is not.
 
 QD1 appears in both roles: it is the latency reference and the denominator of
 every scaling factor. A device that returns the same IOPS at QD32 as at QD1 is
@@ -384,7 +401,9 @@ Field by field:
   whether `--threads` was a large or small fraction of the machine.
 - **writeback.** The dirty-page limit, in GiB, is how much buffered writing this
   machine can absorb before a writer blocks — the single most important number
-  for interpreting the buffered fill. The tool names *which* knob governs,
+  for interpreting a fill, and what the uCache-path stage sizes its sample
+  against, since a sample below it never meets the throttle. The tool names
+  *which* knob governs,
   because the kernel reports `dirty_ratio` as 0 when `vm.dirty_bytes` is set, and
   printing both flat reads as a contradiction.
 - **mount / device.** Resolved by matching the path's device number against the
@@ -489,6 +508,11 @@ A worked pass over one real run — 64 GiB test file, 60 s measurements,
    beforehand and 0.0% of reads / 0.0% of writes unattributed. Nothing else was
    on the disk.
 
+A record taken with `--cache-path` answers an eighth question — *what does
+uCache itself get here* — from its own block, and that one is read differently:
+see [through uCache's own
+code](#measuring-through-ucaches-own-code---cache-path).
+
 ### The other outcome: a capped volume
 
 The same command on a VM volume, for contrast. This is what you are looking for,
@@ -537,27 +561,41 @@ whether a difference between two machines is real.
 | sequential write in place, QD1 | ~6% | the quotable write figure |
 | random 4 KiB read, all depths | ~1–2% | the most stable numbers in the tool |
 | byte-tier and replica-tier reads | ~1% | |
-| uCache-path fill | not yet characterised | version-bound; repeat before comparing |
+| uCache-path reads | **0.6%** (byte tier) and **0.02%** (replica tier) across two runs on one disk with different sample sizes | as stable as the standard reads |
+| uCache-path fill | **9% band** across three runs on that disk (207.1, 220.3, 226.1 MB/s) | see below |
 | test-file creation | **up to 68%** | not a device measurement |
 | reads under writeback | not characterised | |
 
-Two rules follow:
+**Write rates carry a wider band than anything else here, and it is not a defect
+of the tool.** A write to a solid-state device is not a pure function of the
+request: garbage collection, over-provisioning and the drive's own write cache
+depend on history no benchmark can see, reset or schedule, and how much free
+space a stage starts with changes the answer. On these devices, single-run write
+differences under about 20% should not be interpreted. The reads through the very
+same code path, on the same runs, agreed to under 1% — so the band is a property
+of writing to the device, not of the measurement. Three rules follow:
 
+- **Read the curve before the average.** The per-eighth progression is measured
+  *inside* one run and does not depend on what the device did last week. A fill
+  that starts low and settles has told you both the first-touch cost and the
+  sustained rate, and neither of them is the single number on the line. When two
+  runs disagree, compare their curves: usually the shape is the same and only the
+  level moved.
 - **Compare like with like.** Same `--size`, same `--measurement-duration`, same
-  `--threads`, same mode (`O_DIRECT` vs `buffered`). The fill couples to
-  `--size`, and short windows bias the buffered fill low by around 8% because
-  the warm-up is a larger share of a shorter window.
+  `--threads`, same mode (`O_DIRECT` vs `buffered`), and for the uCache-path
+  stage the same `--cache-sample` and the same build — the sample size sets how
+  much of the run is past the writeback knee.
 - **A single measurement of a stateful device measures its state.** If a number
-  matters, take it twice. Repeating helps only where the shape line says the
-  samples are independent; where it says `DRIFTS`, more runs will not tighten
-  anything.
+  matters, take it twice; and if the two disagree, the reads are the ones to
+  trust, because they are the ones that reproduce.
 
 ---
 
 ## Pitfalls
 
 - **`--measurement-duration` is per measurement.** 60 does not mean a 60-second
-  run; it means about 15 minutes. Read the plan the tool prints.
+  run; it means about 13 minutes, and more with `--cache-path`. Read the plan
+  the tool prints.
 - **`--size` is a ceiling.** Check for `stopped at time cap` before comparing a
   file-size-dependent number against another machine.
 - **The default log is the working directory.** Running from a directory that
@@ -581,11 +619,11 @@ Two rules follow:
 |---|---|---|
 | `PATH ...` | the configured cache dir | one or more directories; several print a comparison table |
 | `--threads N` | **required** | job concurrency for the pattern measurements, 1–1024. Never guessed |
-| `--size SZ` | `1g` | test-file ceiling (floor 16 MiB); also caps the fill file at `SZ/4` per writer |
+| `--size SZ` | `1g` | test-file ceiling (floor 16 MiB) |
 | `--measurement-duration S` | `5` | seconds per measurement, 0–300. Aliases: `--phase-seconds`, `--seconds` |
 | `--block KB` | `4096` | block size for the sequential measurements; 4–65536 KiB, multiple of 4 |
 | `--fill k=v,...` | `writers=4,block=48k` | the arrival pattern the uCache-path stage generates |
-| `--sweep` | off | replace the single byte-tier point with a block ladder (4, 8, 16, 32, 48, 128, 512, 4096 KiB) to locate the operation-bound/bandwidth knee. 19 measurements instead of 12 |
+| `--sweep` | off | replace the single byte-tier point with a block ladder (4, 8, 16, 32, 48, 128, 512, 4096 KiB) to locate the operation-bound/bandwidth knee. 17 measurements instead of 10 |
 | `--cache-path` | off | also measure this storage **through uCache's own fill and read code** — see below |
 | `--cache-sample SZ` | automatic | volume for that stage; implies `--cache-path`. Automatic is `max(2 × the kernel dirty limit, 30 s × this run's measured sequential write rate)` |
 | `--log FILE` | `./ucache-bench.txt` | append the record here |
@@ -606,10 +644,35 @@ publication, sidecar rewrites, read-run coalescing and per-page verification are
 all the product's own code rather than an imitation of it. **The only thing
 modelled is the order in which offsets arrive.**
 
-Its numbers are properties of a **release**, not of the device alone: change the
-write path and they move. The record carries the build id for that reason, and
-these figures should not be compared across versions the way the standard block
-can be.
+### Why the imitation was retired
+
+This tool used to have a synthetic fill stage: threads writing 48 KiB blocks in
+the pattern a cache was believed to generate. On one SATA SSD it printed
+**432 MB/s** where a real cold fill of the same data on the same disk ran at
+**240** — and after its own measurement artefacts were corrected it was still
+**1.4× optimistic**. That is the wrong direction on the number someone would use
+to decide whether a location is worth caching on.
+
+The imitation was wrong in ways that were invisible until it was checked against
+the product:
+
+- it **appended to dense files**, so the kernel merged 48 KiB writes into
+  ~510 KiB device writes. A cache writes wherever the analysis happened to read,
+  into a **sparse** file, and each of those is a first touch that allocates.
+- it **unlinked each file** and recycled the same blocks, so it never paid what a
+  fill pays as free space falls.
+- it did not carry the product's staging, sorting, coalescing or checksums, all
+  of which sit between the arriving byte and the device.
+
+Every one of those is a decision the fill code makes, and the only way to have
+them all right is not to reimplement them. So the synthetic stage is gone rather
+than fixed, and what replaced it is the code that ships. The cost of that choice
+is stated plainly: these numbers are properties of a **release**, not of the
+device alone — change the write path and they move. The record carries the build
+id for that reason, and these figures should not be compared across versions the
+way the standard block can be.
+
+### The two passes
 
 Two phases, because they are the two different passes a real workload makes:
 
@@ -621,19 +684,69 @@ Two phases, because they are the two different passes a real workload makes:
   once (a second pass would answer from RAM), at both serving shapes: scattered
   ~48 KiB like the byte cache, and sequential ~512 KiB like a replica.
 
+### What it prints
+
+```
+  Through uCache's own code
+    sample 80.0 GiB over 8 entries, 48 KiB arrival runs, 4 writers, fill_buffer_mb 48
+    cold fill (writes only: staged pages serve reads)   207.1 MB/s   (device 220.7, 55.7 KiB/op, QD 14.5)   p99 0.04 ms
+      by eighth of volume: 201 209 209 211 222 223 236 256 MB/s
+      closing sync 133 s; product drained 1739363 runs averaging 48 KiB
+      writeback threshold 37.4 GiB; volume exceeds it, and dirty pages peaked at 30.3 GiB (81%) — writeback kept up, so no throttle was reached
+      writers blocked on the disk 64% of their time — the disk was the constraint, so this is a storage measurement
+    warm read, byte tier (scattered 48 KiB, QD32)    530.5 MB/s   (device 531.6, 47.2 KiB/op, QD 9.5)   p99 1.52 ms
+      by eighth of volume: 533 510 542 535 543 529 533 532 MB/s
+    warm read, replica tier (sequential 512 KiB, QD32)   560.3 MB/s   (device 560.3, 133.5 KiB/op, QD 38.1)   p99 14.44 ms
+      by eighth of volume: 554 561 562 562 562 563 563 MB/s
+```
+
+A SATA SSD, 80 GiB through the product. Four things in that block are worth
+naming, because none of them can be read off the standard measurements:
+
+- **the two tiers are 5.6% apart in throughput and 2.8× apart in device request
+  size** (47.2 vs 133.5 KiB). On this disk the replica tier's advantage converts
+  to almost nothing — bandwidth is the constraint, not operations. On a volume
+  that prices operations, the same pair separates sharply.
+- **the closing sync cost 133 s**, on top of the fill's own 6 minutes. It is
+  excluded from the rate on purpose — it is not a rate — but it is real wall time
+  a cache pays at the end, and on this run it was a fifth of the stage.
+- **the drains averaged 48 KiB, exactly the arrival size**, so the product's
+  sorting and coalescing recovered nothing here: with four writers scattered
+  across eight entries, staged pages rarely end up adjacent. The same figure was
+  157 KiB on another disk in the same fleet, and that difference is a property of
+  the filesystem and the arrival pattern, not of the code.
+- **dirty pages peaked at 81% of the kernel's threshold** — measured, not
+  assumed, and reproduced to 0.1 GiB across three runs.
+
 **Read the stall line first.** Making the source "infinitely fast" means
 generating bytes, which costs a memory copy and a checksum per page. If the fill
 threads never blocked on the staging cap, the generator was slower than the disk
 and the number is a CPU measurement wearing a storage label. The stage says which
-happened, every time.
+happened, every time, and shouts `!! TOO LITTLE` when the share is low enough to
+make the fill figure untrustworthy — a short sample on a fast disk is the usual
+way to see it.
 
-Two more things it reports that are easy to misread. The **device** figures
-include the filesystem's own writes — an extent and a journal record per
-scattered allocation — so device traffic legitimately exceeds the payload, and the
-mean device request size can fall below the block for the same reason. And the
-per-eighth curve is bucketed by *device* bytes, so a throttle knee lands at the
-byte count where it really happens; the line says whether the volume crossed the
-writeback threshold at all, because below it there is no throttle to see.
+**Every phase carries a per-eighth progression.** It is the within-run stability
+check, and it is the reason the read phases have one too: in the example above the
+byte tier varies 1.5% about its mean and the replica tier 0.8%, while the fill
+climbs 27% from first eighth to last. Reading those three lines together says the
+drift belongs to *writing* rather than to the run, the machine or something else
+competing for the disk — a conclusion the three averages alone cannot support.
+The buckets are cut by **device** bytes rather than elapsed time, so a throttle
+knee lands at the byte count where it really happens; a phase sometimes shows
+seven of the eight, since the last boundary is not always crossed before the
+phase ends.
+
+Two more things that are easy to misread. The **device** figures include the
+filesystem's own writes — an extent and a journal record per scattered allocation
+— so device traffic legitimately exceeds the payload, and the mean device request
+size can fall below the block for the same reason. And the writeback line says
+whether the volume crossed the threshold **at all**: below it there is no
+throttle to see, and the fill figure then describes a device absorbing writes
+into RAM. Crossing it is not the same as hitting it — in the example the volume
+is more than twice the limit, yet writeback kept up and dirty pages settled at
+81% of it. That is where a real fill lives: close enough that a slower disk or a
+faster source would tip it over.
 
 Sizing is automatic and worth understanding: the volume must exceed the kernel's
 dirty limit to show the throttle, and be long enough to be stable on a fast
@@ -700,6 +813,34 @@ Present only when `--threads` was given.
 | `pat_rand48k_read_mbps`, `_iops`, `_us_p99` | byte tier: random 48 KiB. With `--sweep`, one set per ladder size as `pat_rand<N>k_read_*` |
 | `pat_replica_read_mbps`, `pat_replica_read_iops` | replica tier: sequential 512 KiB |
 | `mixed_read_iops`, `mixed_us_p50/p99`, `mixed_write_mbps` | random 4 KiB reads under writeback, and what the competing writer got |
+
+### The uCache-path stage
+
+Present only with `--cache-path`. Read these together with `build_id`: unlike
+every other group, they describe a *release* on this storage.
+
+| field | meaning |
+|---|---|
+| `cachepath_error` | empty on success; the reason the stage failed otherwise. The rest of the group is still emitted |
+| `cachepath_sample_mib` | volume written and then read back, whether automatic or `--cache-sample` |
+| `cachepath_entries`, `cachepath_writers`, `cachepath_threads` | cache entries filled, fill writers, and reader concurrency (`--threads`) |
+| `cachepath_fill_block_kib`, `cachepath_fill_buffer_mb` | the arrival run length, and the per-entry staging cap the product was configured with |
+| `cachepath_stalls`, `cachepath_stall_s` | times a writer blocked on the staging cap, and how long in total |
+| `cachepath_stall_share` | that time as a fraction of writer thread-time — **the trust check**. Low means the byte generator, not the disk, set the pace |
+| `cachepath_flush_runs`, `cachepath_flush_run_kib` | drains the product issued, and their mean size — what its sorting and coalescing achieved on this filesystem |
+| `cachepath_volume_exceeds_dirty_limit` | false means the sample never reached the writeback threshold, so the fill figure is a RAM-absorption rate |
+| `cachepath_peak_dirty_mib`, `cachepath_dirty_limit_mib` | peak dirty pages during the fill, against the limit |
+| `cachepath_fill_sync_s` | the closing sync, excluded from the fill rate but part of the wall a real fill pays |
+
+Then one set per phase, with `<p>` one of `fill`, `read_byte`, `read_replica`:
+
+| field | meaning |
+|---|---|
+| `cachepath_<p>_mbps` | payload rate — bytes the cache moved, divided by the phase seconds |
+| `cachepath_<p>_dev_mbps`, `cachepath_<p>_dev_op_kib`, `cachepath_<p>_qd` | what the block device saw: rate, mean request size, mean queue depth. The device rate legitimately exceeds the payload — filesystem metadata is real traffic |
+| `cachepath_<p>_mib`, `cachepath_<p>_seconds` | payload and duration |
+| `cachepath_<p>_us_p50`, `cachepath_<p>_us_p99` | per-operation latency as the product issues them |
+| `cachepath_<p>_curve` | array of rates, one per eighth of the phase's **device** bytes. Usually seven entries — the last boundary is not always crossed. Use it to tell a drifting phase from a steady one within the run |
 
 ### Run context
 
