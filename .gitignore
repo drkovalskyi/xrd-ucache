@@ -2,6 +2,9 @@ build*/
 *.o
 *.so
 *.root
+# ...except the hermetic RNTuple test fixture, which the unit tests ASSERT on.
+# It is 6.5 KB and generating it needs ROOT, which the tests deliberately do not.
+!tests/data/rntuple_fixture.root
 __pycache__/
 .cache/
 compile_commands.json

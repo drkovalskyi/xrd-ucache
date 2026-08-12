@@ -76,7 +76,7 @@ struct Rewritten {
 
 } // namespace
 
-TEST(RNTupleFixture, ParsesWithTheStructureTheGateRelevsOn) {
+TEST(RNTupleFixture, ParsesWithTheStructureTheGateReliesOn) {
   auto m = parseRNTuple(fixture(), "");
   ASSERT_TRUE(m.error.empty()) << m.error;
   EXPECT_EQ(m.ntupleName, "Events");

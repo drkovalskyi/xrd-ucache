@@ -8,7 +8,7 @@ target_compile_definitions(ucache PRIVATE UCACHE_VERSION="${PROJECT_VERSION}") #
 # Build identity for measurement records. The version alone cannot distinguish
 # builds: it is a constant between releases, so several different binaries all
 # claim the same number and a benchmark record cannot say which produced it.
-# `--dirty` is the load-bearing part — a bare commit would name code that was
+# `--dirty` is the essential part — a bare commit would name code that was
 # not what ran whenever the tree had uncommitted edits.
 set(UCACHE_BUILD_ID "${PROJECT_VERSION}")
 find_package(Git QUIET)
