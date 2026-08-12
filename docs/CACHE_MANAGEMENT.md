@@ -367,7 +367,7 @@ month), a cron line does it with no config change and no root:
 
 ## 6. Choosing a cleanup approach
 
-The commands in §4 span from surgical to nuclear — pick by how much you know
+The commands in §4 span from targeted to wholesale — pick by how much you know
 about what you want gone:
 
 | You want to… | Use |

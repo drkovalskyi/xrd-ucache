@@ -1797,7 +1797,7 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       auto hot = tp::deriveHotBranches(fm, csrc, cfg.recompressCodecs);
       if (hot.empty()) {
         // Nothing to transcode here. Two very different reasons, and conflating
-        // them is what made a 100%-declined corpus read as "already optimal":
+        // them is what made a 100%-declined dataset read as "already optimal":
         // the entry may hold no fully-cached content at all, or its content may
         // be in a codec the policy does not list. In the second case the codec
         // we DID see is the one fact that tells the user what to change, and it
@@ -1962,7 +1962,7 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     seenCodecs += (seenCodecs.empty() ? "" : ",") + c;
   // Every state gets its own words. "nothing to do" used to absorb three
   // unrelated outcomes — already done, declined by codec policy, nothing
-  // cached — so a corpus the policy declined outright read as a healthy cache.
+  // cached — so a dataset the policy declined outright read as a healthy cache.
   char declinedSeg[256] = {0};
   if (declined.load())
     std::snprintf(declinedSeg, sizeof declinedSeg,
@@ -2044,7 +2044,7 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   closeFds();
   // Any build failure is a non-zero exit, not just a total one. A field run
   // finished 1416 of 1456 entries with 40 deterministic `build failed` lines
-  // and exited 0, so a script had no way to know the corpus was 97.3% covered
+  // and exited 0, so a script had no way to know the dataset was 97.3% covered
   // -- and partial coverage buys almost nothing, because the unreplicated
   // remainder paces the next read pass. Declined (codec) and incomplete (bytes
   // not cached) are legitimate outcomes and stay silent in the exit code.
@@ -3333,7 +3333,7 @@ int main(int argc, char** argv) {
     if (mode == RecompressMode::kDrain) {
       // The spawning plugin sizes this from its own thread count
       // (min(cores/2, threads/2)); a fixed clamp of 2 here was what limited
-      // background coverage to 8-18% of a large corpus. Still bounded, so a
+      // background coverage to 8-18% of a large dataset. Still bounded, so a
       // hand-typed --drain cannot oversubscribe the machine.
       unsigned hw = std::thread::hardware_concurrency();
       int cap = hw ? static_cast<int>(hw) : 4;

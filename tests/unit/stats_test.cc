@@ -42,7 +42,7 @@ TEST(Stats, JsonBodyHasAllCounters) {
   s.reqReadBytes.add(4096);
   s.hitReadSize.add(4096);
   std::string j = "{" + s.toJsonBody() + "}";
-  // Spot-check names and values (schema is docs/STATS.md and load-bearing).
+  // Spot-check names and values (schema is docs/STATS.md, and is relied on).
   EXPECT_NE(j.find("\"opens\":3"), std::string::npos);
   EXPECT_NE(j.find("\"hit_bytes\":12345"), std::string::npos);
   EXPECT_NE(j.find("\"crc_failures\":1"), std::string::npos);

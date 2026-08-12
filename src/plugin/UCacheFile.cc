@@ -1122,7 +1122,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   // Cache-freshness (UCACHE_REVALIDATE_S, default 7 days): if a
   // recent local entry is trusted, skip the remote open+stat entirely and
   // serve from cache — the origin is touched only if a genuine miss forces a
-  // lazy open (fail-open). This is the reliability lever: warm reads don't
+  // lazy open (fail-open). This is the reliability control: warm reads don't
   // depend on a flaky/loaded/WAN remote. UCACHE_REVALIDATE_S=0 (revalidate
   // every open) never enters here.
   if (!passthroughOnly_ && cfg.revalidateSeconds > 0) {
@@ -1370,7 +1370,7 @@ void queueRecompress(const std::string& url, const Config& cfg) {
   const std::string& exe = *helperExe; // resolved and checked above; outlives exit
   pid_t pid = 0;
   // How many transcodes the background drainer may run. A fixed two was far too
-  // few at scale: measured on a 1456-file corpus it reached only 8-18% coverage
+  // few at scale: measured on a 1456-file dataset it reached only 8-18% coverage
   // by the end of the fill pass, pushing the remainder into a ~400 s foreground
   // sweep -- the "build it while you work" model barely functioning.
   //

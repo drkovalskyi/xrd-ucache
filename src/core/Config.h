@@ -65,7 +65,7 @@ struct Config {
   // the window expires (`ucache rm <url>` forces a re-check). 0 = revalidate
   // on every open (the pre-0.9.1 default).
   int revalidateSeconds = 604800;         // UCACHE_REVALIDATE_S (7 days)
-  // UCACHE_OPEN_RETRIES (opt-in reliability lever):
+  // UCACHE_OPEN_RETRIES (opt-in reliability control):
   // additional attempts after the first for a TRANSIENT open failure (flaky/
   // loaded/WAN remote). 0 = off (default; the Open path is unchanged). Each
   // retry constructs a fresh XrdCl::File (a failed open is terminal on the
@@ -101,7 +101,7 @@ struct Config {
   Reclaim recompressReclaim = Reclaim::kSuperseded; // UCACHE_RECOMPRESS_RECLAIM
   // Background transcode jobs during a fill pass. 0 = auto, which is
   // min(cores/2, threads/2) of the process doing the reading; a fixed small
-  // number reached only 8-18% coverage on a large corpus, and the right share
+  // number reached only 8-18% coverage on a large dataset, and the right share
   // depends on how much of the machine the analysis is actually using.
   int recompressDrainJobs = 0;                   // UCACHE_RECOMPRESS_DRAIN_JOBS
   // `trace = io` writes a sampled per-operation JSON trace
