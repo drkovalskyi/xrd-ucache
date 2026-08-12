@@ -452,7 +452,7 @@ TEST(FileEntry, HitReadsCoalesceIntoOnePreadPerRun) {
 // read whole-pages-wide, so the bound that keeps it inside the request is the
 // only thing standing between "one big read" and a heap overflow — and slack in
 // a test buffer hides exactly that. Every read here goes into a buffer sized to
-// the request EXACTLY, with a guard byte immediately after it, across all four
+// the request EXACTLY, with a canary immediately after it, across all four
 // alignment shapes.
 TEST(FileEntry, CoalescedReadStaysInsideTheCallersBuffer) {
   Fixture fx(64 * 4096);
