@@ -169,6 +169,29 @@ not have to schedule anything. There are two ways to bound growth:
 | **Free-space floor** (default) | `UCACHE_MIN_FREE_BYTES`, or automatic | Use the disk freely; evict LRU whole entries whenever free space drops below the floor. Auto floor = `min(50 GiB, 10% of the volume)`, clamped to at most half of the free space at startup. |
 | **Hard size cap** (opt-in) | `UCACHE_MAX_BYTES` | Cap the cache at a fixed size; when it reaches 90% of the cap, evict down to 75%. |
 
+### How much space a replica adds
+
+Recompressed replicas are a first-class consumer of the same volume, and how
+much they add depends on what the source was compressed with — and, less
+obviously, on the container. The replica's own codec is fixed, so the multiplier
+is essentially how much better the source compressed than the replica does:
+
+| source | container | byte cache | replicas | multiplier |
+|---|---|--:|--:|--:|
+| LZMA-9 | TTree | 132.6 GiB | 161.6 GiB | **1.22×** |
+| LZMA-9 | RNTuple | 105.9 GiB | 110.3 GiB | **1.04×** |
+
+Same 1453 files and the same physics on both rows, 100% coverage, measured as
+on-disk footprint after a full sweep. A weakly compressed source (ZLIB-1, which
+is most NanoAOD) costs less again, for the same reason — re-encoding buys little
+when the source was not tightly packed.
+
+**Plan with the number for your data, not with a single figure.** `ucache
+recompress` estimates growth with a deliberate upper bound of 1.4×, which is
+above every case measured so far; that is the right bias for a warning and the
+wrong one for a decision, which is why the estimate no longer decides anything
+(the pass defers per file against live headroom instead).
+
 Eviction always removes **least-recently-used entries first** — ranked by when
 each file was last *read*, not when it was cached. That is the key point for
 your concern: **stale data you have stopped using is the first to go**, and hot
@@ -303,13 +326,16 @@ ucache recompress                      # builds what's missing + reclaims,
                                        # file by file, space freed as it goes
 ```
 
-Space first: replicas cost ~1.4× of the bytes they replace, and a sweep that
-does not fit triggers LRU eviction *mid-sweep* — which can evict the very
-data your next run needs and turn a warm loop into an origin-refetch storm.
-`ucache recompress` therefore estimates its net growth against the headroom
-to your eviction floor before building anything, prints the arithmetic, and
-asks for confirmation when it would not fit (`--yes` to override in scripts;
-on a non-tty it refuses without it). Check where you stand any time with the
+Space first: replicas cost between 1.04× and 1.22× of the bytes they replace
+on the datasets measured here (see §3), and a sweep that does not fit would
+trigger LRU eviction *mid-sweep* — which can evict the very data your next run
+needs and turn a warm loop into an origin-refetch storm. `ucache recompress`
+therefore checks headroom **per file, against live free space**, and defers any
+build that would not fit rather than evicting around it; deferred files are
+queued for a later pass and counted in the summary as `deferred (no space)`. It
+also prints its up-front estimate, which is advisory: at a flat 1.4× it is an
+upper bound on every case measured, so treating it as a verdict refused sweeps
+that would have fit. Check where you stand any time with the
 `headroom` line in `ucache status`.
 
 **Background recompression never evicts.** With `recompress = on` the builds

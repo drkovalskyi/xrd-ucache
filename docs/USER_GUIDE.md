@@ -375,8 +375,9 @@ from the origin on demand. See CACHE_MANAGEMENT §4 for details.
 Set expectations honestly: the replica removes *decompression* time only. A
 warm analysis that is 80% LZMA decode gets several× faster; one dominated by
 its own compute may gain 10%. One instrumented run with ROOT's
-`TTreePerfStats` tells you your ceiling before you spend the disk (~1.4× the
-cached bytes for LZMA ntuples; `ucache status` totals it, and superseded
+`TTreePerfStats` tells you your ceiling before you spend the disk (measured
+1.04–1.22× of the cached bytes on LZMA-9 sources, by container — see
+`docs/CACHE_MANAGEMENT.md` §3; `ucache status` totals it, and superseded
 original pages are hole-punched so the data is not stored twice). `ucache
 branches <url>` shows exactly which branches you read and their codecs.
 Escape hatches: `ucache set transpose off` stops serving replicas; `ucache

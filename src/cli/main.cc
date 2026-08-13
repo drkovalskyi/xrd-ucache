@@ -1518,14 +1518,18 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     closeFds();
     return 0;
   }
-  // Capacity pre-flight (sweep only): estimate the sweep's net disk
-  // growth against the headroom to the eviction trigger, and require explicit
-  // confirmation when the sweep would push the cache into eviction — the
-  // A real incident turned a warm 17-min loop into a 40-min origin-refetch
-  // storm because nothing said "this will not fit". The estimate is a
-  // deliberate UPPER BOUND (replica ≈ 1.4x of the candidates' resident bytes,
-  // the measured ZSTD-1/LZMA footprint ratio; reclaim credited only under
-  // `full`, where it is knowable) — shown, so the user can overrule it.
+  // Capacity pre-flight (sweep only): state what this sweep is likely to cost
+  // against the headroom to the eviction trigger. ADVISORY, and deliberately so
+  // since the per-file budget above now guards both modes: the estimate exists
+  // to tell a human what they are about to spend an hour on, not to decide
+  // whether the pass is safe. It cannot decide that honestly — it is a flat
+  // upper bound (1.4x of the candidates' resident bytes), while the measured
+  // ratio ranges from 1.04x to 1.45x with the source codec AND the container, so
+  // refusing on it declines sweeps that fit. One field run refused a sweep
+  // estimated at 148.3 GiB against 134.7 GiB of headroom; the replicas needed
+  // 110.3 GiB, and the campaign reported a full results table with an empty
+  // replica tier. What protects the floor is the per-file claim, which defers
+  // exactly the files that do not fit and reports them as `deferred (no space)`.
   if (!drain && !work.empty()) {
     uint64_t candBytes = 0;
     for (const auto& e : work)
@@ -1543,38 +1547,25 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
     io.spaceInfo(cfg.cacheDir, avail, total); // for the arithmetic printed below
     if (growth > headroom) {
       std::fprintf(stderr,
-                   "recompress: this sweep would NOT fit — LRU eviction would run mid-sweep "
-                   "and can evict the very data your next run needs (origin refetch storm):\n"
+                   "recompress: this sweep may not fit entirely — each file that does not is "
+                   "deferred, never evicted around:\n"
                    "  candidates        : %zu file(s), %s cached\n"
-                   "  replicas, est.    : up to %s (1.4x of the cached bytes)\n"
+                   "  replicas, est.    : up to %s (1.4x of the cached bytes — an UPPER bound; "
+                   "measured 1.04x-1.45x by source codec and container)\n"
                    "  reclaimed, est.   : %s (%s)\n"
                    "  net growth, est.  : up to %s\n"
                    "  headroom to floor : %s (disk free %s, eviction floor %s)\n"
-                   "free space first (`ucache evict --to-size`, `rm`, or `recompress_reclaim "
-                   "= full` to replace byte copies), or proceed knowingly.\n",
+                   "the pass builds what fits and defers the rest (`deferred (no space)` in the "
+                   "summary below). To fit more, free space first (`ucache evict --to-size`, "
+                   "`rm`, or `recompress_reclaim = full` to replace byte copies).\n",
                    work.size(), human(candBytes).c_str(), human(estReplicas).c_str(),
                    human(reclaimCredit).c_str(),
                    reclaimFull ? "reclaim full" : "reclaim superseded: counted as 0 — "
                                                   "punch size is unknowable before the build",
                    human(growth).c_str(), human(headroom).c_str(), human(avail).c_str(),
                    human(cfg.minFreeBytes).c_str());
-      if (yes) {
-        std::fputs("proceeding (--yes)\n", stderr);
-      } else if (::isatty(0)) {
-        std::fputs("proceed anyway? [y/N] ", stderr);
-        char buf[16] = {0};
-        if (!std::fgets(buf, sizeof buf, stdin) || (buf[0] != 'y' && buf[0] != 'Y')) {
-          std::fputs("recompress: aborted (nothing built)\n", stderr);
-          closeFds();
-          return 2;
-        }
-      } else {
-        std::fputs("recompress: refusing on a non-interactive stdin — rerun with --yes to "
-                   "override\n",
-                   stderr);
-        closeFds();
-        return 2;
-      }
+      if (yes)
+        std::fputs("proceeding (--yes; the estimate is advisory either way)\n", stderr);
     }
   }
   if (jobs < 1)
@@ -1587,7 +1578,15 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
   // matters. What the pass must track itself is only the bytes it has promised
   // but not yet written — once a build lands, statvfs sees it.
   // Guard applies whenever eviction is enabled at all; ~0ull means it is off.
-  const bool budgetGuard = drain && headroomToFloor(cfg, io) != ~0ull;
+  // Applies to BOTH modes. It used to be background-only, on the reasoning that
+  // a sweep asks the user up front — but an up-front estimate is not a guard:
+  // once approved, nothing re-checked the floor, so a sweep whose estimate was
+  // low (or that ran beside another writer) evicted anyway; and a sweep whose
+  // estimate was HIGH built nothing at all, which is how a field run produced a
+  // complete-looking results table with an empty replica tier. The per-file
+  // claim below is the real protection — live headroom, one file at a time —
+  // and it works the same whoever asked for the pass.
+  const bool budgetGuard = headroomToFloor(cfg, io) != ~0ull;
   std::atomic<uint64_t> inFlight{0};
   std::atomic<int> deferred{0};
   std::atomic<uint64_t> deferBytes{0};
@@ -1658,11 +1657,11 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         ++failed;
         continue;
       }
-      // Capacity budget (background only): a replica this pass writes must fit
-      // in the headroom above the eviction floor. The sweep asks the user up
-      // front; the drainer has no tty by construction, so it decides for itself
-      // and declines — background recompression must never be the thing that
-      // pushes a volume into eviction. Deciding per file rather than per batch
+      // Capacity budget: a replica this pass writes must fit in the headroom
+      // above the eviction floor. Neither mode may be the thing that pushes a
+      // volume into eviction, and neither can know up front what it will cost —
+      // so both decide here, per file, against live headroom. Deciding per file
+      // rather than per batch
       // matters under `recompress_reclaim = full`, where each build hands back
       // the v1 copy and so pays for the next one.
       // Charge the FULL estimate, with no credit for the byte copy that
