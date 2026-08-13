@@ -338,6 +338,32 @@ Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw) {
   if (m.pageListNbytes) sup.push_back({m.pageListOffset, m.pageListNbytes});
   if (m.anchor.nbytesFooter) sup.push_back({m.anchor.seekFooter, m.anchor.nbytesFooter});
 
+  // RESERVE THE FILE HEAD, even where it is genuinely superseded. A reader takes
+  // the head as ONE OPAQUE BLOCK and asks for bytes it will never interpret:
+  // ROOT's raw-file layer requests 4 KiB and then 128 KiB at offset 0, measured
+  // identically on a 1.4 MB file and a 2.4 GB one. Reclaiming inside that window
+  // buys nothing and costs a round trip — the block read spans the hole, misses,
+  // refetches the whole 128 KiB from the origin, and writes the same pages back,
+  // so the range ends up resident anyway with a fetch paid for it. Keeping it is
+  // therefore free in the steady state, and it is what makes a warm pass over a
+  // replicated entry reach origin_bytes == 0.
+  //
+  // The pages themselves ARE dead: their recompressed copies live in the appended
+  // extent, and nothing in the rewritten file points here. That is exactly why
+  // the distinction matters — deadness is a property of the bytes, and this is a
+  // property of how they are asked for.
+  constexpr uint64_t kHeadReserve = 128 * 1024;
+  for (auto& r : sup) {
+    if (r.off < kHeadReserve) {
+      const uint64_t end = r.off + r.len;
+      r.off = kHeadReserve;
+      r.len = end > kHeadReserve ? end - kHeadReserve : 0;
+    }
+  }
+  sup.erase(std::remove_if(sup.begin(), sup.end(),
+                           [](const ReplicaMeta::Range& r) { return r.len == 0; }),
+            sup.end());
+
   // Merge, so reclaim is a few large punches rather than one per page.
   std::sort(sup.begin(), sup.end(),
             [](const auto& a, const auto& b) { return a.off < b.off; });
