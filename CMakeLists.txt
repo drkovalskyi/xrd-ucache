@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xrd-ucache VERSION 0.19.0 LANGUAGES CXX) # SemVer; single source of truth for the version
+project(xrd-ucache VERSION 0.19.1 LANGUAGES CXX) # SemVer; single source of truth for the version
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
