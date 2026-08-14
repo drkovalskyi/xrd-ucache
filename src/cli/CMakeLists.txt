@@ -2,7 +2,18 @@
 # no XRootD, no runtime Python. When the transposer library is available
 # (codec libs present), `materialize` also works natively;
 # otherwise it requires --import (the Python-bridge overlay). Installed to bin/.
-add_executable(ucache main.cc DiskBench.cc CacheBench.cc)
+# The storage self-test measures with O_DIRECT and per-device counters, neither
+# of which exists outside Linux. Rather than hold the whole CLI hostage to it —
+# every other subcommand is platform-independent — the subcommand keeps its
+# argument handling and declines at the point of measurement.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(UCACHE_DISKBENCH_SRC DiskBench.cc CacheBench.cc)
+else()
+  set(UCACHE_DISKBENCH_SRC DiskBenchUnsupported.cc)
+  message(STATUS "ucache: `bench` storage self-test unavailable on ${CMAKE_SYSTEM_NAME}")
+endif()
+
+add_executable(ucache main.cc ${UCACHE_DISKBENCH_SRC})
 target_compile_definitions(ucache PRIVATE UCACHE_VERSION="${PROJECT_VERSION}") # `ucache --version`
 
 # Build identity for measurement records. The version alone cannot distinguish

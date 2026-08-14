@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <sys/stat.h> // stat/S_ISREG below; glibc supplies it transitively, other libcs do not
 #include <unistd.h>
 
 namespace ucache {

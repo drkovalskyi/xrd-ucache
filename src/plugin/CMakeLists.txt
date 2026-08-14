@@ -27,7 +27,13 @@ set_target_properties(XrdClUCache PROPERTIES PREFIX "lib" SUFFIX ".so")
 # our detached executor threads (and the atexit stats dump) still execute
 # code from this .so — unmapping it is a guaranteed exit-time SEGV
 # (found by TSan). DF_1_NODELETE makes dlclose a no-op for this library.
-target_link_options(XrdClUCache PRIVATE "-Wl,-z,nodelete")
+# The flag is GNU-ld only. Where it does not exist the library asks the loader
+# for the same guarantee at init instead, and the definition below is what tells
+# it which case it is in — so the two halves cannot drift apart.
+if (NOT APPLE)
+  target_link_options(XrdClUCache PRIVATE "-Wl,-z,nodelete")
+  target_compile_definitions(XrdClUCache PRIVATE UCACHE_LINK_NODELETE=1)
+endif()
 
 # Relocatable install: drop the baked LCG build RPATH in favour of
 # $ORIGIN; the host's libXrdCl is resolved by ld.so as a normal NEEDED lib. The

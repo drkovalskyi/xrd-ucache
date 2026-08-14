@@ -52,6 +52,36 @@ jobs:
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 1 1
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 8 2
 
+  # macOS: keep the tree compiling under AppleClang and run the hermetic tests.
+  # Build-and-test only, deliberately: reading root:// through the plugin needs a
+  # real client stack and a real origin, and is validated on hardware instead.
+  # The `bench` storage self-test does not exist here (see src/cli/CMakeLists.txt).
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: codec libraries (build + test the transposer too)
+        run: brew install xz zstd lz4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF
+             -DUCACHE_BUILD_PLUGIN=OFF -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+      - run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: unit + differential (1e5 ops)
+        run: cd build && ctest --output-on-failure -E crash-suite
+      - name: plugin, when an XRootD client is installable
+        run: |
+          # Not a required leg: the point of the job is the compiler, and the core
+          # plus CLI above already exercise most of it. If the formula is missing
+          # or broken the plugin's own warnings simply go unchecked here, which is
+          # worth saying out loud rather than failing the build over.
+          if ! brew install xrootd; then
+            echo "::warning::no installable xrootd — plugin compile not checked on macOS"
+            exit 0
+          fi
+          cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF \
+                -DUCACHE_BUILD_TESTS=OFF -DUCACHE_XROOTD_ROOT="$(brew --prefix)" \
+                -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+          cmake --build build-plugin -j"$(sysctl -n hw.ncpu)"
+
   # Zero-admin acceptance: install -> `ucache setup` (no root) ->
   # new-shell cached read (warm origin=0) -> fail-open, all in a CLEAN container
   # (no CVMFS/LCG). Alma9 gates it; Ubuntu is best-effort (needs xrootd-dev >=5.6).

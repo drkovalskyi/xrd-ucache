@@ -3,7 +3,9 @@
 #include <cerrno>
 #include <dirent.h>
 #include <fcntl.h>
-#include <linux/falloc.h>
+#if !defined(__APPLE__)
+#include <linux/falloc.h> // FALLOC_FL_*; Darwin punches through fcntl instead
+#endif
 #include <sys/file.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -59,7 +61,21 @@ int64_t RealIO::pread(int fd, void* buf, uint64_t count, uint64_t offset) {
 int64_t RealIO::pwrite(int fd, const void* buf, uint64_t count, uint64_t offset) {
   return retErrno64(::pwrite(fd, buf, count, offset));
 }
-int RealIO::fdatasync(int fd) { return retErrno(::fdatasync(fd)); }
+int RealIO::fdatasync(int fd) {
+#if defined(__APPLE__)
+  // Darwin's fdatasync() is not the same trade: this platform's documented
+  // durability primitive is fcntl(F_FULLFSYNC), a full device-cache barrier
+  // that can cost tens of milliseconds. This runs once per entry at publish,
+  // so paying a barrier here would dominate the fill it is meant to make
+  // durable. fsync() is the closer equivalent of what fdatasync() costs
+  // elsewhere: the data and the size reach the filesystem, and a power cut can
+  // still lose what the drive is holding in its own cache — the same exposure
+  // this code already accepts everywhere else.
+  return retErrno(::fsync(fd));
+#else
+  return retErrno(::fdatasync(fd));
+#endif
+}
 int RealIO::ftruncate(int fd, uint64_t length) { return retErrno(::ftruncate(fd, length)); }
 int RealIO::fstat(int fd, struct ::stat* st) { return retErrno(::fstat(fd, st)); }
 int RealIO::stat(const std::string& path, struct ::stat* st) {
@@ -112,10 +128,25 @@ int RealIO::punchHole(int fd, uint64_t offset, uint64_t length) {
   if (length == 0)
     return 0;
   int r;
+#if defined(__APPLE__)
+  // APFS punches through fcntl. The range must land on filesystem block
+  // boundaries or the call is refused outright; every caller here punches
+  // whole cache pages, so that holds by construction. A filesystem that
+  // declines (or does not implement it at all) simply keeps the bytes: a
+  // failed punch costs space reclaim and nothing else, which is why this
+  // returns the error instead of pretending to have freed anything.
+  ::fpunchhole_t hole = {};
+  hole.fp_offset = static_cast<off_t>(offset);
+  hole.fp_length = static_cast<off_t>(length);
+  do {
+    r = ::fcntl(fd, F_PUNCHHOLE, &hole);
+  } while (r < 0 && errno == EINTR);
+#else
   do {
     r = ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                     static_cast<off_t>(offset), static_cast<off_t>(length));
   } while (r < 0 && errno == EINTR);
+#endif
   return retErrno(r);
 }
 

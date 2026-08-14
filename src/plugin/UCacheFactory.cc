@@ -12,6 +12,7 @@
 
 #include <XrdVersion.hh>
 
+#include <dlfcn.h>
 #include <mutex>
 
 namespace ucache {
@@ -26,7 +27,32 @@ std::shared_ptr<CacheStore>* gStore = nullptr;
 // conf files name this library.
 std::map<std::string, std::string>* gPluginConf = nullptr;
 
+// Keep this library mapped for the life of the process. XrdCl's plugin manager
+// dlcloses plugin libraries at teardown, while our detached executor threads and
+// the atexit stats dump still execute code from this image — unmapping it is an
+// exit-time crash, not a leak. Where the link step could mark the library
+// non-unloadable it already has (UCACHE_LINK_NODELETE) and there is nothing to
+// do here; otherwise the loader is asked for the same guarantee by re-opening
+// this image with RTLD_NODELETE and never closing the handle.
+void pinSelfInMemory() {
+#ifndef UCACHE_LINK_NODELETE
+  ::Dl_info info{};
+  // dladdr reports success as NON-zero, unlike most of what surrounds it.
+  if (::dladdr(reinterpret_cast<const void*>(&pinSelfInMemory), &info) == 0 || !info.dli_fname) {
+    UCACHE_WARN("could not identify this plugin's own library file; it stays unloadable only "
+                "if the loader chooses to keep it");
+    return;
+  }
+  // Leaked deliberately: closing this handle is exactly what it exists to
+  // prevent. One extra reference on an already-loaded image costs nothing.
+  if (::dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE) == nullptr)
+    UCACHE_WARN("could not pin %s in memory (%s); a plugin unload during teardown could crash "
+                "at exit", info.dli_fname, ::dlerror());
+#endif
+}
+
 void initGlobals() {
+  pinSelfInMemory(); // before any thread exists that could outlive an unload
   // Leaked intentionally: destruction order against XrdCl teardown and the
   // executor threads is unknowable; the final stats dump happens via atexit.
   gConfig = new Config(Config::fromEnv(gPluginConf));

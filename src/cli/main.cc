@@ -24,10 +24,15 @@ namespace tp = ucache::transpose;
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
 #include <dlfcn.h>
+#if defined(__APPLE__)
+#include <limits.h>
+#include <mach-o/dyld.h> // _NSGetExecutablePath: this platform's /proc/self/exe
+#endif
 #include <atomic>
 #include <mutex>
 #include <set>
@@ -498,6 +503,29 @@ int cmdStatsFiles(const Config& cfg, size_t topN) {
   return 0;
 }
 
+// Absolute path of the running binary, or empty when it cannot be determined.
+// Used to find things installed beside us — the netbench helper, the plugin
+// library — so a build tree and an install tree both work without configuration.
+// Empty is a normal answer, not an error: every caller falls back to a search.
+std::string selfExePath() {
+  char buf[4096];
+#if defined(__APPLE__)
+  uint32_t size = sizeof buf;
+  if (_NSGetExecutablePath(buf, &size) != 0)
+    return {};
+  // Unlike the symlink other platforms expose, what the loader returns here is
+  // whatever argv[0] resolved to: it may be relative and may contain symlinks,
+  // and both break "look next to me".
+  char resolved[PATH_MAX];
+  if (::realpath(buf, resolved))
+    return resolved;
+  return buf;
+#else
+  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
+  return n > 0 ? std::string(buf, static_cast<size_t>(n)) : std::string();
+#endif
+}
+
 // `ucache netbench`: thin front for the ucache-netbench
 // helper — the origin-baseline companion of `bench`. A separate binary
 // because it needs XrdCl, which this CLI deliberately does not link (same
@@ -506,10 +534,7 @@ int cmdNetbench(int argc, char** argv) {
   std::vector<std::string> cands;
   if (const char* v = ::getenv("UCACHE_NETBENCH"))
     cands.push_back(v);
-  char buf[4096];
-  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
-  if (n > 0) {
-    std::string exe(buf, static_cast<size_t>(n));
+  if (std::string exe = selfExePath(); !exe.empty()) {
     auto slash = exe.rfind('/');
     std::string bindir = slash == std::string::npos ? "." : exe.substr(0, slash);
     cands.push_back(bindir + "/ucache-netbench");          // install tree (bin/)
@@ -2363,9 +2388,7 @@ std::string homeDir() {
 std::string pluginSoPath() {
   if (const char* v = ::getenv("UCACHE_PLUGIN_SO"))
     return v;
-  char buf[4096];
-  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);
-  std::string exe = n > 0 ? std::string(buf, n) : "";
+  std::string exe = selfExePath();
   auto dir = [](const std::string& p) {
     auto s = p.rfind('/');
     return s == std::string::npos ? std::string(".") : p.substr(0, s);
