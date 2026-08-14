@@ -32,7 +32,7 @@ TEST(Crc32c, SwPathCheckVector) {
 
 TEST(Crc32c, HwAndSwAgree) {
   if (!detail::crc32cHwAvailable())
-    GTEST_SKIP() << "no SSE4.2";
+    GTEST_SKIP() << "no hardware CRC32C in this build";
   for (uint64_t seed : {1u, 2u, 3u}) {
     auto buf = test::randomBytes(4096 + seed * 13, seed);
     EXPECT_EQ(detail::crc32cHw(0, buf.data(), buf.size()),

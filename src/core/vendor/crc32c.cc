@@ -6,6 +6,11 @@
 #include <cpuid.h>
 #include <nmmintrin.h>
 #define UCACHE_CRC32C_HW 1
+#define UCACHE_CRC32C_HW_X86 1
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#define UCACHE_CRC32C_HW 1
+#define UCACHE_CRC32C_HW_ARM 1
 #endif
 
 namespace ucache {
@@ -37,7 +42,7 @@ uint32_t swCrc(uint32_t crc, const uint8_t* p, size_t len) {
   while (len >= 8) {
     uint64_t v;
     __builtin_memcpy(&v, p, 8);
-    v ^= crc; // little-endian host assumed (x86_64/aarch64 Linux)
+    v ^= crc; // little-endian host assumed (x86_64/aarch64)
     crc = table[7][v & 0xFF] ^ table[6][(v >> 8) & 0xFF] ^ table[5][(v >> 16) & 0xFF] ^
           table[4][(v >> 24) & 0xFF] ^ table[3][(v >> 32) & 0xFF] ^
           table[2][(v >> 40) & 0xFF] ^ table[1][(v >> 48) & 0xFF] ^ table[0][(v >> 56) & 0xFF];
@@ -50,13 +55,23 @@ uint32_t swCrc(uint32_t crc, const uint8_t* p, size_t len) {
 }
 
 #ifdef UCACHE_CRC32C_HW
-bool cpuHasSse42() {
+bool cpuHasHwCrc() {
+#ifdef UCACHE_CRC32C_HW_X86
   unsigned eax, ebx, ecx, edx;
   if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx))
     return false;
   return (ecx & bit_SSE4_2) != 0;
+#else
+  // AArch64 asks the question at build time instead. The instruction is only
+  // compiled in when the target declares the CRC32 extension, which is the same
+  // contract as every other baseline instruction in the binary — and it is
+  // mandatory from ARMv8.1 onwards, so a target that lacks it is a deliberately
+  // old one, where the macro is simply undefined and this whole path is gone.
+  return true;
+#endif
 }
 
+#ifdef UCACHE_CRC32C_HW_X86
 __attribute__((target("sse4.2"))) uint32_t hwCrc(uint32_t crc, const uint8_t* p, size_t len) {
   uint64_t c = ~crc;
   while (len && (reinterpret_cast<uintptr_t>(p) & 7)) {
@@ -74,6 +89,29 @@ __attribute__((target("sse4.2"))) uint32_t hwCrc(uint32_t crc, const uint8_t* p,
     c = _mm_crc32_u8(static_cast<uint32_t>(c), *p++);
   return ~static_cast<uint32_t>(c);
 }
+#else
+// Same shape and the same inversion convention as the x86 path above. The
+// alignment head is not required here — AArch64 loads need no alignment — but
+// keeping the two loops identical means a divergence between them is a
+// difference in the intrinsics, not in the surrounding arithmetic.
+uint32_t hwCrc(uint32_t crc, const uint8_t* p, size_t len) {
+  uint32_t c = ~crc;
+  while (len && (reinterpret_cast<uintptr_t>(p) & 7)) {
+    c = __crc32cb(c, *p++);
+    --len;
+  }
+  while (len >= 8) {
+    uint64_t v;
+    __builtin_memcpy(&v, p, 8);
+    c = __crc32cd(c, v);
+    p += 8;
+    len -= 8;
+  }
+  while (len--)
+    c = __crc32cb(c, *p++);
+  return ~c;
+}
+#endif
 #endif
 
 bool useHw = false;
@@ -85,7 +123,7 @@ uint32_t crc32c(uint32_t crc, const void* data, size_t len) {
   std::call_once(initFlag, [] {
     initTables();
 #ifdef UCACHE_CRC32C_HW
-    useHw = cpuHasSse42();
+    useHw = cpuHasHwCrc();
 #endif
   });
   const auto* p = static_cast<const uint8_t*>(data);
@@ -102,7 +140,7 @@ uint32_t crc32cSw(uint32_t crc, const void* data, size_t len) {
   std::call_once(initFlag, [] {
     initTables();
 #ifdef UCACHE_CRC32C_HW
-    useHw = cpuHasSse42();
+    useHw = cpuHasHwCrc();
 #endif
   });
   return swCrc(crc, static_cast<const uint8_t*>(data), len);
@@ -110,7 +148,7 @@ uint32_t crc32cSw(uint32_t crc, const void* data, size_t len) {
 
 uint32_t crc32cHw(uint32_t crc, const void* data, size_t len) {
 #ifdef UCACHE_CRC32C_HW
-  if (cpuHasSse42())
+  if (cpuHasHwCrc())
     return hwCrc(crc, static_cast<const uint8_t*>(data), len);
 #endif
   (void)crc;
@@ -121,7 +159,7 @@ uint32_t crc32cHw(uint32_t crc, const void* data, size_t len) {
 
 bool crc32cHwAvailable() {
 #ifdef UCACHE_CRC32C_HW
-  return cpuHasSse42();
+  return cpuHasHwCrc();
 #else
   return false;
 #endif
