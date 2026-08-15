@@ -7,8 +7,10 @@ set(UCACHE_XROOTD_ROOT
     CACHE PATH "XRootD client install (headers + libXrdCl)")
 # SERVER side of the bench harness (origin + XCache instances): host 5.9.6.
 set(UCACHE_XROOTD_SERVER_VERSION "5.9.6")
-# Minimum acceptable for building/linking.
+# Acceptable range for building/linking: the plugin implements the 5.x
+# FilePlugIn interface, so both ends are real constraints.
 set(UCACHE_XROOTD_MINIMUM "5.6")
+set(UCACHE_XROOTD_NEXT_MAJOR "6.0")
 
 # Fail configure if the discovered XRootD client is older than the plugin-ABI
 # minimum — the compile-time half of fail-open: a too-old XrdCl
@@ -35,6 +37,18 @@ function(ucache_require_xrootd_version include_dir)
     message(FATAL_ERROR
       "ucache: XRootD client ${_found} is older than the required ${UCACHE_XROOTD_MINIMUM} "
       "(plugin ABI). Install a newer xrootd-client-devel or set UCACHE_XROOTD_ROOT.")
+  endif()
+  # And an UPPER bound, because the interface we implement is versioned too.
+  # XRootD 6 changed FilePlugIn's signatures (the timeout parameter became
+  # time_t), so every method we declare stops overriding anything and the
+  # compiler reports each one separately — around forty errors that say nothing
+  # about the actual cause. One sentence here is worth more than all of them.
+  if(NOT _found VERSION_LESS "${UCACHE_XROOTD_NEXT_MAJOR}")
+    message(FATAL_ERROR
+      "ucache: XRootD client ${_found} implements a plugin interface this code does not "
+      "target — the FilePlugIn signatures changed in ${UCACHE_XROOTD_NEXT_MAJOR}. Build against a "
+      "5.x client (set UCACHE_XROOTD_ROOT to its prefix). At runtime a mismatched client simply "
+      "declines to load the plugin, so jobs keep working uncached; only the build must be told.")
   endif()
   message(STATUS "ucache: XRootD client ${_found} (>= ${UCACHE_XROOTD_MINIMUM} required) — OK")
 endfunction()

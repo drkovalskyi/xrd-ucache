@@ -64,10 +64,14 @@ jobs:
         run: brew install xz zstd lz4
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF
              -DUCACHE_BUILD_PLUGIN=OFF -DCMAKE_PREFIX_PATH="$(brew --prefix)"
-      - run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+        # -k: keep going after the first error. A porting round learns whatever the
+        # compiler can tell it in ONE run; stopping at the first file turns a list
+        # of diagnostics into one-per-push, which is how this leg spent three
+        # rounds discovering three unrelated missing declarations.
+      - run: cmake --build build -j"$(sysctl -n hw.ncpu)" -- -k
       - name: unit + differential (1e5 ops)
         run: cd build && ctest --output-on-failure -E crash-suite
-      - name: plugin, when an XRootD client is installable
+      - name: plugin, when a 5.x XRootD client is installable
         run: |
           # Not a required leg: the point of the job is the compiler, and the core
           # plus CLI above already exercise most of it. If the formula is missing
@@ -77,10 +81,20 @@ jobs:
             echo "::warning::no installable xrootd — plugin compile not checked on macOS"
             exit 0
           fi
+          # The plugin implements the 5.x FilePlugIn interface. Homebrew moved to
+          # XRootD 6, whose signatures differ, so building against whatever the
+          # formula happens to ship tests a combination we do not support and
+          # cannot fix here — that is a client-version fact, not a macOS one.
+          ver=$(brew list --versions xrootd | awk '{print $NF}')
+          case "$ver" in
+            5.*) ;;
+            *) echo "::warning::Homebrew xrootd is $ver; the plugin targets the 5.x interface — plugin compile skipped"
+               exit 0 ;;
+          esac
           cmake -S . -B build-plugin -DCMAKE_BUILD_TYPE=Release -DUCACHE_BUILD_BENCH=OFF \
                 -DUCACHE_BUILD_TESTS=OFF -DUCACHE_XROOTD_ROOT="$(brew --prefix)" \
                 -DCMAKE_PREFIX_PATH="$(brew --prefix)"
-          cmake --build build-plugin -j"$(sysctl -n hw.ncpu)"
+          cmake --build build-plugin -j"$(sysctl -n hw.ncpu)" -- -k
 
   # Zero-admin acceptance: install -> `ucache setup` (no root) ->
   # new-shell cached read (warm origin=0) -> fail-open, all in a CLEAN container
