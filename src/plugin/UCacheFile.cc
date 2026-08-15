@@ -10,6 +10,7 @@
 
 #include <XProtocol/XProtocol.hh> // kXR_* wire codes for the OpenRetry drift asserts
 
+#include <cstdio>
 #include <spawn.h>
 #include <sys/resource.h>
 #include <sys/stat.h>

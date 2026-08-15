@@ -26,6 +26,7 @@
 #include <sys/vfs.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 
 #ifndef UCACHE_VERSION
 #define UCACHE_VERSION "unknown"

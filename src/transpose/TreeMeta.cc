@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <lzma.h>
+#include <utility>
 #include <zlib.h>
 #include <zstd.h>
 #ifdef UCACHE_HAVE_LZ4

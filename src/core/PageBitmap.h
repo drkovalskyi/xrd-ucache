@@ -5,6 +5,7 @@
 // mutex (single writer discipline, readers under the same lock).
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
+#include <utility>
 
 namespace ucache::transpose {
 namespace {

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <functional>
+#include <utility>
 
 namespace ucache {
 namespace {

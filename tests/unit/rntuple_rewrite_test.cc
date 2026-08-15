@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <string>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using namespace ucache::transpose;

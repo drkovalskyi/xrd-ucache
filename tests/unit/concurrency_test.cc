@@ -5,6 +5,7 @@
 
 #include "TestUtil.h"
 #include <atomic>
+#include <chrono>
 #include <gtest/gtest.h>
 #include <thread>
 

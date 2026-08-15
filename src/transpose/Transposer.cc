@@ -4,6 +4,7 @@
 #include <cstring>
 #include <set>
 
+#include <utility>
 #include <zstd.h>
 
 namespace ucache::transpose {
