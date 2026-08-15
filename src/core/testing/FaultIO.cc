@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <sys/file.h> // flock: reached transitively on glibc, declared here everywhere
 
 namespace ucache {
 

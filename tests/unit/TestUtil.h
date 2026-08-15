@@ -7,6 +7,7 @@
 #include <ftw.h>
 #include <random>
 #include <string>
+#include <unistd.h> // mkdtemp lives here on BSD-derived libcs, in <stdlib.h> on glibc
 #include <vector>
 
 namespace ucache::test {
