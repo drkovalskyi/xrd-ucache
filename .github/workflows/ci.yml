@@ -71,6 +71,19 @@ jobs:
       - run: cmake --build build -j"$(sysctl -n hw.ncpu)" -- -k
       - name: unit + differential (1e5 ops)
         run: cd build && ctest --output-on-failure -E crash-suite
+      - name: the hardware CRC32C path must be the one compiled in
+        run: |
+          # A green suite cannot distinguish "hardware path verified" from
+          # "hardware path absent": the agreement test SKIPS when no hardware
+          # implementation is compiled in, and a skip counts as a pass. Absent
+          # means every cached page is checksummed by the software table — on
+          # the read path this cache exists to make fast, and invisibly.
+          out=$(./build/tests/ucache-unit-tests --gtest_filter='Crc32c.*' 2>&1) || { echo "$out"; exit 1; }
+          echo "$out" | grep -E "SKIPPED|PASSED|FAILED" || true
+          if echo "$out" | grep -q "SKIPPED"; then
+            echo "::error::no hardware CRC32C for this target — the checksum on every cached page would use the software table"
+            exit 1
+          fi
       - name: plugin, when a 5.x XRootD client is installable
         run: |
           # Not a required leg: the point of the job is the compiler, and the core
