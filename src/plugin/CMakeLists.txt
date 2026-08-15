@@ -6,7 +6,12 @@
 # substitute a different libXrdCl than the headers being compiled against.
 find_path(XRDCL_INCLUDE_DIR XrdCl/XrdClPlugInInterface.hh
           PATHS ${UCACHE_XROOTD_ROOT}/include/xrootd NO_DEFAULT_PATH)
-find_path(XRDCL_INCLUDE_DIR XrdCl/XrdClPlugInInterface.hh REQUIRED)
+# Fallback: discover it on the default search path. PATH_SUFFIXES matters —
+# every packaged XRootD puts the headers under <prefix>/include/xrootd, not
+# <prefix>/include, so without it this stage can only succeed on a hand-built
+# install and CMAKE_PREFIX_PATH alone (MacPorts, conda, Homebrew, a distro
+# package) fails to configure with the headers sitting right there.
+find_path(XRDCL_INCLUDE_DIR XrdCl/XrdClPlugInInterface.hh PATH_SUFFIXES xrootd REQUIRED)
 find_library(XRDCL_LIBRARY XrdCl
              PATHS ${UCACHE_XROOTD_ROOT}/lib64 ${UCACHE_XROOTD_ROOT}/lib NO_DEFAULT_PATH)
 find_library(XRDCL_LIBRARY XrdCl REQUIRED)
