@@ -63,14 +63,22 @@ int64_t RealIO::pwrite(int fd, const void* buf, uint64_t count, uint64_t offset)
 }
 int RealIO::fdatasync(int fd) {
 #if defined(__APPLE__)
-  // Darwin's fdatasync() is not the same trade: this platform's documented
-  // durability primitive is fcntl(F_FULLFSYNC), a full device-cache barrier
-  // that can cost tens of milliseconds. This runs once per entry at publish,
-  // so paying a barrier here would dominate the fill it is meant to make
-  // durable. fsync() is the closer equivalent of what fdatasync() costs
-  // elsewhere: the data and the size reach the filesystem, and a power cut can
-  // still lose what the drive is holding in its own cache — the same exposure
-  // this code already accepts everywhere else.
+  // Deliberately WEAKER here than on the platform this was written for, and the
+  // difference is real: fdatasync() there reaches the device, while Darwin's
+  // fsync() only reaches the filesystem — this platform's device-cache barrier
+  // is fcntl(F_FULLFSYNC), which costs milliseconds and is not used.
+  //
+  // What that gives up is bounded to REWORK, not correctness, because the
+  // barrier is not what makes a served byte trustworthy — the per-page crc32c
+  // is, and it is verified on every read of both tiers. After a power cut,
+  // pages the drive was still holding fail that check and are refetched, a
+  // replica whose overlay is incomplete fails it and falls back to the byte
+  // copy, and a torn sidecar is refused whole. So the cost of losing the
+  // barrier is work redone, and the cost of taking it would be a device
+  // barrier per publish on every recompress pass.
+  //
+  // Consequence worth knowing: after an unclean shutdown a run may report
+  // nonzero crc_failures, which is benign here and alarming everywhere else.
   return retErrno(::fsync(fd));
 #else
   return retErrno(::fdatasync(fd));
