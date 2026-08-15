@@ -21,9 +21,15 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <sys/sysmacros.h>
 #include <sys/utsname.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>  // statfs, and f_fstypename instead of a magic number
+#include <sys/param.h>
+#include <sys/sysctl.h>
+#else
+#include <sys/sysmacros.h>
 #include <sys/vfs.h>
+#endif
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -53,6 +59,44 @@ constexpr double kMinQuarterS = 0.5;
 constexpr int kStdQd[] = {1, 16, 32};
 // The depth datasheets quote for random IOPS, and SATA's full NCQ.
 constexpr int kStdWriteQd = 32;
+
+// Darwin has no fdatasync; fsync is the whole-file equivalent. It also flushes
+// metadata, which costs time here and never correctness.
+#if defined(__APPLE__)
+inline int ucacheFdatasync(int fd) { return ::fsync(fd); }
+#else
+inline int ucacheFdatasync(int fd) { return ::fdatasync(fd); }
+#endif
+
+// --- keeping the page cache out of a measurement --------------------------
+// Linux uses O_DIRECT: a guarantee, with an alignment contract. Darwin has no
+// O_DIRECT at all; the nearest thing is F_NOCACHE, set on the descriptor after
+// it is open, which ASKS the kernel not to keep this file's data in the buffer
+// cache. It is a hint with no alignment contract and no promise that any given
+// transfer bypassed the cache. The two therefore do not produce interchangeable
+// numbers, which is why the mode is printed in the table and named in the JSON
+// rather than left for a reader to assume from the field names.
+#if defined(__APPLE__)
+constexpr int kDirectOpenFlag = 0; // requested after open() instead
+#else
+constexpr int kDirectOpenFlag = O_DIRECT;
+#endif
+
+// open(), plus whatever this platform needs to bypass the cache. `direct` is
+// redundant on Linux (the flag is already in `flags`) and is what carries the
+// intent on Darwin, where no open flag can.
+int openTest(const char* path, int flags, bool direct, mode_t mode = 0) {
+  int fd = (flags & O_CREAT) ? ::open(path, flags, mode) : ::open(path, flags);
+#if defined(__APPLE__)
+  if (fd >= 0 && direct && ::fcntl(fd, F_NOCACHE, 1) != 0) {
+    ::close(fd); // caller falls back to buffered, as a refused O_DIRECT does
+    return -1;
+  }
+#else
+  (void)direct;
+#endif
+  return fd;
+}
 
 double nowS() {
   return std::chrono::duration<double>(
@@ -127,6 +171,10 @@ std::string fsName(const std::string& path) {
   struct ::statfs sf;
   if (::statfs(path.c_str(), &sf) != 0)
     return "?";
+#if defined(__APPLE__)
+  // Darwin names the filesystem outright, so no magic-number table is needed.
+  return sf.f_fstypename[0] ? std::string(sf.f_fstypename) : std::string("?");
+#else
   switch (static_cast<unsigned>(sf.f_type)) {
   case 0x58465342: return "xfs";
   case 0xEF53: return "ext4";
@@ -145,6 +193,7 @@ std::string fsName(const std::string& path) {
     return b;
   }
   }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +201,7 @@ std::string fsName(const std::string& path) {
 // how busy the machine was, so both are captured and recorded next to them.
 // ---------------------------------------------------------------------------
 
+#if !defined(__APPLE__) // parses /proc and /sys; no counterpart on Darwin
 std::string readFileTrim(const std::string& p) {
   std::ifstream f(p);
   std::string s;
@@ -162,8 +212,10 @@ std::string readFileTrim(const std::string& p) {
   size_t b = s.find_first_not_of(' ');
   return b == std::string::npos ? "" : s.substr(b);
 }
+#endif
 
 // mountinfo escapes space/tab/newline/backslash as \0NN.
+#if !defined(__APPLE__) // parses /proc and /sys; no counterpart on Darwin
 std::string unescapeOctal(const std::string& s) {
   std::string o;
   for (size_t i = 0; i < s.size(); ++i) {
@@ -178,7 +230,9 @@ std::string unescapeOctal(const std::string& s) {
   }
   return o;
 }
+#endif
 
+#if !defined(__APPLE__) // parses /proc and /sys; no counterpart on Darwin
 bool pathUnder(const std::string& mp, const std::string& rp) {
   if (mp == "/")
     return true;
@@ -186,6 +240,7 @@ bool pathUnder(const std::string& mp, const std::string& rp) {
     return false;
   return rp.size() == mp.size() || rp[mp.size()] == '/';
 }
+#endif
 
 struct MountInfo {
   bool found = false;
@@ -199,6 +254,7 @@ struct MountInfo {
 
 // The scheduler file reads "none [mq-deadline] kyber bfq" — only the selected
 // one is a fact about this device.
+#if !defined(__APPLE__) // parses /proc and /sys; no counterpart on Darwin
 std::string selectedSched(const std::string& s) {
   size_t a = s.find('[');
   size_t b = s.find(']');
@@ -206,8 +262,27 @@ std::string selectedSched(const std::string& s) {
     return s.substr(a + 1, b - a - 1);
   return s;
 }
+#endif
 
 MountInfo mountFor(const std::string& path) {
+#if defined(__APPLE__)
+  // No /proc/self/mountinfo. statfs names the mount and its device directly;
+  // there is no /sys, so model, scheduler and rotational stay unknown rather
+  // than being guessed.
+  MountInfo mi;
+  struct ::statfs sf;
+  if (::statfs(path.c_str(), &sf) != 0)
+    return mi;
+  mi.found = true;
+  mi.mountPoint = sf.f_mntonname;
+  mi.fsType = sf.f_fstypename;
+  mi.source = sf.f_mntfromname;
+  const std::string dev = mi.source;
+  const size_t slash = dev.rfind('/');
+  mi.partName = slash == std::string::npos ? dev : dev.substr(slash + 1);
+  mi.diskName = mi.partName;
+  return mi;
+#else
   MountInfo m;
   char rbuf[4096];
   std::string rp = ::realpath(path.c_str(), rbuf) ? std::string(rbuf) : path;
@@ -294,6 +369,7 @@ MountInfo mountFor(const std::string& path) {
   if (!sz.empty())
     m.sizeGb = static_cast<double>(std::strtoull(sz.c_str(), nullptr, 10)) * 512.0 / (1ull << 30);
   return m;
+#endif
 }
 
 struct DiskCounters {
@@ -396,8 +472,17 @@ struct LoadAvg {
 };
 LoadAvg loadAvg() {
   LoadAvg l;
+#if defined(__APPLE__)
+  double a[3] = {0, 0, 0};
+  if (::getloadavg(a, 3) == 3) {
+    l.l1 = a[0];
+    l.l5 = a[1];
+    l.l15 = a[2];
+  }
+#else
   std::ifstream f("/proc/loadavg");
   f >> l.l1 >> l.l5 >> l.l15;
+#endif
   return l;
 }
 
@@ -424,6 +509,18 @@ Machine machineInfo() {
     m.arch = u.machine;
   }
   m.ncpu = ::sysconf(_SC_NPROCESSORS_ONLN);
+#if defined(__APPLE__)
+  // No /proc: the same two facts come from sysctl.
+  char brand[256];
+  size_t bsz = sizeof brand;
+  if (::sysctlbyname("machdep.cpu.brand_string", brand, &bsz, nullptr, 0) == 0)
+    m.cpuModel = brand;
+  uint64_t mem = 0;
+  size_t msz = sizeof mem;
+  if (::sysctlbyname("hw.memsize", &mem, &msz, nullptr, 0) == 0)
+    m.memGb = static_cast<double>(mem) / (1024.0 * 1024.0 * 1024.0);
+  return m;
+#else
   std::ifstream ci("/proc/cpuinfo");
   std::string line;
   while (std::getline(ci, line)) {
@@ -456,6 +553,7 @@ Machine machineInfo() {
   m.dirtyLimitGb = db_abs ? static_cast<double>(db_abs) / (1ull << 30)
                           : (m.dirtyRatio > 0 ? m.memGb * m.dirtyRatio / 100.0 : 0);
   return m;
+#endif
 }
 
 // How much space this tool refuses to consume, whatever the sizing rule asks
@@ -613,7 +711,7 @@ struct StreamStat {
 // Thread-safety: each worker opens its own fd and owns its own buffer and
 // sample vector; only the totals (atomics) and the merged sample list (mutex)
 // are shared.
-StreamStat randReadStage(const std::string& tf, int rflags, uint64_t fsz, int n,
+StreamStat randReadStage(const std::string& tf, int rflags, bool direct, uint64_t fsz, int n,
                          double phase) {
   StreamStat s;
   s.n = s.nEff = n;
@@ -626,7 +724,7 @@ StreamStat randReadStage(const std::string& tf, int rflags, uint64_t fsz, int n,
   pool.reserve(static_cast<size_t>(n));
   for (int t = 0; t < n; ++t)
     pool.emplace_back([&, t] {
-      int fd = ::open(tf.c_str(), rflags);
+      int fd = openTest(tf.c_str(), rflags, direct);
       char* buf = alignedBuf(kSmall);
       std::vector<uint32_t> mine;
       if (fd >= 0 && buf)
@@ -673,14 +771,14 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
   }
   s.nEff = nEff;
 
-  const int flags = (write ? O_WRONLY : O_RDONLY) | (direct ? O_DIRECT : 0);
+  const int flags = (write ? O_WRONLY : O_RDONLY) | (direct ? kDirectOpenFlag : 0);
   std::atomic<uint64_t> bytes{0};
   double t0 = nowS(), deadline = t0 + phase;
   std::vector<std::thread> pool;
   pool.reserve(static_cast<size_t>(nEff));
   for (int t = 0; t < nEff; ++t)
     pool.emplace_back([&, t] {
-      int fd = ::open(tf.c_str(), flags);
+      int fd = openTest(tf.c_str(), flags, direct);
       char* buf = alignedBuf(blk);
       const uint64_t base = static_cast<uint64_t>(t) * per;
       uint64_t off = base, local = 0;
@@ -696,7 +794,7 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
       }
       if (fd >= 0) {
         if (write && !direct)
-          ::fdatasync(fd); // buffered: bill the writeback inside the phase
+          ucacheFdatasync(fd); // buffered: bill the writeback inside the phase
         ::close(fd);
       }
       ::free(buf);
@@ -716,7 +814,7 @@ StreamStat bigStage(const std::string& tf, uint64_t fsz, int n, uint64_t block,
 // (byte cache) and ~599 KiB (replica), which sit between the standard 4 KiB
 // and 4 MiB points — and that interval is where a device stops being
 // op-bound and becomes bandwidth-bound, so it cannot be interpolated.
-StreamStat randSizeStage(const std::string& tf, int rflags, uint64_t fsz, int qd,
+StreamStat randSizeStage(const std::string& tf, int rflags, bool direct, uint64_t fsz, int qd,
                          uint64_t blk, double phase, bool write) {
   StreamStat s;
   s.n = s.nEff = qd;
@@ -733,7 +831,7 @@ StreamStat randSizeStage(const std::string& tf, int rflags, uint64_t fsz, int qd
   pool.reserve(static_cast<size_t>(qd));
   for (int t = 0; t < qd; ++t)
     pool.emplace_back([&, t] {
-      int fd = ::open(tf.c_str(), write ? (rflags & ~O_RDONLY) | O_WRONLY : rflags);
+      int fd = openTest(tf.c_str(), write ? (rflags & ~O_RDONLY) | O_WRONLY : rflags, direct);
       char* buf = alignedBuf(blk);
       std::vector<uint32_t> mine;
       std::mt19937_64 rng(900 + static_cast<uint64_t>(t));
@@ -912,12 +1010,38 @@ std::string humanBlock(const Result& r) {
   if (r.haveCachePath) {
     const CacheBenchResult& c = r.cachePath;
     appendf(s, "\n  Through uCache's own code\n");
+#if defined(__APPLE__)
+    // The warm stages claim to read from the device. On Darwin they cannot:
+    // there is no way to drop pages that are already resident, so a sample
+    // smaller than RAM is answered from memory and the rate is not a device
+    // rate at all. Say so at the point of reading, not in a footnote.
+    {
+      uint64_t memBytes = 0;
+      size_t msz = sizeof memBytes;
+      ::sysctlbyname("hw.memsize", &memBytes, &msz, nullptr, 0);
+      if (memBytes && r.cachePath.sampleBytes &&
+          r.cachePath.sampleBytes < memBytes)
+        appendf(s,
+                "    !! the warm rates below are NOT device rates: this platform\n"
+                "       cannot drop resident pages, and the %.1f GiB sample fits in\n"
+                "       %.1f GiB of RAM. Use a sample larger than RAM, or read them\n"
+                "       as an upper bound.\n",
+                gib(r.cachePath.sampleBytes), gib(memBytes));
+    }
+#endif
     if (!c.error.empty()) {
       appendf(s, "    FAILED: %s\n", c.error.c_str());
     } else {
       auto line = [&s](const char* label, const CachePhase& p) {
+#if defined(__APPLE__)
+        // No per-device counters on this platform: printing them as 0.0 would
+        // read as "the device did nothing", which is not what was measured.
+        appendf(s, "    %-46s%8.1f MB/s   p99 %.2f ms\n",
+                label, p.payloadMbps, p.p99Us / 1e3);
+#else
         appendf(s, "    %-46s%8.1f MB/s   (device %.1f, %.1f KiB/op, QD %.1f)   p99 %.2f ms\n",
                 label, p.payloadMbps, p.devMbps, p.devOpKib, p.devQueueDepth, p.p99Us / 1e3);
+#endif
         // Every phase shows how its rate moved through the pass, not just where
         // it ended: an aggregate cannot show a drift, and a read pass can drift
         // for the same reasons a write one can.
@@ -1024,8 +1148,18 @@ std::string contextBlock(const Result& r, const DiskBenchOpts& o) {
       appendf(s, "   %.1f GiB", e.mnt.sizeGb);
     appendf(s, "\n");
   } else {
+#if defined(__APPLE__)
+    // The device is known (statfs named it above); what is missing is a way to
+    // describe it. There is no /sys here, so model, scheduler, rotational and
+    // size have no source — and no per-device counters either, which is why
+    // the before/after activity lines below are absent on this platform.
+    appendf(s, "  device    %s (not described — no /sys on this platform, "
+               "and no per-device counters)\n",
+            e.mnt.source.empty() ? "?" : e.mnt.source.c_str());
+#else
     appendf(s, "  device    (none — %s is not backed by a block device)\n",
             e.mnt.found ? e.mnt.fsType.c_str() : r.fs.c_str());
+#endif
   }
   if (e.pre.valid)
     appendf(s, "  device BEFORE the run (%.1f s sample): read %.1f MB/s, wrote %.1f MB/s, "
@@ -1189,8 +1323,18 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
 
 // Evict the file's pages so buffered-mode reads see the device, not RAM.
 void evict(int fd) {
-  ::fdatasync(fd);
+#if defined(__APPLE__)
+  // Darwin has no posix_fadvise. F_NOCACHE stops FUTURE reads on this
+  // descriptor from being cached but does not drop pages already resident, so
+  // a buffered-mode figure here can still be helped by RAM. Said plainly
+  // because it cannot be fixed from inside this call: the direct path, where
+  // F_NOCACHE is set from the first open, is the one to trust on this platform.
+  ::fsync(fd);
+  ::fcntl(fd, F_NOCACHE, 1);
+#else
+  ucacheFdatasync(fd);
   ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
 }
 
 Result benchOne(const std::string& path, const DiskBenchOpts& o) {
@@ -1305,16 +1449,20 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
 
   // O_DIRECT when the fs takes it; else buffered + eviction (mode reported).
   bool direct = true;
-  int wfd = ::open(tf.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0600);
+  int wfd = openTest(tf.c_str(), O_WRONLY | O_CREAT | O_TRUNC | kDirectOpenFlag, true, 0600);
   if (wfd < 0) {
     direct = false;
-    wfd = ::open(tf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    wfd = openTest(tf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, false, 0600);
   }
   if (wfd < 0) {
     r.error = std::string("open failed: ") + std::strerror(errno);
     return r;
   }
+#if defined(__APPLE__)
+  r.mode = direct ? "F_NOCACHE" : "buffered";
+#else
   r.mode = direct ? "O_DIRECT" : "buffered";
+#endif
 
   char* big = alignedBuf(o.blockBytes);
   char* small = alignedBuf(kSmall);
@@ -1350,7 +1498,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       prog.emplace_back(nowS() - t0, fsz);
     }
     double writeS = prog.empty() ? 0 : prog.back().first;
-    ::fdatasync(wfd);
+    ucacheFdatasync(wfd);
     double totalS = nowS() - t0; // the flush is part of the cost of the write
     double overall = totalS > 0 ? static_cast<double>(fsz) / 1e6 / totalS : 0;
     r.buildWriteMbps = overall;
@@ -1395,7 +1543,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
           static_cast<ssize_t>(kSmall))
         break; // nothing dirty to sync — the fdatasync sample would be a lie
       double t0 = nowS();
-      ::fdatasync(bfd);
+      ucacheFdatasync(bfd);
       us.push_back(static_cast<uint32_t>((nowS() - t0) * 1e6));
     }
     if (bfd >= 0)
@@ -1405,8 +1553,8 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
 
   ::close(wfd);
 
-  int rflags = O_RDONLY | (direct ? O_DIRECT : 0);
-  int rfd = ::open(tf.c_str(), rflags);
+  int rflags = O_RDONLY | (direct ? kDirectOpenFlag : 0);
+  int rfd = openTest(tf.c_str(), rflags, direct);
   if (rfd < 0) {
     r.error = std::string("reopen failed: ") + std::strerror(errno);
     return r;
@@ -1422,7 +1570,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   for (int qd : kStdQd) {
     if (!direct)
       evict(rfd);
-    r.randr.push_back(randReadStage(tf, rflags, fsz, qd, o.measurementSeconds));
+    r.randr.push_back(randReadStage(tf, rflags, direct, fsz, qd, o.measurementSeconds));
     r.env.ownReadBytes += r.randr.back().bytes;
   }
   {
@@ -1469,7 +1617,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       if (!direct)
         evict(rfd);
       r.patRead.push_back(
-          randSizeStage(tf, rflags, fsz, r.threads, sizes[i], o.measurementSeconds, false));
+          randSizeStage(tf, rflags, direct, fsz, r.threads, sizes[i], o.measurementSeconds, false));
       r.env.ownReadBytes += r.patRead.back().bytes;
       r.patReadKib.push_back(sizes[i] / 1024);
     }
@@ -1483,7 +1631,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   // --- STANDARD random write, 4 KiB at queue depth 32 (the datasheet number;
   // --- the shipped scattered-write stage is single-threaded, so the tool had
   // --- QD1 only while every spec sheet quotes QD32).
-  r.randw = randSizeStage(tf, rflags, fsz, kStdWriteQd, kSmall, o.measurementSeconds, true);
+  r.randw = randSizeStage(tf, rflags, direct, fsz, kStdWriteQd, kSmall, o.measurementSeconds, true);
   r.env.ownWriteBytes += r.randw.bytes;
 
   // --- random reads UNDER writeback (the production killer mode) ----------
@@ -1493,7 +1641,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> wbytes{0};
     std::thread writer([&] {
-      int fd = ::open(tf.c_str(), O_WRONLY | (direct ? O_DIRECT : 0));
+      int fd = openTest(tf.c_str(), O_WRONLY | (direct ? kDirectOpenFlag : 0), direct);
       char* buf = alignedBuf(o.blockBytes);
       uint64_t off = 0;
       while (fd >= 0 && buf && !stop.load(std::memory_order_relaxed)) {
@@ -1507,7 +1655,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
       }
       if (fd >= 0) {
         if (!direct)
-          ::fdatasync(fd);
+          ucacheFdatasync(fd);
         ::close(fd);
       }
       ::free(buf);
@@ -1519,7 +1667,7 @@ Result benchOne(const std::string& path, const DiskBenchOpts& o) {
     std::vector<std::thread> readers;
     for (int t = 0; t < 4; ++t)
       readers.emplace_back([&, t] {
-        int fd = ::open(tf.c_str(), rflags);
+        int fd = openTest(tf.c_str(), rflags, direct);
         char* buf = alignedBuf(kSmall);
         std::vector<uint32_t> mine;
         if (fd >= 0 && buf)

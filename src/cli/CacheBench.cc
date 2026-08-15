@@ -25,6 +25,14 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(__APPLE__)
+// Darwin has no fdatasync; fsync is the whole-file equivalent. It flushes
+// metadata this call does not need, which costs time and never correctness.
+static inline int ucacheFdatasync(int fd) { return ::fsync(fd); }
+#else
+static inline int ucacheFdatasync(int fd) { return ::fdatasync(fd); }
+#endif
+
 namespace ucache {
 namespace {
 
@@ -115,7 +123,14 @@ void dropCache(const std::vector<std::string>& paths) {
     int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0)
       continue;
+#if defined(__APPLE__)
+    // No posix_fadvise on Darwin. F_NOCACHE keeps FUTURE reads on this
+    // descriptor out of the buffer cache; pages already resident stay, so this
+    // is weaker than the Linux path and the read-back can be helped by RAM.
+    ::fcntl(fd, F_NOCACHE, 1);
+#else
     ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
     ::close(fd);
   }
 }
@@ -157,7 +172,7 @@ void syncPaths(const std::vector<std::string>& paths) {
       int fd = ::open(p.c_str(), O_WRONLY);
       if (fd < 0)
         return;
-      ::fdatasync(fd);
+      ucacheFdatasync(fd);
       ::close(fd);
     });
   for (auto& x : t)

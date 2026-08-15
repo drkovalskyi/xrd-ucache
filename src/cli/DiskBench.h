@@ -10,11 +10,25 @@
 // retired rather than tuned and the product's own code measures it instead
 // (--cache-path, CacheBench.h).
 //
-// Methodology (hardened by field probe failures): O_DIRECT when the
-// filesystem supports it (else buffered + posix_fadvise-evict, and the mode
-// is reported); a dedicated non-sparse test file (never reads cache objects —
-// sparse holes measure nothing); every phase time-capped, so the tool still
-// finishes on a volume that delivers a few dozen IOPS.
+// Methodology (hardened by field probe failures): keep the page cache out of
+// the measurement, use a dedicated non-sparse test file (never reads cache
+// objects — sparse holes measure nothing), and time-cap every phase so the
+// tool still finishes on a volume that delivers a few dozen IOPS.
+//
+// HOW the page cache is kept out differs by platform, and the difference is
+// reported rather than hidden — the `mode` field says which was used:
+//   Linux   O_DIRECT, a guarantee with an alignment contract; buffered plus
+//           posix_fadvise-evict where the filesystem refuses it.
+//   macOS   F_NOCACHE, set after open. It ASKS the kernel not to cache this
+//           file's data: no alignment contract, no promise that a given
+//           transfer bypassed the cache, and no way to drop pages already
+//           resident. Measured latencies show it working (device-real
+//           microseconds, not RAM), but a macOS figure is not interchangeable
+//           with an O_DIRECT one and should not be put in the same table
+//           without saying so.
+// macOS also has no per-device counters (/proc/diskstats) and no iowait, so
+// the record omits those fields instead of substituting weaker ones; the
+// device is named but not described.
 //
 // Three properties the numbers depend on, and which the output therefore
 // states outright:

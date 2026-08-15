@@ -2,11 +2,14 @@
 # no XRootD, no runtime Python. When the transposer library is available
 # (codec libs present), `materialize` also works natively;
 # otherwise it requires --import (the Python-bridge overlay). Installed to bin/.
-# The storage self-test measures with O_DIRECT and per-device counters, neither
-# of which exists outside Linux. Rather than hold the whole CLI hostage to it —
-# every other subcommand is platform-independent — the subcommand keeps its
-# argument handling and declines at the point of measurement.
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# The storage self-test is built from interfaces that differ by platform:
+# Linux keeps the page cache out with O_DIRECT and reads per-device counters
+# from /proc, macOS asks with F_NOCACHE and has no equivalent counters. Both
+# measure; they do not measure identically, so the mode is reported in the
+# output and named in the JSON rather than left for the reader to assume.
+# Platforms with neither keep the subcommand's argument handling and decline at
+# the point of measurement, so the rest of the CLI never depends on it.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
   set(UCACHE_DISKBENCH_SRC DiskBench.cc CacheBench.cc)
 else()
   set(UCACHE_DISKBENCH_SRC DiskBenchUnsupported.cc)
