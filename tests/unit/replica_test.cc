@@ -4,6 +4,7 @@
 #include "ReplicaFile.h"
 #include "ReplicaStore.h"
 
+#include "IOBackend.h"
 #include "CacheStore.h"
 #include "TestUtil.h"
 #include "testing/FaultIO.h"
@@ -334,7 +335,7 @@ TEST(ReplicaStore, CorruptMiddlePageOfAnOverlayRunIsCaught) {
   const std::string dPath = ReplicaStore::tdataPath(key(), f.cfg.cacheDir);
   struct ::stat st;
   ASSERT_EQ(::stat(dPath.c_str(), &st), 0);
-  struct timespec keep[2] = {st.st_atim, st.st_mtim};
+  struct timespec keep[2] = {statAtime(st), statMtime(st)};
 
   // Page 2 of 4 — not the first page of the run the read below will build.
   int fd = ::open(dPath.c_str(), O_RDWR);
@@ -518,7 +519,7 @@ TEST(ReplicaStore, VerifyOnceMarkerSkipsScanButPerReadCrcStays) {
   struct ::stat st;
   ASSERT_EQ(::stat(tok.c_str(), &st), 0); // publish wrote the marker
   ASSERT_EQ(::stat(dPath.c_str(), &st), 0);
-  struct timespec keep[2] = {st.st_atim, st.st_mtim};
+  struct timespec keep[2] = {statAtime(st), statMtime(st)};
 
   // Corrupt a page but RESTORE the mtime: the advisory marker then matches,
   // the open-time scan is skipped (that's the optimization), and the

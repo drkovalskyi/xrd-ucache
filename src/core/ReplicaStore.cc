@@ -1,5 +1,6 @@
 #include "ReplicaStore.h"
 
+#include "IOBackend.h"
 #include "Log.h"
 #include "vendor/crc32c.h"
 
@@ -134,8 +135,8 @@ namespace {
 constexpr char kTokMagic[4] = {'U', 'C', 'T', 'V'};
 
 uint64_t mtimeNs(const struct ::stat& st) {
-  return static_cast<uint64_t>(st.st_mtim.tv_sec) * 1000000000ull +
-         static_cast<uint64_t>(st.st_mtim.tv_nsec);
+  return static_cast<uint64_t>(statMtime(st).tv_sec) * 1000000000ull +
+         static_cast<uint64_t>(statMtime(st).tv_nsec);
 }
 
 std::vector<uint8_t> tokImage(uint64_t tdataBytes, uint64_t mtNs, const ReplicaMeta& m) {

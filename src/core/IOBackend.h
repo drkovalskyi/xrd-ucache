@@ -17,6 +17,27 @@
 
 namespace ucache {
 
+// Nanosecond timestamps out of a stat buffer. POSIX 2008 named these fields
+// st_mtim/st_atim; Darwin had them first under the names st_mtimespec and
+// st_atimespec and kept those. Same data, two spellings, so the choice is made
+// once here rather than at each use — a compile error on the second platform is
+// the cheapest possible outcome of getting this wrong, and it is still one
+// round trip per site.
+inline const struct timespec& statMtime(const struct ::stat& st) {
+#if defined(__APPLE__)
+  return st.st_mtimespec;
+#else
+  return st.st_mtim;
+#endif
+}
+inline const struct timespec& statAtime(const struct ::stat& st) {
+#if defined(__APPLE__)
+  return st.st_atimespec;
+#else
+  return st.st_atim;
+#endif
+}
+
 // Upper bound on a single coalesced cache read. Read granularity and
 // checksum granularity are independent: a reader may pull a contiguous run
 // of pages with one pread and verify each page's crc32c out of that buffer.
