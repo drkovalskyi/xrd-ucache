@@ -77,8 +77,14 @@ int RealIO::fdatasync(int fd) {
   // barrier is work redone, and the cost of taking it would be a device
   // barrier per publish on every recompress pass.
   //
-  // Consequence worth knowing: after an unclean shutdown a run may report
-  // nonzero crc_failures, which is benign here and alarming everywhere else.
+  // Consequence worth knowing, and NOT specific to this platform: after an
+  // unclean shutdown a run may report nonzero crc_failures. With the default
+  // fsync policy (off) nothing is synced before pages are published anywhere,
+  // so a power cut can do this on any platform; what this branch adds is the
+  // same exposure for the two cases the other platform does make durable — an
+  // opted-in fsync policy, and the replica publish, which syncs regardless of
+  // it. Benign in that one circumstance and a real alarm in every other, which
+  // is the reason to name the circumstance rather than the platform.
   return retErrno(::fsync(fd));
 #else
   return retErrno(::fdatasync(fd));
