@@ -32,7 +32,7 @@ TEST(Config, Defaults) {
   EXPECT_EQ(c.metaFlushSeconds, 30);
   EXPECT_EQ(c.revalidateSeconds, 604800); // 7-day freshness window
   EXPECT_FALSE(c.recompress); // recompression is a single opt-in switch
-  EXPECT_EQ(c.recompressCodecs, (std::vector<std::string>{"lzma"}));
+  EXPECT_EQ(c.recompressCodecs, (std::vector<std::string>{"lzma", "zlib"}));
   EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kSuperseded); // default reclaim mode
   EXPECT_TRUE(c.transpose);
   EXPECT_FALSE(c.disable);

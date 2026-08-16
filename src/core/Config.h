@@ -85,12 +85,15 @@ struct Config {
   // close and transcoded by a detached background drainer, no questions asked
   // (off by default — opt-in CPU/disk; the user flipping the switch IS the
   // worth-it decision). `recompress_codecs` = which SOURCE codecs qualify
-  // (static fact from basket headers — transcoding zstd->zstd is pointless).
+  // (static fact from basket headers). The default lists the two codecs that
+  // are expensive to decode and are what stored physics data actually uses;
+  // lz4 and zstd already decode cheaply, so transcoding them to ZSTD-1 would
+  // spend disk to buy nothing.
   // The evidence gate (recompress_min_share) is PARKED: .cost/
   // calibration evidence is still collected, but no longer gates builds.
   // Serving already-built replicas is governed by `transpose`, not by these.
   bool recompress = false;                       // UCACHE_RECOMPRESS
-  std::vector<std::string> recompressCodecs{"lzma"}; // UCACHE_RECOMPRESS_CODECS
+  std::vector<std::string> recompressCodecs{"lzma", "zlib"}; // UCACHE_RECOMPRESS_CODECS
   // `recompress_reclaim`: what to punch from the v1 byte cache once
   // a valid replica exists. kSuperseded (default) frees only the ranges the
   // overlay relocated; kFull drops the entry's ENTIRE byte copy — the replica

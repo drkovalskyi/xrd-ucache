@@ -145,14 +145,16 @@ the specific cause. Full detail always lands in `<cache-dir>/recompress.log`, bu
 you should no longer need to read it to find out *why* nothing happened. The
 causes, in order of likelihood:
 
-1. **The source codec is not in `recompress_codecs`.** The default is `lzma`
-   only, so a ZLIB- or ZSTD-compressed dataset is declined in full. A sweep says
-   so in as many words, naming the codec it actually found and the fix:
+1. **The source codec is not in `recompress_codecs`.** The default is
+   `lzma,zlib`, the two codecs that are expensive to decode. Data already
+   stored in ZSTD or LZ4 is declined in full, because transcoding it to ZSTD-1
+   would spend disk to buy nothing. A sweep says so in as many words, naming
+   the codec it actually found and the fix:
 
    ```
-   recompress: 0 recompressed, 9 declined (source codec zlib, not in recompress_codecs = lzma), 0 nothing to do (nothing cached), 0 failed
-     nothing was recompressed: this cache holds zlib content, but recompress_codecs = lzma.
-     to transcode it:  ucache set recompress_codecs zlib
+   recompress: 0 recompressed, 9 declined (source codec zstd, not in recompress_codecs = lzma,zlib), 0 nothing to do (nothing cached), 0 failed
+     nothing was recompressed: this cache holds zstd content, but recompress_codecs = lzma,zlib.
+     to transcode it:  ucache set recompress_codecs zstd
    ```
 
    `ucache branches <url>` shows the codec per branch if you want to look first.

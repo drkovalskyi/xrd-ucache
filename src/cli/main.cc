@@ -112,7 +112,7 @@ void usage() {
       "                    branches, bytes, source codec, and the summary share)\n"
       "  recompress [--jobs N] [--yes] [--strict]\n"
       "                                 transcode the cached files whose source codec is in\n"
-      "                    recompress_codecs (default lzma), foreground with live\n"
+      "                    recompress_codecs (default lzma,zlib), foreground with live\n"
       "                    progress (default jobs: half the CPU cores). For automatic\n"
       "                    background builds of everything your jobs read, turn the\n"
       "                    switch on instead: `ucache set recompress on`. With\n"

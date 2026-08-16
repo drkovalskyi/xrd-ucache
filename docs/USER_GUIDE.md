@@ -243,7 +243,7 @@ overriding your defaults. Common keys:
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read are transcoded to fast-to-decode replicas **automatically in the background** (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
-| `recompress_codecs = lzma` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
+| `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
 | `trace_sample = 64` | `UCACHE_TRACE_SAMPLE` | record every Nth read-class trace op (`1` = everything; opens/flushes are always recorded) |
@@ -330,7 +330,7 @@ printed to your terminal (log: `<cache-dir>/recompress.log`; totals:
 `ucache status`). With it off (the default), nothing is ever built in the
 background; `ucache recompress` runs one foreground sweep over what is already
 cached, with live progress. In both cases only branches whose source codec is
-in `recompress_codecs` (default `lzma`) are transcoded — recompressing
+in `recompress_codecs` (default `lzma,zlib`) are transcoded — recompressing
 already-fast codecs would waste CPU and disk — and only branches your runs
 actually read, fully cached, qualify.
 
