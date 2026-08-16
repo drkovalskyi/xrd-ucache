@@ -84,6 +84,36 @@ jobs:
             echo "::error::no hardware CRC32C for this target — the checksum on every cached page would use the software table"
             exit 1
           fi
+      - name: the storage self-test must RUN here, not merely compile
+        run: |
+          # Compiling this file on macOS is not the same as exercising it, and
+          # the difference has already cost something: the port shipped with no
+          # per-device figures at all, because the counter reader returned
+          # nothing and no CI leg ever looked at its output. This is a smoke
+          # test, not a measurement — seconds of IO on a runner's shared disk
+          # says nothing about a device, and it is not logged anywhere.
+          #
+          # What it does check is that the Darwin-only paths execute: cache
+          # bypass via F_NOCACHE (there is no O_DIRECT here), filesystem naming
+          # through statfs, and the IOKit registry walk that reads the
+          # per-device counters — which retains and releases kernel objects and
+          # traverses a storage topology that differs between machines.
+          out=$(./build/src/cli/ucache bench --size 64m --measurement-duration 0.2 \
+                  --threads 2 --no-log . 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          # The mode must be named, and on this platform it must be the hint
+          # rather than a guarantee -- if this ever reads O_DIRECT the reported
+          # methodology is wrong for the platform.
+          echo "$out" | grep -q "F_NOCACHE" || {
+            echo "::error::the self-test did not report F_NOCACHE as its cache-bypass mode"; exit 1; }
+          # A JSON record, and one that names this platform's kernel.
+          echo "$out" | grep -q '^ucache-bench-json: {' || {
+            echo "::error::no ucache-bench-json record emitted"; exit 1; }
+          # Device counters: absent ones read as zero, which is the state this
+          # leg exists to prevent regressing to.
+          echo "$out" | grep -qE '"mount_source":"[^"]+"' || {
+            echo "::error::the record names no device -- statfs resolution failed"; exit 1; }
+
       - name: plugin, when a 5.x XRootD client is installable
         run: |
           # Not a required leg: the point of the job is the compiler, and the core
