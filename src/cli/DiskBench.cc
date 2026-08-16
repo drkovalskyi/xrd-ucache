@@ -23,6 +23,9 @@
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
 #if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
 #include <sys/mount.h>  // statfs, and f_fstypename instead of a magic number
 #include <sys/param.h>
 #include <sys/sysctl.h>
@@ -280,7 +283,12 @@ MountInfo mountFor(const std::string& path) {
   const std::string dev = mi.source;
   const size_t slash = dev.rfind('/');
   mi.partName = slash == std::string::npos ? dev : dev.substr(slash + 1);
+  // Counters live on the whole-disk driver, so name that: diskNsM -> diskN.
   mi.diskName = mi.partName;
+  const size_t sp = mi.diskName.find('s', 4);
+  if (sp != std::string::npos)
+    mi.diskName = mi.diskName.substr(0, sp);
+  mi.haveBlock = true;
   return mi;
 #else
   MountInfo m;
@@ -386,6 +394,58 @@ struct DiskCounters {
   uint64_t wrMerged = 0;
 };
 
+#if defined(__APPLE__)
+// Same counters, different registry: see the note beside devRead() in
+// CacheBench.cc. Two fields have no Darwin source and stay zero rather than
+// being invented — ticksMs (wall time the device was busy, which Total Time
+// cannot give because concurrent operations overlap) and wrMerged (the block
+// layer's merge count, which has no counterpart here).
+uint64_t cfU64Disk(CFDictionaryRef d, CFStringRef key) {
+  if (!d)
+    return 0;
+  CFNumberRef n = static_cast<CFNumberRef>(CFDictionaryGetValue(d, key));
+  long long v = 0;
+  if (n && CFGetTypeID(n) == CFNumberGetTypeID())
+    CFNumberGetValue(n, kCFNumberLongLongType, &v);
+  return v < 0 ? 0 : static_cast<uint64_t>(v);
+}
+
+DiskCounters diskCounters(const std::string& disk) {
+  DiskCounters d;
+  if (disk.empty())
+    return d;
+  CFMutableDictionaryRef match = IOBSDNameMatching(0, 0, disk.c_str());
+  if (!match)
+    return d;
+  io_service_t node = IOServiceGetMatchingService(0, match); // consumes match
+  if (!node)
+    return d;
+  while (node && !IOObjectConformsTo(node, kIOBlockStorageDriverClass)) {
+    io_registry_entry_t parent = 0;
+    kern_return_t kr = IORegistryEntryGetParentEntry(node, kIOServicePlane, &parent);
+    IOObjectRelease(node);
+    node = (kr == KERN_SUCCESS) ? parent : 0;
+  }
+  if (!node)
+    return d;
+  CFDictionaryRef st = static_cast<CFDictionaryRef>(IORegistryEntryCreateCFProperty(
+      node, CFSTR(kIOBlockStorageDriverStatisticsKey), kCFAllocatorDefault, 0));
+  IOObjectRelease(node);
+  if (!st)
+    return d;
+  d.valid = true;
+  d.reads = cfU64Disk(st, CFSTR(kIOBlockStorageDriverStatisticsReadsKey));
+  d.writes = cfU64Disk(st, CFSTR(kIOBlockStorageDriverStatisticsWritesKey));
+  d.rdSect = cfU64Disk(st, CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey)) / 512ull;
+  d.wrSect = cfU64Disk(st, CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey)) / 512ull;
+  d.weightedMs =
+      (cfU64Disk(st, CFSTR(kIOBlockStorageDriverStatisticsTotalReadTimeKey)) +
+       cfU64Disk(st, CFSTR(kIOBlockStorageDriverStatisticsTotalWriteTimeKey))) /
+      1000000ull; // ns -> ms
+  CFRelease(st);
+  return d;
+}
+#else
 DiskCounters diskCounters(const std::string& disk) {
   DiskCounters d;
   if (disk.empty())
@@ -412,6 +472,7 @@ DiskCounters diskCounters(const std::string& disk) {
   }
   return d;
 }
+#endif
 
 // Everything else device-side in this record is a delta across the whole run,
 // so it describes the run — including our own traffic — and says nothing about
@@ -1033,15 +1094,8 @@ std::string humanBlock(const Result& r) {
       appendf(s, "    FAILED: %s\n", c.error.c_str());
     } else {
       auto line = [&s](const char* label, const CachePhase& p) {
-#if defined(__APPLE__)
-        // No per-device counters on this platform: printing them as 0.0 would
-        // read as "the device did nothing", which is not what was measured.
-        appendf(s, "    %-46s%8.1f MB/s   p99 %.2f ms\n",
-                label, p.payloadMbps, p.p99Us / 1e3);
-#else
         appendf(s, "    %-46s%8.1f MB/s   (device %.1f, %.1f KiB/op, QD %.1f)   p99 %.2f ms\n",
                 label, p.payloadMbps, p.devMbps, p.devOpKib, p.devQueueDepth, p.p99Us / 1e3);
-#endif
         // Every phase shows how its rate moved through the pass, not just where
         // it ended: an aggregate cannot show a drift, and a read pass can drift
         // for the same reasons a write one can.
@@ -1149,12 +1203,12 @@ std::string contextBlock(const Result& r, const DiskBenchOpts& o) {
     appendf(s, "\n");
   } else {
 #if defined(__APPLE__)
-    // The device is known (statfs named it above); what is missing is a way to
-    // describe it. There is no /sys here, so model, scheduler, rotational and
-    // size have no source — and no per-device counters either, which is why
-    // the before/after activity lines below are absent on this platform.
-    appendf(s, "  device    %s (not described — no /sys on this platform, "
-               "and no per-device counters)\n",
+    // Reached only when statfs could not name the mount; the normal Darwin
+    // path resolves the device and takes the branch above. Counters come from
+    // the IO registry, so what is missing here is the identification, not the
+    // measurement — model, scheduler, rotational and size have no source
+    // without /sys and stay absent rather than guessed.
+    appendf(s, "  device    %s (not resolved)\n",
             e.mnt.source.empty() ? "?" : e.mnt.source.c_str());
 #else
     appendf(s, "  device    (none — %s is not backed by a block device)\n",

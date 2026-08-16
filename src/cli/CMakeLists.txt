@@ -17,6 +17,10 @@ else()
 endif()
 
 add_executable(ucache main.cc ${UCACHE_DISKBENCH_SRC})
+if (APPLE)
+  # Per-device IO counters come from the IO registry here, not from /proc.
+  target_link_libraries(ucache PRIVATE "-framework IOKit" "-framework CoreFoundation")
+endif()
 target_compile_definitions(ucache PRIVATE UCACHE_VERSION="${PROJECT_VERSION}") # `ucache --version`
 
 # Build identity for measurement records. The version alone cannot distinguish

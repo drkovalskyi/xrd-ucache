@@ -24,6 +24,11 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
+#endif
 
 #if defined(__APPLE__)
 // Darwin has no fdatasync; fsync is the whole-file equivalent. It flushes
@@ -48,6 +53,65 @@ struct Dev {
   bool valid = false;
   uint64_t rd = 0, rdSect = 0, wr = 0, wrSect = 0, weightedMs = 0;
 };
+#if defined(__APPLE__)
+// Darwin has no /proc/diskstats, but the same counters exist in the IO
+// registry: every IOBlockStorageDriver publishes a Statistics dictionary
+// carrying per-device operation counts, byte counts and accumulated service
+// time. Walk up from the partition's IOMedia to the driver that owns the whole
+// disk, which is the level Linux's whole-disk row also reports at.
+//
+// One semantic note, because the field is reused rather than renamed: Linux's
+// weighted-ms is time-integrated queue depth, while Total Time is summed
+// per-operation service time. Divided by elapsed time both yield mean
+// concurrency, which is the only thing this field is used for.
+uint64_t cfU64(CFDictionaryRef d, CFStringRef key) {
+  if (!d)
+    return 0;
+  CFNumberRef n = static_cast<CFNumberRef>(CFDictionaryGetValue(d, key));
+  long long v = 0;
+  if (n && CFGetTypeID(n) == CFNumberGetTypeID())
+    CFNumberGetValue(n, kCFNumberLongLongType, &v);
+  return v < 0 ? 0 : static_cast<uint64_t>(v);
+}
+
+Dev devRead(const std::string& disk) {
+  Dev d;
+  if (disk.empty())
+    return d;
+  // 0 = the default IO main port; naming the constant would tie this file to a
+  // deployment target (the symbol was renamed in macOS 12 and the old spelling
+  // is deprecated, which -Werror would reject).
+  CFMutableDictionaryRef match = IOBSDNameMatching(0, 0, disk.c_str());
+  if (!match)
+    return d;
+  io_service_t node = IOServiceGetMatchingService(0, match); // consumes match
+  if (!node)
+    return d;
+  while (node && !IOObjectConformsTo(node, kIOBlockStorageDriverClass)) {
+    io_registry_entry_t parent = 0;
+    kern_return_t kr = IORegistryEntryGetParentEntry(node, kIOServicePlane, &parent);
+    IOObjectRelease(node);
+    node = (kr == KERN_SUCCESS) ? parent : 0;
+  }
+  if (!node)
+    return d;
+  CFDictionaryRef stats = static_cast<CFDictionaryRef>(IORegistryEntryCreateCFProperty(
+      node, CFSTR(kIOBlockStorageDriverStatisticsKey), kCFAllocatorDefault, 0));
+  IOObjectRelease(node);
+  if (!stats)
+    return d;
+  d.valid = true;
+  d.rd = cfU64(stats, CFSTR(kIOBlockStorageDriverStatisticsReadsKey));
+  d.wr = cfU64(stats, CFSTR(kIOBlockStorageDriverStatisticsWritesKey));
+  d.rdSect = cfU64(stats, CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey)) / 512ull;
+  d.wrSect = cfU64(stats, CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey)) / 512ull;
+  d.weightedMs = (cfU64(stats, CFSTR(kIOBlockStorageDriverStatisticsTotalReadTimeKey)) +
+                  cfU64(stats, CFSTR(kIOBlockStorageDriverStatisticsTotalWriteTimeKey))) /
+                 1000000ull; // ns -> ms
+  CFRelease(stats);
+  return d;
+}
+#else
 Dev devRead(const std::string& disk) {
   Dev d;
   if (disk.empty())
@@ -72,6 +136,7 @@ Dev devRead(const std::string& disk) {
   }
   return d;
 }
+#endif
 
 // Dirty pages right now, in GiB. Sampled through the fill so the record can say
 // whether the kernel's writeback threshold was actually approached, rather than
