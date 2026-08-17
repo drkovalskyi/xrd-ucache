@@ -18,9 +18,21 @@
 namespace ucache {
 namespace {
 uint64_t nowS() { return static_cast<uint64_t>(::time(nullptr)); }
-// Per-process sequence so multiple CacheStore instances (same host+pid+second)
-// get distinct stats files — else they share a file, dumpStats appends both, and
-// aggregateStats' last-line-per-file rule silently drops the earlier source.
+// Starting point for the stats-file suffix, so multiple CacheStore instances
+// (same host+pid+second) get distinct files — else they share one, dumpStats
+// appends both, and aggregateStats' last-line-per-file rule silently drops the
+// earlier source.
+//
+// This counter alone is NOT enough, because it is per-IMAGE, not per-process.
+// A client can load two copies of this library at once: XrdCl reads
+// /etc/xrootd/client.plugins.d, then the passwd home's client.plugins.d, then
+// XRD_PLUGINCONFDIR, and loads every library they name. When two of those name
+// DIFFERENT paths (a user's own install plus a self-contained one, which is
+// exactly what the benchmark kit ships), each copy has its own globals, each
+// starts this counter at 0, and both pick the same filename. The copy that
+// served nothing then appends its all-zero record last and becomes the one
+// every reader believes. So the name is claimed from the filesystem below
+// rather than assumed to be ours.
 std::atomic<uint64_t> g_statsSeq{0};
 
 std::string jsonEscape(const std::string& s) {
@@ -45,15 +57,41 @@ CacheStore::CacheStore(IOBackend& io, Config cfg) : io_(io), cfg_(std::move(cfg)
   io_.mkdirs(cfg_.cacheDir + "/stats", 0700);
   char host[256] = "unknown";
   ::gethostname(host, sizeof host - 1);
-  std::ostringstream p;
-  p << cfg_.cacheDir << "/stats/" << host << "-" << ::getpid() << "-" << nowS() << "-"
-    << g_statsSeq.fetch_add(1, std::memory_order_relaxed);
-  statsPath_ = p.str() + ".jsonl";
+  // Claim the name with O_EXCL: the only authority on whether a stats file is
+  // already spoken for is the filesystem, since a rival writer can be a
+  // separate copy of this library with its own counter (see g_statsSeq). The
+  // empty file left behind is harmless — aggregateStats skips a file with no
+  // complete line and does not count it — and reserving it closes the window
+  // between choosing a name and first writing to it.
+  std::string stem;
+  bool collided = false;
+  for (unsigned tries = 0; tries < 1024; ++tries) {
+    std::ostringstream p;
+    p << cfg_.cacheDir << "/stats/" << host << "-" << ::getpid() << "-" << nowS() << "-"
+      << g_statsSeq.fetch_add(1, std::memory_order_relaxed);
+    stem = p.str();
+    int fd = io_.open(stem + ".jsonl", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+      io_.close(fd);
+      break;
+    }
+    if (errno != EEXIST)
+      break; // not a name clash (read-only dir, ENOSPC): keep this name and let
+             // the ordinary write path report the real error
+    collided = true;
+  }
+  if (collided)
+    UCACHE_WARN("another uCache instance is already writing stats for this "
+                "process — two copies of the plugin are loaded (check for a "
+                "second conf naming a different library in "
+                "/etc/xrootd/client.plugins.d, ~/.xrootd/client.plugins.d, or "
+                "XRD_PLUGINCONFDIR); each keeps its own counters");
+  statsPath_ = stem + ".jsonl";
   // Stats companions share the stem: <stem>.files.jsonl (per-entry
   // records) and <stem>.trace.jsonl (sampled IO trace, opt-in).
-  obsSink_ = std::make_shared<FileEntry::ObsSink>(io_, p.str() + ".files.jsonl");
+  obsSink_ = std::make_shared<FileEntry::ObsSink>(io_, stem + ".files.jsonl");
   if (cfg_.trace == "io") {
-    tracer_ = std::make_unique<Tracer>(io_, p.str() + ".trace.jsonl", cfg_.traceSample);
+    tracer_ = std::make_unique<Tracer>(io_, stem + ".trace.jsonl", cfg_.traceSample);
     stats_.tracer = tracer_.get(); // set before any entry/thread exists
   }
   resolveBudget();
@@ -94,6 +132,15 @@ void CacheStore::resolveBudget() {
   // default floor path uses statvfs and needs no per-startup scan.
   if (cfg_.maxBytes > 0)
     approxUsage_.store(usageBytes(), std::memory_order_relaxed);
+}
+
+void CacheStore::disableStatsDump() {
+  dumpStatsOnDtor_ = false;
+  // Only if still untouched: a caller that disables dumping after something was
+  // already written would otherwise destroy a real record.
+  struct ::stat st {};
+  if (io_.stat(statsPath_, &st) == 0 && st.st_size == 0)
+    io_.unlink(statsPath_);
 }
 
 CacheStore::~CacheStore() {

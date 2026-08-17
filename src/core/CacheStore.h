@@ -150,7 +150,10 @@ class CacheStore {
   void dumpStats(bool finalDump = false);
   // The CLI opens a store only to read/mutate; suppress the destructor's stats
   // dump so `ucache` invocations don't litter stats/ with zero-counter lines.
-  void disableStatsDump() { dumpStatsOnDtor_ = false; }
+  // Also drops the stats file the constructor reserved, while it is still
+  // empty — reserving the NAME is what keeps two loaded copies of this library
+  // apart, but a CLI call that will never write must not leave one behind.
+  void disableStatsDump();
 
  private:
   // Sidecar-adjacent artifacts observed in the shard listing: removal
