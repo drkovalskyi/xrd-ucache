@@ -106,7 +106,7 @@ class RetryingOpenHandler : public ResponseHandler {
  public:
   RetryingOpenHandler(std::shared_ptr<HandleState> st, std::string url,
                       XrdCl::OpenFlags::Flags flags, XrdCl::Access::Mode mode,
-                      uint16_t timeout, ResponseHandler* real, const Config& cfg)
+                      ucache::XrdTimeout timeout, ResponseHandler* real, const Config& cfg)
       : st_(std::move(st)), url_(std::move(url)), flags_(flags), mode_(mode),
         timeout_(timeout), real_(real), cfg_(cfg) {}
 
@@ -192,7 +192,7 @@ class RetryingOpenHandler : public ResponseHandler {
   std::string url_;
   XrdCl::OpenFlags::Flags flags_;
   XrdCl::Access::Mode mode_;
-  uint16_t timeout_;
+  ucache::XrdTimeout timeout_;
   ResponseHandler* real_;
   const Config& cfg_;
   int attempt_ = 0;
@@ -291,7 +291,7 @@ bool HandleState::ensureInnerOpen() {
   // the inner connection IS the client's connection.
   const std::string fillUrl = stripCgiParams(url, {"tried", "triedrc"});
   XRootDStatus s = inner->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read,
-                               XrdCl::Access::None, static_cast<uint16_t>(0));
+                               XrdCl::Access::None, static_cast<ucache::XrdTimeout>(0));
   // Case B: bounded synchronous retry of a TRANSIENT lazy
   // open on a FRESH inner file (a failed open is terminal). The sleeps run on
   // this caller/executor thread under innerOpenMu — the deliberate asymmetry
@@ -305,7 +305,7 @@ bool HandleState::ensureInnerOpen() {
     std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs(retry, cfg)));
     XrdCl::File* fresh = resetInner();
     s = fresh->Open(faultOpenUrl(fillUrl, ++lazyOpenAttempt), OF::Read, XrdCl::Access::None,
-                    static_cast<uint16_t>(0));
+                    static_cast<ucache::XrdTimeout>(0));
   }
   if (!s.IsOK() && retry > 1 && store) // retried at least once and still failed
     store->stats().openRetriesExhausted.fetch_add(1, std::memory_order_relaxed);
@@ -623,7 +623,7 @@ class MissReadHandler : public ResponseHandler {
 // wire-read fault: the injected completion is posted to the executor, standing
 // in for the XrdCl callback thread, so the handler runs its real error path.
 XRootDStatus issueWireRead(XrdCl::File* f, uint64_t off, uint64_t len, void* buf,
-                           MissReadHandler* mh, uint16_t timeout) {
+                           MissReadHandler* mh, ucache::XrdTimeout timeout) {
   if (readFaultFire()) {
     Executor::instance().post([mh] {
       mh->HandleResponseWithHosts(
@@ -1103,7 +1103,7 @@ void writeCostSidecar(const std::string& url, const Config& cfg, uint64_t cpuUs,
 
 XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::Flags flags,
                                      XrdCl::Access::Mode mode, ResponseHandler* handler,
-                                     uint16_t timeout) {
+                                     ucache::XrdTimeout timeout) {
   st_->cpu0Us = processCpuUs(); // CPU-span start
   if (gOpenUCacheHandles.fetch_add(1) > 0)
     st_->cpuBlended = true; // another handle already open: spans overlap
@@ -1404,7 +1404,7 @@ void queueRecompress(const std::string& url, const Config& cfg) {
     ::posix_spawn_file_actions_destroy(&fa);
 }
 
-XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, uint16_t timeout) {
+XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   // Wait for queued page persists before flushing meta, so the cache is
   // complete on disk when the process (which may exit right after Close)
   // goes away. This blocks Close, never a read (§5.2 step 4).
@@ -1446,7 +1446,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, uint16_t timeout
 }
 
 XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
-                                     uint16_t timeout) {
+                                     ucache::XrdTimeout timeout) {
   // A trusted cache-only handle (UCACHE_REVALIDATE_S) answers Stat from local
   // metadata for BOTH force values — the whole point is to not touch the
   // origin. If setup degrades (entry gone), it opens the origin and we fall
@@ -1511,7 +1511,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
 }
 
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
-                                     ResponseHandler* handler, uint16_t timeout) {
+                                     ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
   if (entry)
     noteRequestBytes(st_, size);
@@ -1650,7 +1650,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 // has stale patched windows — so it is served from the stitched view with
 // locally computed kXR page checksums (crc32c, same as the wire protocol).
 XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buffer,
-                                       ResponseHandler* handler, uint16_t timeout) {
+                                       ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
   if (entry)
     noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
@@ -1718,7 +1718,7 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 }
 
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
-                                           ResponseHandler* handler, uint16_t timeout) {
+                                           ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
   auto chunkSum = [&chunks] {
     uint64_t n = 0;
@@ -1837,45 +1837,45 @@ void UCacheFile::invalidateOnWrite() {
 }
 
 XrdCl::XRootDStatus UCacheFile::Write(uint64_t offset, uint32_t size, const void* buffer,
-                                      ResponseHandler* handler, uint16_t timeout) {
+                                      ResponseHandler* handler, ucache::XrdTimeout timeout) {
   invalidateOnWrite();
   return st_->inner->Write(offset, size, buffer, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Write(uint64_t offset, XrdCl::Buffer&& buffer,
-                                      ResponseHandler* handler, uint16_t timeout) {
+                                      ResponseHandler* handler, ucache::XrdTimeout timeout) {
   invalidateOnWrite();
   return st_->inner->Write(offset, std::move(buffer), handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::VectorWrite(const ChunkList& chunks,
-                                            ResponseHandler* handler, uint16_t timeout) {
+                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   invalidateOnWrite();
   return st_->inner->VectorWrite(chunks, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::WriteV(uint64_t offset, const struct iovec* iov, int iovcnt,
-                                       ResponseHandler* handler, uint16_t timeout) {
+                                       ResponseHandler* handler, ucache::XrdTimeout timeout) {
   invalidateOnWrite();
   return st_->inner->WriteV(offset, iov, iovcnt, handler, timeout);
 }
 
-XrdCl::XRootDStatus UCacheFile::Sync(ResponseHandler* handler, uint16_t timeout) {
+XrdCl::XRootDStatus UCacheFile::Sync(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   return st_->inner->Sync(handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Truncate(uint64_t size, ResponseHandler* handler,
-                                         uint16_t timeout) {
+                                         ucache::XrdTimeout timeout) {
   invalidateOnWrite();
   return st_->inner->Truncate(size, handler, timeout);
 }
 
 XrdCl::XRootDStatus UCacheFile::Fcntl(const XrdCl::Buffer& arg, ResponseHandler* handler,
-                                      uint16_t timeout) {
+                                      ucache::XrdTimeout timeout) {
   return st_->inner->Fcntl(arg, handler, timeout);
 }
 
-XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, uint16_t timeout) {
+XrdCl::XRootDStatus UCacheFile::Visa(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   return st_->inner->Visa(handler, timeout);
 }
 

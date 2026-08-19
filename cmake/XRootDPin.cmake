@@ -7,10 +7,10 @@ set(UCACHE_XROOTD_ROOT
     CACHE PATH "XRootD client install (headers + libXrdCl)")
 # SERVER side of the bench harness (origin + XCache instances): host 5.9.6.
 set(UCACHE_XROOTD_SERVER_VERSION "5.9.6")
-# Acceptable range for building/linking: the plugin implements the 5.x
-# FilePlugIn interface, so both ends are real constraints.
+# Acceptable range for building/linking: the plugin implements the FilePlugIn
+# interface of majors 5 and 6, so both ends are real constraints.
 set(UCACHE_XROOTD_MINIMUM "5.6")
-set(UCACHE_XROOTD_NEXT_MAJOR "6.0")
+set(UCACHE_XROOTD_NEXT_MAJOR "7.0")
 
 # Fail configure if the discovered XRootD client is older than the plugin-ABI
 # minimum — the compile-time half of fail-open: a too-old XrdCl
@@ -39,16 +39,18 @@ function(ucache_require_xrootd_version include_dir)
       "(plugin ABI). Install a newer xrootd-client-devel or set UCACHE_XROOTD_ROOT.")
   endif()
   # And an UPPER bound, because the interface we implement is versioned too.
-  # XRootD 6 changed FilePlugIn's signatures (the timeout parameter became
-  # time_t), so every method we declare stops overriding anything and the
-  # compiler reports each one separately — around forty errors that say nothing
-  # about the actual cause. One sentence here is worth more than all of them.
+  # 5.x and 6.x are both supported: 6 widened FilePlugIn's timeout parameter
+  # from uint16_t to time_t, and the plugin follows it through the alias in
+  # src/plugin/XrdClTimeout.h. A future major may change more than a type, and
+  # an override that silently matches nothing is the failure this guards: the
+  # compiler would report one error per method and name the cause in none of
+  # them. Raise this only with a build against the new headers to prove it.
   if(NOT _found VERSION_LESS "${UCACHE_XROOTD_NEXT_MAJOR}")
     message(FATAL_ERROR
       "ucache: XRootD client ${_found} implements a plugin interface this code does not "
-      "target — the FilePlugIn signatures changed in ${UCACHE_XROOTD_NEXT_MAJOR}. Build against a "
-      "5.x client (set UCACHE_XROOTD_ROOT to its prefix). At runtime a mismatched client simply "
-      "declines to load the plugin, so jobs keep working uncached; only the build must be told.")
+      "target — 5.x and 6.x are supported. Build against one of those (set UCACHE_XROOTD_ROOT to "
+      "its prefix). At runtime a client of a different major than the plugin was built for does "
+      "not use the plugin, so jobs keep working uncached; only the build must be told.")
   endif()
   message(STATUS "ucache: XRootD client ${_found} (>= ${UCACHE_XROOTD_MINIMUM} required) — OK")
 endfunction()

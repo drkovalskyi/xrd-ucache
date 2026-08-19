@@ -29,6 +29,7 @@
 #include "CacheStore.h"
 #include "Config.h"
 #include "ReplicaStore.h"
+#include "XrdClTimeout.h"
 
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClPlugInInterface.hh>
@@ -130,30 +131,30 @@ class UCacheFile : public XrdCl::FilePlugIn {
 
   XrdCl::XRootDStatus Open(const std::string& url, XrdCl::OpenFlags::Flags flags,
                            XrdCl::Access::Mode mode, XrdCl::ResponseHandler* handler,
-                           uint16_t timeout) override;
-  XrdCl::XRootDStatus Close(XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                           ucache::XrdTimeout timeout) override;
+  XrdCl::XRootDStatus Close(XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus Stat(bool force, XrdCl::ResponseHandler* handler,
-                           uint16_t timeout) override;
+                           ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus Read(uint64_t offset, uint32_t size, void* buffer,
-                           XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                           XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus PgRead(uint64_t offset, uint32_t size, void* buffer,
-                             XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                             XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus VectorRead(const XrdCl::ChunkList& chunks, void* buffer,
-                                 XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                                 XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus Write(uint64_t offset, uint32_t size, const void* buffer,
-                            XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                            XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus Write(uint64_t offset, XrdCl::Buffer&& buffer,
-                            XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                            XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus VectorWrite(const XrdCl::ChunkList& chunks,
-                                  XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                                  XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus WriteV(uint64_t offset, const struct iovec* iov, int iovcnt,
-                             XrdCl::ResponseHandler* handler, uint16_t timeout) override;
-  XrdCl::XRootDStatus Sync(XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                             XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
+  XrdCl::XRootDStatus Sync(XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus Truncate(uint64_t size, XrdCl::ResponseHandler* handler,
-                               uint16_t timeout) override;
+                               ucache::XrdTimeout timeout) override;
   XrdCl::XRootDStatus Fcntl(const XrdCl::Buffer& arg, XrdCl::ResponseHandler* handler,
-                            uint16_t timeout) override;
-  XrdCl::XRootDStatus Visa(XrdCl::ResponseHandler* handler, uint16_t timeout) override;
+                            ucache::XrdTimeout timeout) override;
+  XrdCl::XRootDStatus Visa(XrdCl::ResponseHandler* handler, ucache::XrdTimeout timeout) override;
   bool IsOpen() const override;
   bool SetProperty(const std::string& name, const std::string& value) override;
   bool GetProperty(const std::string& name, std::string& value) const override;
