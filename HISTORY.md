@@ -8,7 +8,19 @@ Versions are `0.y.z` while the project is pre-production: `y` adds capability,
 
 **Across every release so far:** the on-disk cache format has not changed, so a
 newer release reads a cache written by an older one. Recompression stays off
-unless you turn it on. Any XRootD 5.6 or newer 5.x client works.
+unless you turn it on. Any XRootD 5.6 or newer 5.x client works; 6.x from
+v0.21.0.
+
+## v0.21.0 — 2026-08-21
+- XRootD 6 clients are supported — the plugin builds against and loads into 6 as
+  well as 5.
+- A running job no longer evicts its own working set: an entry is not an eviction
+  candidate while it was read within the last day.
+- When the cache is full of such entries it stops caching new files rather than
+  evicting data the job still needs, and `ucache status` says so. Reads keep
+  working, uncached. `evict_protect_seconds = 0` restores the old behaviour.
+- Recompression accepts ZLIB sources by default as well as LZMA, so it no longer
+  declines a ZLIB dataset without being told to.
 
 ## v0.20.0 — 2026-08-16
 - The plugin, the CLI and the tests build and run on macOS (Apple silicon,
