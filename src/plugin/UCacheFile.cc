@@ -1241,8 +1241,14 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
     std::unique_ptr<XrdCl::StatInfo> sip(si);
     if (s.IsOK() && si && allowed) {
       statClone = std::make_unique<XrdCl::StatInfo>(*si);
-      entry = st_->store->open(*key, si->GetSize(), si->GetModTime());
-      if (!entry)
+      bool declinedForSpace = false;
+      entry = st_->store->open(*key, si->GetSize(), si->GetModTime(),
+                               MetaData::kCksumNone, 0, &declinedForSpace);
+      // A capacity DECISION is not a fail-open. failopenEvents means something
+      // went wrong and every benchmark requires it to be zero, so counting a
+      // deliberate decline there would make a cache that is merely full look
+      // broken. The read proceeds uncached either way; only the reason differs.
+      if (!entry && !declinedForSpace)
         st_->store->stats().failopenEvents.fetch_add(1, std::memory_order_relaxed);
       // Transposed replica: adopt the stitched view when one
       // validates + fully verifies (openView); the reported size becomes

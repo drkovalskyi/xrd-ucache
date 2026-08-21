@@ -150,7 +150,9 @@ CacheStore::~CacheStore() {
 
 std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSize,
                                             uint64_t originMtime, uint8_t cksumKind,
-                                            uint32_t originCksum) {
+                                            uint32_t originCksum, bool* declinedForSpace) {
+  if (declinedForSpace)
+    *declinedForSpace = false;
   {
     std::lock_guard<std::mutex> g(regMu_);
     auto it = registry_.find(key.hashHex);
@@ -162,6 +164,27 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
       registry_.erase(it);
     }
   }
+  // Growth has stopped: every resident entry was read too recently to evict.
+  // Decline entries we do not already hold, and hold that line PER ENTRY. Doing
+  // it per PAGE instead would converge on every file partially cached, which for
+  // a columnar read still needs an origin round trip per file and so keeps the
+  // bytes while giving up most of the benefit. An entry already on disk is always
+  // admitted: it is not growth, and refusing it would leave a partial entry.
+  struct ::stat mst{};
+  if (admissionBlocked_.load(std::memory_order_relaxed) &&
+      io_.stat(key.metaPath(cfg_.cacheDir), &mst) != 0) {
+    if (declinedForSpace)
+      *declinedForSpace = true;
+    stats_.admissionsBypassed.fetch_add(1, std::memory_order_relaxed);
+    if (!blockedWarned_.exchange(true, std::memory_order_relaxed))
+      UCACHE_WARN("cache is full of entries read within the last %us, so new files are "
+                  "no longer being cached (reads still work, uncached). Free space with "
+                  "`ucache evict --older-than <dur>`, lower `evict_protect_seconds`, or "
+                  "use a bigger cache disk",
+                  cfg_.evictProtectSeconds);
+    return nullptr; // NOT a fail-open: the caller must not count it as one
+  }
+
   auto entry = FileEntry::open(io_, cfg_, stats_, key, originSize, originMtime, cksumKind,
                                originCksum,
                                [this](uint64_t b, bool ev) { notePersisted(b, ev); });
@@ -408,6 +431,17 @@ int CacheStore::evictNow() {
     return false;
   };
 
+  // Entries read within this window are not candidates, so a running analysis
+  // cannot evict its own working set. The cutoff is computed ONCE per pass: a
+  // per-entry `now` would let entries read during the pass drift across the
+  // boundary and make the decision depend on how long the scan took.
+  const uint64_t passNow = nowS(); // file-local helper; one reading for the pass
+  const uint64_t protectCutoff =
+      cfg_.evictProtectSeconds && passNow > cfg_.evictProtectSeconds
+          ? passNow - cfg_.evictProtectSeconds
+          : 0; // 0 => protect nothing (window off, or the clock is absurdly early)
+  bool sawProtected = false;
+
   int evicted = 0;
   if (needEvict()) {
     std::sort(scans.begin(), scans.end(),
@@ -417,6 +451,13 @@ int CacheStore::evictNow() {
         break;
       if (s.pinned || liveHashes.count(s.hashHex))
         continue; // never evict pinned or currently-open entries
+      if (protectCutoff && s.atime >= protectCutoff) {
+        // Sorted oldest-first, so everything after this is protected too — but
+        // keep scanning rather than breaking: a later entry may be unprotected if
+        // atime resolution ties, and the loop is over an in-memory vector.
+        sawProtected = true;
+        continue;
+      }
       // Honor a pin that landed after the scan snapshot (a CLI `pin` racing us).
       if (auto m = MetaFile::load(io_, s.metaPath); m && (m->flags & MetaData::kFlagPinned))
         continue;
@@ -450,6 +491,17 @@ int CacheStore::evictNow() {
                 static_cast<unsigned long long>(usage));
   }
   sweepReplicaOrphans();
+  // Growth stops when the budget is still exceeded AND the only thing standing in
+  // the way is the protection window. Deliberately NOT latched when the blocker is
+  // the pinned/open set: that case predates this window, is handled by the
+  // over-budget rate-limit bypass, and blaming it on the window would make both
+  // the WARN and the doctor finding name the wrong cause. Cleared as soon as a
+  // victim becomes eligible, so a pass that frees something re-opens admission.
+  admissionBlocked_.store(needEvict() && sawProtected, std::memory_order_relaxed);
+  if (needEvict() && sawProtected)
+    UCACHE_INFO("eviction: over budget with every candidate inside the %us protection "
+                "window — new entries will not be admitted until one ages out",
+                cfg_.evictProtectSeconds);
   // Reconcile the per-process running estimate to the authoritative scan total,
   // and record whether this pass made progress (drives the over-budget bypass).
   approxUsage_.store(usage, std::memory_order_relaxed);

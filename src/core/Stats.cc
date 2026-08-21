@@ -79,6 +79,7 @@ std::string Stats::toJsonBody() const {
   f("evicted_entries", evictedEntries);
   f("evicted_bytes", evictedBytes);
   f("failopen_events", failopenEvents);
+  f("admissions_bypassed", admissionsBypassed);
   f("open_retries", openRetries);
   f("open_retries_exhausted", openRetriesExhausted);
   f("disabled_handles", disabledHandles);
@@ -159,6 +160,7 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.evictedEntries += extractU64(last, "evicted_entries");
     t.evictedBytes += extractU64(last, "evicted_bytes");
     t.failopenEvents += extractU64(last, "failopen_events");
+    t.admissionsBypassed += extractU64(last, "admissions_bypassed");
     t.openRetries += extractU64(last, "open_retries");
     t.openRetriesExhausted += extractU64(last, "open_retries_exhausted");
     t.replicaOpens += extractU64(last, "replica_opens");

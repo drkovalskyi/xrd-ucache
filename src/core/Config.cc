@@ -142,6 +142,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.lowWater = ::atof(v.c_str());
   else if (k == "evict_check_seconds")
     c.evictCheckSeconds = ::atoi(v.c_str());
+  else if (k == "evict_protect_seconds")
+    c.evictProtectSeconds = static_cast<uint32_t>(::atol(v.c_str()));
   else if (k == "validate")
     setValidate(c, v);
   else if (k == "fsync")
@@ -328,6 +330,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"max_bytes", "UCACHE_MAX_BYTES"},
       {"min_free_bytes", "UCACHE_MIN_FREE_BYTES"},
       {"evict_check_seconds", "UCACHE_EVICT_CHECK_S"},
+      {"evict_protect_seconds", "UCACHE_EVICT_PROTECT_S"},
       {"high_water", "UCACHE_HIGH_WATER"},
       {"low_water", "UCACHE_LOW_WATER"},
       {"validate", "UCACHE_VALIDATE"},
@@ -387,6 +390,8 @@ std::string Config::valueOf(const std::string& key) const {
     return minFreeBytes ? std::to_string(minFreeBytes) : std::string(budgetAuto ? "0 (auto)" : "0");
   if (key == "evict_check_seconds")
     return std::to_string(evictCheckSeconds);
+  if (key == "evict_protect_seconds")
+    return std::to_string(evictProtectSeconds);
   if (key == "high_water" || key == "low_water") {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.2f", key == "high_water" ? highWater : lowWater);

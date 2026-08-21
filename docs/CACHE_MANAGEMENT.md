@@ -169,6 +169,40 @@ not have to schedule anything. There are two ways to bound growth:
 | **Free-space floor** (default) | `UCACHE_MIN_FREE_BYTES`, or automatic | Use the disk freely; evict LRU whole entries whenever free space drops below the floor. Auto floor = `min(50 GiB, 10% of the volume)`, clamped to at most half of the free space at startup. |
 | **Hard size cap** (opt-in) | `UCACHE_MAX_BYTES` | Cap the cache at a fixed size; when it reaches 90% of the cap, evict down to 75%. |
 
+### A running job will not evict its own data
+
+Whichever limit is in force, an entry is **not** an eviction candidate while it
+was read within `evict_protect_seconds` (default **1 day**). Data untouched for
+longer — an earlier, finished piece of work — is what gets given up first.
+
+This matters when the cache is smaller than what a job reads. Plain LRU is at its
+worst on a repeated sequential pass: the entry it picks to evict is precisely the
+one wanted next, so almost every read misses, refetches, and evicts the following
+one. The cache ends up doing the work of no cache while still paying to write
+everything. Holding a stable subset instead gives you hits in proportion to how
+much of the data fits.
+
+So when the disk is full and every remaining entry is too recent to touch, uCache
+**stops caching new files** rather than evicting data the running job still needs.
+Reads keep working — they just go to the origin, uncached. `ucache status` says so
+in its `protected` line, and `ucache stats` counts it as `admissions_bypassed`:
+
+```
+protected : 1204 entries (118.2 GiB) read within the last 1d — ALL of them, and the
+            disk is at the floor, so NEW FILES ARE NOT BEING CACHED.
+            `ucache evict --older-than <dur>`, or lower evict_protect_seconds
+```
+
+Three ways out, in the order usually worth trying: give the cache a bigger disk;
+free space explicitly with `ucache evict --older-than 2h`; or shorten the window
+with `ucache set evict_protect_seconds 3600`. Setting it to `0` restores plain
+LRU, including its behaviour on the pass above.
+
+The window is a *duration*, so size it to how often the work repeats rather than
+to how long one job runs. A day suits work rerun daily. Two cautions: a single
+job that runs longer than the window can age out of its own protection, and a job
+whose runs are further apart than the window loses protection between them.
+
 ### How much space a replica adds
 
 Recompressed replicas are a first-class consumer of the same volume, and how

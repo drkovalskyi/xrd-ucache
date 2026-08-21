@@ -454,6 +454,10 @@ TEST(ReplicaStore, EvictionAccountsAndRemovesReplica) {
   // Force a full eviction via a tiny byte cap on a fresh store instance.
   Config evictCfg = f.cfg;
   evictCfg.maxBytes = 1; // everything is over budget
+  // Orthogonal to the eviction protection window: the entry was written moments
+  // ago, which the shipped 1-day window protects by design. Turn it off so this
+  // case still measures replica accounting and removal.
+  evictCfg.evictProtectSeconds = 0;
   CacheStore s2(f.io, evictCfg);
   s2.disableStatsDump();
   EXPECT_EQ(s2.evictNow(), 1);

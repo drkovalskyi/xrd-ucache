@@ -68,6 +68,12 @@ TEST(CacheStore, UsageAndEviction) {
   cfg.maxBytes = 1000000;
   cfg.highWater = 0.5; // 500 KB
   cfg.lowWater = 0.25; // 250 KB
+  // This case is about the BYTE BUDGET, not the protection window: entries are
+  // written and immediately evicted, so with the shipped 1-day window every one
+  // of them would be immune and nothing would be evicted. Turn the window off so
+  // the test measures what it means to measure; the window has its own cases
+  // below.
+  cfg.evictProtectSeconds = 0;
   CacheStore store(io, cfg);
 
   auto src = test::randomBytes(200 * 4096, 5); // 800 KB source
@@ -107,6 +113,10 @@ TEST(CacheStore, EvictNowFailsCleanlyWhenAnotherProcessHoldsLock) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = td.path();
+  // Orthogonal to the protection window: this case writes entries and evicts them
+  // immediately, which the shipped 1-day window forbids by design. Turn it off so
+  // the case still measures the budget/floor mechanics it was written for.
+  cfg.evictProtectSeconds = 0;
   cfg.maxBytes = 100000;
   CacheStore store(io, cfg);
   auto src = test::randomBytes(50 * 4096, 7);
@@ -134,6 +144,10 @@ TEST(CacheStore, EvictionSkipsPinned) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = td.path();
+  // Orthogonal to the protection window: this case writes entries and evicts them
+  // immediately, which the shipped 1-day window forbids by design. Turn it off so
+  // the case still measures the budget/floor mechanics it was written for.
+  cfg.evictProtectSeconds = 0;
   cfg.maxBytes = 100000;
   cfg.highWater = 0.5;
   cfg.lowWater = 0.1; // target 10 KB: below one entry -> wants to evict all
@@ -497,6 +511,10 @@ TEST(CacheStore, StatvfsFloorTriggersEvictionRespectingPins) {
   FaultIO io{real};
   Config cfg;
   cfg.cacheDir = td.path();
+  // Orthogonal to the protection window: this case writes entries and evicts them
+  // immediately, which the shipped 1-day window forbids by design. Turn it off so
+  // the case still measures the budget/floor mechanics it was written for.
+  cfg.evictProtectSeconds = 0;
   cfg.maxBytes = 100ull << 30; // huge: the byte trigger never fires
   cfg.minFreeBytes = 50ull << 30;
   cfg.evictCheckSeconds = 0;
@@ -647,6 +665,10 @@ TEST(CacheStore, DiskFloorEvictsWithByteBudgetDisabled) {
   FaultIO io{real};
   Config cfg;
   cfg.cacheDir = td.path();
+  // Orthogonal to the protection window: this case writes entries and evicts them
+  // immediately, which the shipped 1-day window forbids by design. Turn it off so
+  // the case still measures the budget/floor mechanics it was written for.
+  cfg.evictProtectSeconds = 0;
   cfg.maxBytes = 0;               // byte budget OFF
   cfg.minFreeBytes = 50ull << 30; // disk floor ON
   cfg.evictCheckSeconds = 0;
@@ -709,6 +731,10 @@ TEST(CacheStore, DiskFloorEvictsOnlyEnoughToClearFloor) {
   FaultIO io{real};
   Config cfg;
   cfg.cacheDir = td.path();
+  // Orthogonal to the protection window: this case writes entries and evicts them
+  // immediately, which the shipped 1-day window forbids by design. Turn it off so
+  // the case still measures the budget/floor mechanics it was written for.
+  cfg.evictProtectSeconds = 0;
   cfg.maxBytes = 100ull << 30; // byte trigger off (usage tiny)
   cfg.minFreeBytes = 1000000;  // resumeFree = 1,100,000
   cfg.evictCheckSeconds = 0;
@@ -739,6 +765,10 @@ TEST(CacheStore, BudgetEnforcedDespiteLazySidecarFlush) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = td.path();
+  // Orthogonal to the protection window: this case writes entries and evicts them
+  // immediately, which the shipped 1-day window forbids by design. Turn it off so
+  // the case still measures the budget/floor mechanics it was written for.
+  cfg.evictProtectSeconds = 0;
   cfg.maxBytes = 1000000; // 1 MB
   cfg.highWater = 0.5;    // 500 KB
   cfg.lowWater = 0.25;    // 250 KB
@@ -811,6 +841,10 @@ TEST(CacheStore, EvictNowDropsListedArtifactsWithEntry) {
   RealIO io;
   Config cfg;
   cfg.cacheDir = td.path();
+  // Orthogonal to the protection window: this case writes entries and evicts them
+  // immediately, which the shipped 1-day window forbids by design. Turn it off so
+  // the case still measures the budget/floor mechanics it was written for.
+  cfg.evictProtectSeconds = 0;
   cfg.maxBytes = 100 * 4096; // force everything over budget
   cfg.highWater = 0.5;
   cfg.lowWater = 0.25;
@@ -874,4 +908,121 @@ TEST(CacheStoreBudget, EffectiveFloorIsAnswerableBeforeResolution) {
   ucache::Config offCfg = cfg;
   offCfg.budgetAuto = false;
   EXPECT_EQ(ucache::CacheStore::effectiveMinFree(offCfg, io), 0u);
+}
+
+// --- Eviction protection window (Config::evictProtectSeconds) --------------
+//
+// LRU is pessimal for a cyclic scan: with a cache smaller than the working set
+// the victim it picks is exactly the entry wanted next, so the hit rate
+// collapses toward zero instead of the C/W a policy that simply held still
+// would reach. These pin the behaviour that prevents a running job from
+// evicting its own working set, while leaving an EARLIER study's data as the
+// first thing given up.
+//
+// Atimes are set explicitly rather than slept for, so the tests are
+// deterministic and cost nothing.
+namespace {
+// Three 160 KB entries against a 500 KB high / 250 KB low water budget: plain
+// LRU must remove two. Returns the store so the caller can vary the window.
+struct EvictFixture {
+  test::TempDir td;
+  RealIO io;
+  Config cfg;
+  std::unique_ptr<CacheStore> store;
+
+  explicit EvictFixture(uint32_t protectSeconds, uint64_t atimeBase) {
+    cfg.cacheDir = td.path();
+    cfg.maxBytes = 1000000;
+    cfg.highWater = 0.5;
+    cfg.lowWater = 0.25;
+    cfg.evictProtectSeconds = protectSeconds;
+    store = std::make_unique<CacheStore>(io, cfg);
+    auto src = test::randomBytes(40 * 4096, 7);
+    for (int n = 0; n < 3; ++n) {
+      auto e = store->open(keyN(n), src.size());
+      if (!e)
+        return;
+      e->writePages(0, 40 * 4096, src.data());
+      e->flushMeta(true);
+    }
+    // Atimes are stamped AFTER the entries are released: FileEntry's destructor
+    // flushes its sidecar with a fresh atime, so setting them while an entry is
+    // alive is silently undone. (The pre-existing UsageAndEviction test set them
+    // inside the loop and never noticed, because it only counts evictions.)
+    for (int n = 0; n < 3; ++n)
+      setAtime(io, cfg, keyN(n), atimeBase + n);
+  }
+};
+uint64_t nowSecs() { return static_cast<uint64_t>(::time(nullptr)); }
+} // namespace
+
+TEST(CacheStore, ProtectWindowKeepsRecentEntriesAndStopsGrowth) {
+  // Every entry read "just now" and a 1-day window: nothing may be evicted even
+  // though the budget is exceeded, and the store reports that it has stopped
+  // growing rather than quietly evicting the caller's own data.
+  EvictFixture f(86400, nowSecs());
+  ASSERT_TRUE(f.store);
+  EXPECT_EQ(f.store->evictNow(), 0);
+  EXPECT_TRUE(f.store->admissionBlocked());
+  EXPECT_EQ(f.store->usageBytes(), 3u * 40 * 4096); // all three still there
+}
+
+TEST(CacheStore, ProtectWindowZeroIsPlainLru) {
+  // The knob off must reproduce the previous behaviour exactly — two of three
+  // evicted — so the feature cannot change anyone's cache until they ask.
+  EvictFixture f(0, nowSecs());
+  ASSERT_TRUE(f.store);
+  EXPECT_EQ(f.store->evictNow(), 2);
+  EXPECT_FALSE(f.store->admissionBlocked());
+}
+
+TEST(CacheStore, ProtectWindowStillEvictsAnEarlierStudy) {
+  // Data untouched for far longer than the window — a finished study — is what
+  // the cache gives up. That is the whole point of protecting by LAST USE.
+  EvictFixture f(3600, 1000); // atimes ~1970, window 1h
+  ASSERT_TRUE(f.store);
+  EXPECT_EQ(f.store->evictNow(), 2);
+  EXPECT_FALSE(f.store->admissionBlocked());
+}
+
+TEST(CacheStore, ProtectWindowEvictsOnlyTheAgedEntry) {
+  // Mixed ages: only the one outside the window is eligible, so eviction stops
+  // there even though the budget is still exceeded.
+  EvictFixture f(3600, nowSecs());
+  ASSERT_TRUE(f.store);
+  setAtime(f.io, f.cfg, keyN(1), 1000); // age one entry out of the window
+  EXPECT_EQ(f.store->evictNow(), 1);
+  EXPECT_TRUE(f.store->admissionBlocked()); // still over budget, rest protected
+}
+
+TEST(CacheStore, BlockedDeclinesNewEntriesButNotResidentOnes) {
+  EvictFixture f(86400, nowSecs());
+  ASSERT_TRUE(f.store);
+  ASSERT_EQ(f.store->evictNow(), 0);
+  ASSERT_TRUE(f.store->admissionBlocked());
+  const uint64_t failopenBefore = f.store->stats().failopenEvents.load();
+
+  // A key the cache does not hold is declined — and NOT as a fail-open, which
+  // means "something went wrong" and which every benchmark requires to be zero.
+  bool declined = false;
+  auto fresh = f.store->open(keyN(99), 4096, 0, MetaData::kCksumNone, 0, &declined);
+  EXPECT_FALSE(fresh);
+  EXPECT_TRUE(declined);
+  EXPECT_EQ(f.store->stats().admissionsBypassed.load(), 1u);
+  EXPECT_EQ(f.store->stats().failopenEvents.load(), failopenBefore);
+
+  // An entry already on disk is still admitted: refusing it would leave a
+  // partial entry, and serving it is not growth.
+  bool declined2 = true;
+  auto resident = f.store->open(keyN(0), 40 * 4096, 0, MetaData::kCksumNone, 0, &declined2);
+  EXPECT_TRUE(resident);
+  EXPECT_FALSE(declined2);
+}
+
+TEST(CacheStore, ProtectWindowDefaultIsOneDay) {
+  // Pinned WITHOUT setting the knob: a test that sets the value under test
+  // cannot tell you what ships, and a default that no case asserts is a default
+  // nothing defends.
+  Config cfg;
+  EXPECT_EQ(cfg.evictProtectSeconds, 86400u);
 }

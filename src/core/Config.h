@@ -41,6 +41,16 @@ struct Config {
                              // 0 = auto (min(50 GiB, 10% of total), clamped to
                              // <= half of free-at-init) when budgetAuto, else off.
   int evictCheckSeconds = 10; // UCACHE_EVICT_CHECK_S; eviction-check rate limit (0 = always)
+  // UCACHE_EVICT_PROTECT_S. An entry is not an eviction candidate while its last
+  // read is this recent, so a running analysis cannot evict its own working set
+  // — LRU is pessimal for a cyclic scan: with a cache smaller than the set, the
+  // victim it picks is exactly the entry wanted next, and the hit rate collapses
+  // toward zero instead of the C/W a policy that simply held still would get.
+  // Data untouched for longer than this — an earlier, finished study — stays the
+  // first thing given up, which is the point.
+  // When nothing is eligible, growth stops by DECLINING NEW ENTRIES rather than
+  // evicting a peer (see CacheStore::admissionBlocked). 0 = off, i.e. plain LRU.
+  uint32_t evictProtectSeconds = 86400;
   double highWater = 0.90;                // UCACHE_HIGH_WATER (fraction of maxBytes)
   double lowWater = 0.75;                 // UCACHE_LOW_WATER
   ValidateMode validate = ValidateMode::kSize; // UCACHE_VALIDATE

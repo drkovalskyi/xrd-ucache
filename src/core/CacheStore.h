@@ -61,10 +61,22 @@ class CacheStore {
   // Opens (or shares) the entry for `key`, validating against the origin
   // metadata. nullptr => caller fails open to pass-through.
   // Triggers a rate-limited eviction check.
+  // `declinedForSpace` (optional, out) distinguishes the two reasons for a null
+  // return, which callers must not conflate: a genuine failure (fail-open, and
+  // something is wrong) from a capacity DECISION — every resident entry is still
+  // inside the protection window, so this NEW entry is not admitted. The read
+  // still succeeds uncached either way, but only the first is a fail-open event.
   std::shared_ptr<FileEntry> open(const UrlKey& key, uint64_t originSize,
                                   uint64_t originMtime = 0,
                                   uint8_t cksumKind = MetaData::kCksumNone,
-                                  uint32_t originCksum = 0);
+                                  uint32_t originCksum = 0,
+                                  bool* declinedForSpace = nullptr);
+
+  // True once an eviction pass has found the budget exceeded with NOTHING
+  // eligible to remove: the cache is full of entries too recently read to touch,
+  // so it has stopped growing. Latched by evictNow() and cleared there as soon as
+  // a victim becomes eligible again. Reported by `status` and `doctor`.
+  bool admissionBlocked() const { return admissionBlocked_.load(std::memory_order_relaxed); }
 
   // Rate-limited high-water check; runs eviction when above.
   void maybeEvict();
@@ -216,6 +228,11 @@ class CacheStore {
   // nothing is evictable (pinned/open set exceeds high-water); the over-budget
   // rate-limit bypass is then disabled so we don't scan-storm on every write.
   std::atomic<int> lastEvictEvicted_{1};
+  // See admissionBlocked(). Latched by evictNow() so the hot open path reads one
+  // relaxed atomic rather than re-deciding, and so the state survives between
+  // the rate-limited eviction checks.
+  std::atomic<bool> admissionBlocked_{false};
+  std::atomic<bool> blockedWarned_{false}; // WARN once per process, not per entry
   std::string statsPath_;
   bool dumpStatsOnDtor_ = true;
   // Distinct keys opened this process (drives stats.filesOpened);

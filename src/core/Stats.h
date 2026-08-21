@@ -46,6 +46,12 @@ struct Stats {
   std::atomic<uint64_t> evictedEntries{0};
   std::atomic<uint64_t> evictedBytes{0};
   std::atomic<uint64_t> failopenEvents{0};
+  // Entries NOT admitted because every resident entry was still inside the
+  // protection window (Config::evictProtectSeconds). Deliberately separate from
+  // failopenEvents: that counter means something went wrong, and the benchmark
+  // acceptance triple requires it to be zero. This is a capacity decision, and
+  // the reads it declines to cache still succeed.
+  std::atomic<uint64_t> admissionsBypassed{0};
   std::atomic<uint64_t> disabledHandles{0};
   // Open-retry (docs/STATS.md):
   std::atomic<uint64_t> openRetries{0};          // transient open failures re-attempted
@@ -117,6 +123,7 @@ struct StatsTotals {
   uint64_t opens = 0, validationsFailed = 0, hitBytes = 0, missBytes = 0, originBytes = 0,
            servedBytes = 0, originReads = 0, fetchesJoined = 0, originReadvs = 0, pageWrites = 0, crcFailures = 0,
            metaCorrupt = 0, evictedEntries = 0, evictedBytes = 0, failopenEvents = 0,
+           admissionsBypassed = 0,
            openRetries = 0, openRetriesExhausted = 0,
            replicaOpens = 0, replicaPublished = 0, replicaInvalid = 0, replicaCrcFailures = 0,
            replicaPunchedBytes = 0, replicaOrphansSwept = 0;

@@ -239,6 +239,7 @@ overriding your defaults. Common keys:
 | `dir = …`           | `UCACHE_DIR`            | cache location — **required** (no default; use a local disk). Unset ⇒ doctor FAILs, plugin runs uncached |
 | `max_bytes = 50g`   | `UCACHE_MAX_BYTES`      | hard cache-size cap; unset ⇒ no cap (use the disk, evict at the floor) |
 | `min_free_bytes = …`| `UCACHE_MIN_FREE_BYTES` | keep this much disk free (the default limit) |
+| `evict_protect_seconds = …`| `UCACHE_EVICT_PROTECT_S` | do not evict an entry read this recently (default 86400 = 1 day; 0 = plain LRU) |
 | `validate = size`   | `UCACHE_VALIDATE`       | `none` / `size` / `size+mtime` / `cksum`. **Caveat:** the plugin has no origin-checksum source yet, so `cksum` currently degrades to size-only (weaker than `size+mtime`) — prefer `size+mtime` until a checksum query lands |
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |

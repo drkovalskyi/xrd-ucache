@@ -335,6 +335,7 @@ void printStats(const StatsTotals& t) {
   row("evicted_entries", t.evictedEntries);
   rowB("evicted_bytes", t.evictedBytes);
   row("failopen_events", t.failopenEvents);
+  row("admissions_bypassed", t.admissionsBypassed);
   row("open_retries", t.openRetries);
   row("open_retries_exhausted", t.openRetriesExhausted);
   row("validations_failed", t.validationsFailed);
@@ -901,11 +902,22 @@ std::string recompressStall(const Config& cfg, IOBackend& io, size_t queued, siz
 int cmdStatus(CacheStore& store, IOBackend& io) {
   const Config& cfg = store.config(); // the EFFECTIVE config (post budget resolution)
   auto entries = store.listEntries();
-  uint64_t used = 0, pinned = 0;
+  uint64_t used = 0, pinned = 0, protectedN = 0, protectedBytes = 0;
+  // Recomputed here from live state rather than read from the plugin's latch:
+  // `status` is a separate process, and a state file would be one more thing to
+  // keep in sync or expire.
+  const uint64_t nowS = static_cast<uint64_t>(::time(nullptr));
+  const uint64_t protectCutoff = cfg.evictProtectSeconds && nowS > cfg.evictProtectSeconds
+                                     ? nowS - cfg.evictProtectSeconds
+                                     : 0;
   for (const auto& e : entries) {
     used += e.cachedBytes;
     if (e.pinned)
       ++pinned;
+    if (protectCutoff && e.atime >= protectCutoff && !e.pinned) {
+      ++protectedN;
+      protectedBytes += e.cachedBytes + e.replicaBytes;
+    }
   }
   std::printf("cache dir : %s\n", cfg.cacheDir.c_str());
   if (cfg.maxBytes)
@@ -930,6 +942,27 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
                     human(avail - cfg.minFreeBytes).c_str(), human(avail).c_str(),
                     human(cfg.minFreeBytes).c_str());
     }
+  }
+  if (cfg.evictProtectSeconds) {
+    uint64_t avail = 0, total = 0;
+    const bool haveSpace =
+        RealIO::instance().spaceInfo(cfg.cacheDir, avail, total) == 0 && total;
+    const bool atFloor = cfg.minFreeBytes && haveSpace && avail <= cfg.minFreeBytes;
+    // The state worth shouting about: no room left AND nothing old enough to give
+    // up, so the cache has stopped growing. Say what it means and how to undo it,
+    // because a cache that has quietly stopped caching looks like a slow cache.
+    if (atFloor && protectedN == entries.size() - pinned && !entries.empty())
+      std::printf("protected : %llu entries (%s) read within the last %s — ALL of them, "
+                  "and the disk is at the floor, so NEW FILES ARE NOT BEING CACHED. "
+                  "`ucache evict --older-than <dur>`, or lower evict_protect_seconds\n",
+                  static_cast<unsigned long long>(protectedN), human(protectedBytes).c_str(),
+                  humanAge(1, 1 + cfg.evictProtectSeconds).c_str());
+    else
+      std::printf("protected : %llu of %zu entries (%s) read within the last %s — not "
+                  "evictable, so a running job cannot evict its own working set\n",
+                  static_cast<unsigned long long>(protectedN), entries.size(),
+                  human(protectedBytes).c_str(),
+                  humanAge(1, 1 + cfg.evictProtectSeconds).c_str());
   }
   std::printf("freshness : %s\n", freshnessSummary(cfg).c_str());
   std::printf("entries   : %zu (%llu pinned)\n", entries.size(), (unsigned long long)pinned);
