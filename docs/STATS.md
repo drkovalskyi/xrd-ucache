@@ -15,7 +15,8 @@ consumers together.
  "origin_reads": 0, "fetches_joined": 0, "origin_readvs": 0, "page_writes": 0,
  "crc_failures": 0, "meta_corrupt": 0,
  "evicted_entries": 0, "evicted_bytes": 0,
- "failopen_events": 0, "open_retries": 0, "open_retries_exhausted": 0,
+ "failopen_events": 0, "admissions_bypassed": 0,
+ "open_retries": 0, "open_retries_exhausted": 0,
  "disabled_handles": 0,
  "replica_opens": 0, "replica_published": 0, "replica_invalid": 0,
  "replica_crc_failures": 0, "replica_punched_bytes": 0, "replica_orphans_swept": 0,
@@ -42,6 +43,13 @@ consumers together.
   `origin_readvs` are incremented by the plugin layer; the core
   owns `opens`, `hit_bytes`, `page_writes`, `crc_failures`, `meta_corrupt`,
   `validations_failed`, `evicted_*`, `failopen_events`.
+- `admissions_bypassed` — files NOT cached because every resident entry was
+  still inside the eviction protection window (`evict_protect_seconds`), so the
+  cache had stopped growing rather than evict data a running job still needs.
+  These reads SUCCEED, uncached. Deliberately separate from `failopen_events`:
+  that counter means something went wrong, while this is a capacity decision. A
+  non-zero value here means the cache is too small for the working set — see
+  `ucache status`, which names the remedy.
 - `crc_failures` — pages that failed CRC on read and were quarantined
   (refetched later). `meta_corrupt` — sidecars that failed to load (torn or
   damaged) and were rebuilt.

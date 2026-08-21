@@ -164,6 +164,17 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
       registry_.erase(it);
     }
   }
+  // Decide on CURRENT state, not on what the last check happened to leave behind.
+  // The latch lives in this process and starts clear, and open() otherwise runs
+  // its eviction check only AFTER admitting — so without this a fresh process
+  // would admit one entry before protection engaged, and a workload of one file
+  // per process would never engage it at all. maybeEvict() is rate-limited, so
+  // the amortised cost of asking here is a compare against a timestamp.
+  {
+    struct ::stat probe{};
+    if (io_.stat(key.metaPath(cfg_.cacheDir), &probe) != 0)
+      maybeEvict(); // a would-be NEW entry: refresh the verdict before deciding
+  }
   // Growth has stopped: every resident entry was read too recently to evict.
   // Decline entries we do not already hold, and hold that line PER ENTRY. Doing
   // it per PAGE instead would converge on every file partially cached, which for
