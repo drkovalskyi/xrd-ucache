@@ -62,11 +62,39 @@ consumers together.
 
 ## Field notes
 
-- `origin_bytes` — bytes requested from the origin **after page rounding**;
-  the read-amplification numerator. `miss_bytes`/`served_bytes`/`origin_reads`/
-  `origin_readvs` are incremented by the plugin layer; the core
-  owns `opens`, `hit_bytes`, `page_writes`, `crc_failures`, `meta_corrupt`,
-  `validations_failed`, `evicted_*`, `failopen_events`.
+What each counter means, and the reasoning behind the ones that are easy to
+misread. Three words recur. The **byte tier** is the page-granular copy of the
+original file — the ordinary cache. The **replica tier** is a recompressed
+overlay built by `ucache recompress`, which serves the same data with less
+decompression work; a cache with recompression off has none. A **sidecar** is
+the small file beside each cached entry holding its page bitmap and checksums.
+[How it works](USER_GUIDE.md#how-it-works-briefly) covers the tiers, and
+[FORMAT.md](FORMAT.md) the files.
+
+### Bytes and where they came from
+
+Every read is served from somewhere, and the counters name the source. Bytes
+served locally are `hit_bytes` (byte tier) and `replica_bytes_served` (replica
+tier); bytes that had to be fetched are `miss_bytes`; bytes the cache never
+touched at all are `relay_bytes`. On a warm pass the fetched figure should be
+zero.
+
+- `origin_bytes` — bytes requested from the origin **after page rounding**, so
+  it is the numerator of read amplification: divide by the bytes the job asked
+  for to see how much extra the cache pulled to satisfy them.
+- Which layer maintains which counter, when tracing an unexpected value back to
+  its source: `miss_bytes`/`served_bytes`/`origin_reads`/`origin_readvs` are
+  incremented by the plugin layer; the core owns `opens`, `hit_bytes`,
+  `page_writes`, `crc_failures`, `meta_corrupt`, `validations_failed`,
+  `evicted_*`, `failopen_events`.
+
+### Capacity, and things going wrong
+
+These are the counters to read first when something looks off. `crc_failures`,
+`failopen_events` and `validations_failed` should all be zero. By contrast
+`admissions_bypassed` is not a fault at all — it records a deliberate decision
+not to cache, and says the cache is under pressure rather than broken.
+
 - `admissions_bypassed` — files NOT cached because every resident entry was
   still inside the eviction protection window (`evict_protect_seconds`), so the
   cache had stopped growing rather than evict data a running job still needs.
@@ -74,6 +102,11 @@ consumers together.
   that counter means something went wrong, while this is a capacity decision. A
   non-zero value here means the cache is too small for the working set — see
   `ucache status`, which names the remedy.
+- `validations_failed` — cached entries discarded because they no longer
+  matched the file at the origin: a different size, mtime or checksum, or a
+  changed page size. The entry is refetched from scratch, so a read still
+  succeeds; a steadily rising count means the data is being rewritten
+  underneath the cache.
 - `crc_failures` — pages that failed CRC on read and were quarantined
   (refetched later). `meta_corrupt` — sidecars that failed to load (torn or
   damaged) and were rebuilt.
@@ -84,15 +117,32 @@ consumers together.
   transient inner-open failures re-attempted (`UCACHE_OPEN_RETRIES`), and opens
   that ultimately gave up after retrying. Uncounted when caching is off (retry
   still works, just unrecorded — no store to hold the counters).
-- `replica_*` (docs/FORMAT.md replica section) — `replica_opens`:
-  stitched views adopted after the open-time full verify;
-  `replica_published`: successful publishes; `replica_invalid`: replicas
-  quarantined at open (torn/stale/mismatched — each also implies a drop);
-  `replica_crc_failures`: overlay page CRC mismatches (open or serve);
-  `replica_punched_bytes`: v1 bytes reclaimed by punch-and-clear;
-  `replica_orphans_swept`: crash/mixed-version debris removed by eviction.
-- Workflow counters (`ucache stats` derives its `workflow:` block from
-  these): `files_opened` — distinct keys opened by this process
+
+### Replica tier
+
+Only meaningful once `ucache recompress` has built overlays; all zero
+otherwise. They track the life of an overlay: built, adopted for serving,
+rejected, or cleaned up. See the replica section of [FORMAT.md](FORMAT.md).
+
+- `replica_opens` — overlays adopted for serving, after the full verification
+  done when the entry is opened.
+- `replica_published` — overlays successfully built and made available.
+- `replica_invalid` — overlays rejected at open as torn, stale or mismatched;
+  each rejection also drops the overlay.
+- `replica_crc_failures` — overlay pages whose checksum did not match, at open
+  or while serving.
+- `replica_punched_bytes` — original bytes reclaimed once an overlay covered
+  them, freeing the space the byte-tier copy held.
+- `replica_orphans_swept` — leftover overlay files removed by eviction, after a
+  crash or a version change.
+
+### What the printed summary is derived from
+
+`ucache stats` does the divisions in its `workflow:` block from the counters
+below — how often each file was opened, which tier served what, how much of the
+reading was re-reading, and what the cache disk was asked to do.
+
+- Workflow counters: `files_opened` — distinct keys opened by this process
   (`opens/files_opened` ≫ 1 = a reopen loop); `ram_hit_bytes` — hit bytes
   served from the fill buffer's staged RAM (subset of `hit_bytes`);
   `first_touch_bytes` — bytes served for the first time in the entry's
