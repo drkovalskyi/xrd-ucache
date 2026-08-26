@@ -49,10 +49,13 @@ Config file example
 
 ``` sh
 url = eospublic.cern.ch:1094
-lib = ~/.local/lib64/libXrdClUCache.so
+lib = /home/<you>/.local/lib64/libXrdClUCache.so
 enable = true
 dir = /tmp/cache
 ```
+
+`lib` must be a literal absolute path — this file is read by the XRootD
+client, which does not expand `~`.
 
 Note: `/tmp/cache` is not an optimal location due to automatic
 cleanup. Find a better location by testing candidate directories with
