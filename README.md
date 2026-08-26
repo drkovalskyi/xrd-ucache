@@ -84,7 +84,10 @@ Further validation is performed with tools outside this repository.
   behaves oddly
 - [Monitoring metrics](docs/STATS.md) — the numbers uCache records about your
   jobs, and the JSON files it writes
-- [On-disk format](docs/FORMAT.md) · [Storage benchmarking](docs/BENCH.md)
+- [Storage benchmarking](docs/BENCH.md) — `ucache bench`: measuring a
+  candidate cache directory, and why the choice matters
+- [On-disk format](docs/FORMAT.md) — what a cached entry is made of on disk,
+  for anyone inspecting or writing tooling against it
 
 ## License
 
