@@ -56,7 +56,29 @@ Note: `/tmp/cache` is not an optimal location due to automatic
 cleanup. Find a better location by testing candidate directories with
 `ucache bench <dir>`.
 
+## Testing
+
+The self-contained suites live here: unit, differential, crash-recovery, soak
+and fuzz tests. CI builds them and runs `ctest` on Linux and macOS for every
+change; the longer crash, soak and fuzz campaigns run outside CI because of
+their duration.
+
+Further validation is performed with tools outside this repository.
+
 ## License
 
 MIT License — see `LICENSE`. Copyright (c) 2026 Massachusetts Institute of
 Technology. Author: Dmytro Kovalskyi (MIT).
+
+## Development and AI assistance
+
+Claude Code (Anthropic's agentic coding tool) was used in the development of
+uCache and its documentation. The authors specified the requirements and
+architecture, directed each change, and validated the implementation by its
+measured behavior: unit, differential, crash-recovery and fuzz test suites run
+under memory and race detectors; integration tests against real analysis
+frameworks and storage services; and physics validation showing that cached and
+direct analyses produce identical results at full dataset scale.
+
+Individual commits carry no AI attribution. Its absence from the commit history
+is a convention, not an omission.
