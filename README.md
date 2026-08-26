@@ -60,8 +60,10 @@ cleanup. Find a better location by testing candidate directories with
 
 The self-contained suites live here: unit, differential, crash-recovery, soak
 and fuzz tests. CI builds them and runs `ctest` on Linux and macOS for every
-change; the longer crash, soak and fuzz campaigns run outside CI because of
-their duration.
+change. The macOS job stops short of the XRootD client plugin: the plugin is
+built and fuzzed against a live origin on Linux, and on macOS it is built and
+exercised by hand rather than in CI. The longer crash, soak and fuzz campaigns
+run outside CI because of their duration.
 
 Further validation is performed with tools outside this repository.
 
