@@ -257,62 +257,54 @@ nothing needs to be running, and there is no sampling daemon to start.
 
 ```text
 $ ucache summary
-overall    : 7 run(s) recorded — 720.8 GiB served from cache, 266.1 GiB from the origin
-  saved    : 35m30s — 4 run(s) took 27m14s, and would have taken about 1h02m reading
-             from the origin (2.3x, estimated)
-             the other 3 run(s) could not be estimated — `ucache history` says which
+overall    : 8 run(s) recorded — 720.8 GiB served from cache, 266.1 GiB from the origin
+  saved    : 35m22s — 4 run(s) took 27m14s, and would have taken about 1h02m with
+             no cache (2.3x, vs a measured baseline)
   health   : OK — no faults in any recorded run
 cache      : /scratch/ucache — 1456 entries, 202.8 GiB on disk, 1.3 TiB headroom
 next       : `ucache summary --detail` for the last run; `ucache history` for the trend
 ```
 
-**The headline is time, not a ratio.** Both walls are shown — what the runs took,
-and what the same work would have cost from the origin — because seconds add up
-honestly across runs of different lengths, where a ratio would be an average no
-single run experienced. The multiplier is there as shorthand, not as the claim.
+**The headline is time, and it is measured against a baseline — the same work
+run once with the cache out of the loop.** Record one by running your job with
+`UCACHE_DISABLE=1` set; the plugin passes everything through untouched and
+writes the run down like any other. From then on, cached runs over the same
+files are compared against it — and the comparison is symmetric: **a cache that
+is slower than your origin shows up as a cost, not a gain**:
 
-Only runs the estimate accepted are counted, and it says how many that was:
-folding a cache-filling run into the total would credit the cache for time it was
-not serving anyone.
+```text
+overall    : 7 run(s) recorded — 429.4 GiB served from cache, 222.8 GiB from the origin
+  COST     : the cache is costing you time on this workload — 4 run(s) took 15m26s
+             where no cache would have taken about 11m40s (0.8x, vs a measured baseline)
+```
+
+That is a real result from a real workload (a fast LAN origin and cheaply
+compressed data): the honest answer there is to not use a cache, and the tool
+says so.
+
+### Why a baseline, and not an estimate
+
+Nothing recorded during cached operation can stand in for the origin alone —
+this was measured, twice, before being accepted. The cold fill's wall is set
+partly by the cache's own writes (on the workload above, using it as the
+reference reported a 1.7x *gain* where the measured truth was a 0.70x *loss*),
+and service-time histograms record blocked waits, which overlap compute and are
+not wall time (same test: 2.8x, same truth). A measured baseline reproduces the
+true ratio to about 1% either way. One extra run of your job is what
+truthfulness costs.
+
+Rules the comparison enforces, so a number is never printed where it would
+mislead: the baseline must cover ≥70% of the same files in both directions
+(matched by URL); a run that mostly *filled* the cache is never scored; runs and
+baselines under 30 s or 64 MiB are refused (too short to time at one-second
+resolution); a baseline that hit faults is not used; with several baselines the
+nearest in time wins — and recording a baseline *after* you have been running
+cached for a while works fine. When the answer cannot be sound, `summary` says
+why and what to do instead of printing a number.
 
 `ucache summary --detail` adds the last run underneath: tier split, delivered
-rate, per-tier read counts and sizes, replica coverage, and the basis for that
-run's own estimate.
-
-### About the gain estimate
-
-
-The estimate compares two rates the records already carry: what the origin
-delivered when these files were **first fetched**, and what the cache delivers
-now. It is deliberately narrow, and it refuses more often than it answers:
-
-- It is a **read-path** estimate. Where reads overlap computation — and in a
-  threaded analysis they do — it is an upper bound on the wall-clock gain, and
-  for a job limited by its own CPU it says nothing useful.
-- It compares **origin-equivalent bytes**, not bytes served, so the replica tier
-  is not flattered by serving decompressed data.
-- It is **suppressed rather than qualified** whenever the comparison would not
-  be sound: no earlier run fetched these files, the two runs covered different
-  files, the earlier fetch hit faults, either run was too short to time at
-  one-second resolution, or the reference rate is an outlier among the fetches
-  recorded here. When that happens the line says why instead of printing a
-  number.
-- A run that **filled** the cache gets no gain. Dividing one fill by another is
-  a real ratio, but it is not what the cache bought anyone.
-- Where several earlier fetches cover the same files, it uses the **fastest**.
-  A fetch can be slowed by things that are not the origin's doing — a
-  recompression pass running alongside it costs around a quarter of the fill on
-  an LZMA dataset — and using that as the baseline would credit the cache for
-  your own machine's contention.
-- A cache that is **slower** than the origin reports below 1.0. That is a real
-  answer, and worth acting on.
-
-One thing it cannot see: **a run whose data was still in the page cache reads
-high**, and nothing in the records says the page cache was warm. If you are
-comparing runs over time, compare like with like.
-
-It is not a substitute for measuring: the only way to know the true speedup is
-to run the same analysis with and without the cache.
+rate, per-tier read counts and sizes, replica coverage, and that run's own
+comparison with its baseline.
 
 ## Trend across runs — `ucache history`
 
@@ -321,18 +313,28 @@ over time, across versions, or after you change the cache disk.
 
 ```text
 $ ucache history
-14 run(s) recorded, newest first (showing 14)
-WHEN                  DUR   FILES     SERVED     ORIGIN       RATE  BYTE/REPL/RELAY   FAULTS GAIN
-2026-08-18 09:42    3m21s     787   91.3 GiB        0 B   456 MB/s  0%/100%/0%             0 2.51x
-2026-08-17 21:03   14m10s     787  142.4 GiB  142.4 GiB   167 MB/s  100%/0%/0%             0 fill
+8 run(s) recorded, newest first (showing 8)
+WHEN                  DUR   FILES     SERVED     ORIGIN       RATE  BYTE/REPL/RELAY  FAULTS GAIN
+ALL (8 runs)        1h24m    1456  853.9 GiB  266.1 GiB   238 MB/s  27%/58%/16%           0 2.30x
+                 4 of 8 runs measured vs baseline: took 27m14s, no cache would have
+                 taken about 1h02m — saved 35m22s
+----
+2026-08-18 09:42    3m51s    1456  164.5 GiB        0 B   764 MB/s  0%/100%/0%            0 4.06x
+2026-08-18 09:20   15m41s    1456    1.8 GiB  133.1 GiB   154 MB/s  100%/0%/0%            0 fill
+2026-08-18 09:02   15m39s    1456  133.1 GiB        0 B   145 MB/s  0%/0%/100%            0 base
 ```
 
-`GAIN` reads `fill` for a run that populated the cache and `-` where the
-estimate was suppressed. `--top N` shows more rows; `--json` on either command
-emits the same figures for scripting.
+`GAIN` reads `base` for a baseline run (cache disabled — the reference), `fill`
+for a run that populated the cache, and `-` where the comparison was refused.
+The `RATE` column is what the job consumed, from all sources combined — it is
+paced by the application, not a cache capability (that is `ucache bench`).
+`--top N` shows more rows; `--json` on either command emits the same figures
+for scripting.
 
 Records appear when a job that used the cache **exits**; CLI invocations do not
-write them. `ucache stats --reset` clears the history along with the counters.
+write them. `ucache stats --reset` starts a fresh counter window but keeps the
+run history (moved under `stats/history/`, where both commands still read it) —
+baselines survive a reset.
 
 ## Monitoring — reading `ucache stats`
 
@@ -497,7 +499,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache doctor`    | check install, filesystem (sparse/flock), and activation |
 | `ucache test <url>` | end-to-end self-test: cold + warm whole-file read via xrdcp against your setup as-is; warm must be origin-free; cleans up the entry it created (pre-existing entries kept) |
 | `ucache enable` / `disable` | turn caching on/off (flips the conf) |
-| `ucache summary [--detail] [--json]` | **overall performance across every recorded run, and an estimate of what the cache has saved you** versus reading from the origin (suppressed rather than qualified when the comparison would not be sound). `--detail` adds the last run: tier split, delivered rate, per-tier read counts and sizes, replica coverage |
+| `ucache summary [--detail] [--json]` | **overall performance across every recorded run, and the time the cache has saved (or cost) you, measured against a no-cache baseline** — record one by running your job once with `UCACHE_DISABLE=1`. Refused with a reason rather than qualified when the comparison would not be sound. `--detail` adds the last run: tier split, delivered rate, per-tier read counts and sizes, replica coverage |
 | `ucache history [--top N] [--json]` | an **ALL** row aggregating every recorded run, then one row per run, newest first — whether the numbers are holding up across runs, versions and machines |
 | `ucache status`    | cache location, budget, usage, aggregate stats |
 | `ucache ls [--sort age\|size]` | list cached entries (size, cached, coverage, last-used age, replica, pinned) |

@@ -52,6 +52,13 @@ struct HandleState {
   bool cpuBlended = false;
   std::shared_ptr<CacheStore> store; // process-wide; null => never cache
   std::string url;
+  // Pass-through bytes this handle relayed, and the once-latch for its
+  // per-file record. A handle with no entry (UCACHE_DISABLE, write-opened)
+  // leaves no lifetime record from FileEntry, so the first of Close/dtor
+  // writes one from these — that is what makes a cache-disabled BASELINE run
+  // matchable, file by file, against the cached runs that follow it.
+  std::atomic<uint64_t> relayedBytes{0};
+  std::atomic<bool> relayObsDone{false};
 
   std::mutex mu;
   std::shared_ptr<FileEntry> entry;            // null until setup completes

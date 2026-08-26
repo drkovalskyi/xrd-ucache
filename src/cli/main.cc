@@ -23,6 +23,7 @@ namespace tp = ucache::transpose;
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -100,8 +101,8 @@ void usage() {
       "                    aggregate stats/*.jsonl across all processes, plus the\n"
       "                    derived workflow picture (tiers, opens/file, re-read\n"
       "                    factor, seq%%, latency percentiles). --files: per-file\n"
-      "                    records, costliest first. --reset deletes the stats\n"
-      "                    window (fresh measurement; warns if a job looks live)\n"
+      "                    records, costliest first. --reset starts a fresh\n"
+      "                    counter window; run HISTORY is kept (stats/history)\n"
       "  evict [--older-than DUR | --newer-than DUR | --to-size SIZE] [--dry-run]\n"
       "                    no flags: one eviction pass to the configured budget;\n"
       "                    --older-than 30d: drop entries unused for that long;\n"
@@ -943,6 +944,8 @@ double mbPerS(uint64_t bytes, uint64_t seconds) {
 // What the run label should say. Deliberately not a percentage: "warm" and
 // "fill" are the two states a user acts on differently.
 const char* runKind(const Run& r) {
+  if (r.disabled)
+    return "baseline"; // cache out of the loop — the measured reference
   if (r.originBytes && r.cacheBytes() == 0)
     return "fill";
   if (r.originBytes == 0 && r.cacheBytes())
@@ -965,7 +968,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       return 2;
     }
   }
-  const auto runs = loadRuns(cfg.cacheDir + "/stats");
+  const auto runs = loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history");
   if (runs.empty()) {
     if (asJson)
       std::puts("{\"runs\":[]}");
@@ -1015,12 +1018,13 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                 human(t.originBytes).c_str(), allRate, allTiers,
                 (unsigned long long)t.faults, allGain);
     if (t.haveGain)
-      std::printf("%-16s %zu of %zu runs estimated: took %s, would have taken about %s "
-                  "from the origin — saved %s\n",
+      std::printf("%-16s %zu of %zu runs measured vs baseline: took %s, no cache would "
+                  "have taken about %s — %s %s\n",
                   "", t.runsEstimated, t.runs,
                   humanDur((uint64_t)t.estimatedDurationS).c_str(),
-                  humanDur((uint64_t)(t.estimatedDurationS + t.savedS)).c_str(),
-                  humanDur((uint64_t)t.savedS).c_str());
+                  humanDur((uint64_t)std::max(0.0, t.estimatedDurationS + t.savedS)).c_str(),
+                  t.savedS >= 0 ? "saved" : "COST",
+                  humanDur((uint64_t)std::fabs(t.savedS)).c_str());
     if (t.gainCapped)
       std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
                   "estimate)\n", "", t.gainCapped);
@@ -1056,6 +1060,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     char gainCell[16];
     if (g.valid)
       std::snprintf(gainCell, sizeof gainCell, "%.2fx", g.gain);
+    else if (r.disabled)
+      std::snprintf(gainCell, sizeof gainCell, "base");
     else
       std::snprintf(gainCell, sizeof gainCell, "%s",
                     r.originBytes && r.cacheBytes() == 0 ? "fill" : "-");
@@ -1089,7 +1095,8 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
       return 2;
     }
   }
-  const auto runs = loadRuns(cfg.cacheDir + "/stats");
+  const auto runs =
+      loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history");
   auto entries = store.listEntries();
   uint64_t used = 0, replicaTotal = 0, replicaN = 0;
   for (const auto& e : entries) {
@@ -1163,17 +1170,26 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     // was actually asked, which is whether the work went faster.
     if (t.haveGain) {
       const uint64_t took = static_cast<uint64_t>(t.estimatedDurationS);
-      const uint64_t would = static_cast<uint64_t>(t.estimatedDurationS + t.savedS);
-      std::printf("  saved    : %s — %zu run(s) took %s, and would have taken about %s "
-                  "reading from the origin (%.1fx, estimated)\n",
-                  humanDur(static_cast<uint64_t>(t.savedS)).c_str(), t.runsEstimated,
-                  humanDur(took).c_str(), humanDur(would).c_str(), t.gain);
+      const uint64_t would =
+          static_cast<uint64_t>(std::max(0.0, t.estimatedDurationS + t.savedS));
+      if (t.savedS >= 0)
+        std::printf("  saved    : %s — %zu run(s) took %s, and would have taken about %s "
+                    "with no cache (%.1fx, vs a measured baseline)\n",
+                    humanDur(static_cast<uint64_t>(t.savedS)).c_str(), t.runsEstimated,
+                    humanDur(took).c_str(), humanDur(would).c_str(), t.gain);
+      else
+        std::printf("  COST     : the cache is costing you time on this workload — "
+                    "%zu run(s) took %s where no cache would have taken about %s "
+                    "(%.1fx, vs a measured baseline)\n",
+                    t.runsEstimated, humanDur(took).c_str(), humanDur(would).c_str(),
+                    t.gain);
       if (t.runsEstimated < t.runs)
-        std::printf("             the other %zu run(s) could not be estimated — "
+        std::printf("             the other %zu run(s) could not be measured — "
                     "`ucache history` says which\n",
                     t.runs - t.runsEstimated);
     } else {
-      std::printf("  saved    : not estimated for any run yet — `ucache history` says why\n");
+      std::printf("  saved    : not measured yet — run your work ONCE with "
+                  "UCACHE_DISABLE=1 to record a no-cache baseline, then compare\n");
     }
     if (t.faults)
       std::printf("  health   : %llu fault(s) across all runs — `ucache verify <url>`\n",
@@ -1246,16 +1262,19 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   // The estimate, or the reason there isn't one. Never both a number and a
   // doubt: outside the conditions it was validated under it is not printed.
   if (gain.valid) {
-    std::printf("gain       : ~%.1fx versus reading from the origin (estimate)\n", gain.gain);
-    std::printf("             basis: %.0f MB/s measured when these files were first "
-                "fetched (%s), %llu of %llu files matched; ~%.0f s saved\n",
-                gain.originMBs, stamp(gain.referenceStartS).c_str(),
+    if (gain.gain >= 1.0)
+      std::printf("gain       : ~%.1fx versus no cache (measured baseline)\n", gain.gain);
+    else
+      std::printf("gain       : %.2fx — the cache made this run SLOWER than no cache "
+                  "(measured baseline)\n",
+                  gain.gain);
+    std::printf("             baseline: %s, same files with the cache disabled, "
+                "%llu of %llu files matched; %s%.0f s\n",
+                stamp(gain.referenceStartS).c_str(),
                 (unsigned long long)gain.matchedFiles, (unsigned long long)gain.runFiles,
-                gain.savedS);
-    std::puts("             read-path estimate — an A/B against a direct run is the "
-              "only measurement");
+                gain.savedS >= 0 ? "saved ~" : "cost ~", std::fabs(gain.savedS));
   } else {
-    std::printf("gain       : not estimated — %s\n", gain.reason.c_str());
+    std::printf("gain       : not measured — %s\n", gain.reason.c_str());
   }
   std::puts("next       : `ucache history` for the trend across runs");
   return 0;
@@ -3640,24 +3659,44 @@ int main(int argc, char** argv) {
         std::puts("stats reset: nothing to remove");
         return 0;
       }
-      int removed = 0, live = 0;
+      int removed = 0, kept = 0, live = 0;
       const time_t now = ::time(nullptr);
+      const std::string hdir = sdir + "/history";
+      bool hdirMade = false;
       while (struct dirent* de = ::readdir(d)) {
         if (de->d_name[0] == '.')
           continue;
-        const std::string p = sdir + "/" + de->d_name;
+        const std::string n = de->d_name;
+        const std::string p = sdir + "/" + n;
         struct ::stat st;
-        if (::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-          if (now - st.st_mtime < 10)
-            ++live;
-          if (::unlink(p.c_str()) == 0)
-            ++removed;
+        if (::stat(p.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+          continue;
+        if (now - st.st_mtime < 10)
+          ++live;
+        // A fresh COUNTER window must not cost the run HISTORY: the records
+        // move aside, where `summary`/`history` keep reading them — a reset
+        // that deleted them would also delete any measured no-cache BASELINE,
+        // the one thing later runs are compared against. Traces are the
+        // exception (bulky, per-op, no run-level meaning): still deleted.
+        const bool trace = n.size() >= 12 && n.compare(n.size() - 12, 12, ".trace.jsonl") == 0;
+        if (!trace && n.size() >= 6 && n.compare(n.size() - 6, 6, ".jsonl") == 0) {
+          if (!hdirMade) {
+            ::mkdir(hdir.c_str(), 0700);
+            hdirMade = true;
+          }
+          if (::rename(p.c_str(), (hdir + "/" + n).c_str()) == 0) {
+            ++kept;
+            continue;
+          } // fall through: better to delete than to leave the window dirty
         }
+        if (::unlink(p.c_str()) == 0)
+          ++removed;
       }
       ::closedir(d);
-      std::printf("stats reset: removed %d file(s) — counters start fresh with the "
-                  "next process\n",
-                  removed);
+      std::printf("stats reset: %d file(s) moved to stats/history (still in "
+                  "`ucache summary`/`history`), %d removed — counters start fresh "
+                  "with the next process\n",
+                  kept, removed);
       if (live)
         std::fprintf(stderr,
                      "warning: %d file(s) were written in the last 10 s — a job may "

@@ -160,6 +160,12 @@ class CacheStore {
   // per-file records of entries still alive (their destructors may never run;
   // emit-once guard prevents doubles).
   void dumpStats(bool finalDump = false);
+  // Per-file record for a handle the cache never served (pass-through:
+  // UCACHE_DISABLE, write-opened, no store entry). Same companion file and
+  // shape as FileEntry's lifetime records, with the bytes under `wire_bytes` —
+  // it is what a cache-disabled BASELINE run leaves behind, and the gain
+  // readout matches later cached runs against it by key.
+  void recordRelayObs(const std::string& url, uint64_t bytes);
   // The CLI opens a store only to read/mutate; suppress the destructor's stats
   // dump so `ucache` invocations don't litter stats/ with zero-counter lines.
   // Also drops the stats file the constructor reserved, while it is still

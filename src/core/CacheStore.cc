@@ -803,6 +803,20 @@ FileEntry::ScrubResult CacheStore::verify(const UrlKey& key, uint64_t originSize
   return e->verifyAll();
 }
 
+void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes) {
+  if (!obsSink_ || bytes == 0)
+    return;
+  // Normalized exactly like a cached entry's key, or the baseline record could
+  // never match the warm runs it exists to be compared against.
+  auto key = UrlKey::parse(url, cfg_.keepCgi);
+  std::ostringstream os;
+  os << "{\"ts\":" << nowS() << ",\"key\":\"" << jsonEscape(key ? key->key : url) << '\"'
+     << ",\"opens\":1,\"served_bytes\":0,\"ram_bytes\":0,\"replica_bytes\":0"
+     << ",\"disk_reads\":0,\"disk_seq\":0,\"disk_bytes\":0,\"first_touch_bytes\":0"
+     << ",\"wire_bytes\":" << bytes << "}\n";
+  obsSink_->append(os.str());
+}
+
 void CacheStore::dumpStats(bool finalDump) {
   if (finalDump) {
     std::lock_guard<std::mutex> g(regMu_);
@@ -811,7 +825,10 @@ void CacheStore::dumpStats(bool finalDump) {
         e->emitObsRecord();
   }
   std::ostringstream line;
-  line << "{\"ts\":" << nowS() << ",\"pid\":" << ::getpid() << ',' << stats_.toJsonBody()
+  line << "{\"ts\":" << nowS() << ",\"pid\":" << ::getpid();
+  if (cfg_.disable)
+    line << ",\"disabled\":1"; // a BASELINE run: the cache was out of the loop
+  line << ',' << stats_.toJsonBody()
        << ",\"entries\":[";
   {
     std::lock_guard<std::mutex> g(regMu_);

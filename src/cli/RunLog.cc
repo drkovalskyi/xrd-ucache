@@ -99,6 +99,7 @@ void loadCounters(const std::string& path, Run& r) {
     return;
   r.complete = true;
   r.endS = fieldU64(last, "ts");
+  r.disabled = fieldU64(last, "disabled") != 0;
   r.opens = fieldU64(last, "opens");
   r.filesOpened = fieldU64(last, "files_opened");
   r.servedBytes = fieldU64(last, "served_bytes");
@@ -159,24 +160,31 @@ void loadFiles(const std::string& path, Run& r) {
 
 } // namespace
 
-std::vector<Run> loadRuns(const std::string& statsDir) {
+std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir) {
   std::vector<Run> runs;
-  DIR* d = ::opendir(statsDir.c_str());
-  if (!d)
-    return runs;
-  std::vector<std::string> stems;
-  while (dirent* e = ::readdir(d)) {
-    const std::string n = e->d_name;
-    if (!endsWith(n, ".jsonl") || endsWith(n, ".files.jsonl") || endsWith(n, ".trace.jsonl"))
+  std::vector<std::pair<std::string, std::string>> stems; // (dir, stem)
+  std::set<std::string> seen; // a stem name is unique per process; never count it twice
+  for (const std::string& dir : {statsDir, archiveDir}) {
+    if (dir.empty())
       continue;
-    stems.push_back(n.substr(0, n.size() - 6));
+    DIR* d = ::opendir(dir.c_str());
+    if (!d)
+      continue;
+    while (dirent* e = ::readdir(d)) {
+      const std::string n = e->d_name;
+      if (!endsWith(n, ".jsonl") || endsWith(n, ".files.jsonl") || endsWith(n, ".trace.jsonl"))
+        continue;
+      const std::string base = n.substr(0, n.size() - 6);
+      if (seen.insert(base).second)
+        stems.emplace_back(dir, base);
+    }
+    ::closedir(d);
   }
-  ::closedir(d);
-  for (const auto& base : stems) {
+  for (const auto& [dir, base] : stems) {
     Run r;
     if (!parseStem(base, r.host, r.pid, r.startS))
       continue; // not a name this writer produced; leave it alone
-    r.stem = statsDir + "/" + base;
+    r.stem = dir + "/" + base;
     loadCounters(r.stem + ".jsonl", r);
     loadFiles(r.stem + ".files.jsonl", r);
     // A killed job leaves no cumulative line. Its per-file records still say
@@ -200,19 +208,22 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   g.runFiles = run.files.size();
 
   // Floors below which the arithmetic is noise rather than a measurement. A
-  // smoke test must not produce a speedup number.
+  // smoke test must not produce a speedup number, and whole-second records
+  // cannot time a short span well enough to divide (a 20 s run carries up to
+  // 5% clock error before any measurement happens).
   constexpr uint64_t kMinBytes = 64ull << 20;
-  constexpr double kMinOverlap = 0.70;
-  // Records carry whole seconds, so a short run cannot be timed well enough to
-  // divide: a 20 s span carries up to 5% clock error on its own, and the ratio
-  // carries twice that -- which is the whole error budget spent before any
-  // measurement. Below this the answer is refused rather than rounded.
   constexpr uint64_t kMinDurationS = 30;
+  constexpr double kMinOverlap = 0.70;
 
+  if (run.disabled) {
+    g.reason = "this run IS a baseline (cache disabled) — it is what others are "
+               "measured against";
+    return g;
+  }
   // A run that fetched more than the cache served it is a FILL. Dividing two
-  // fills' spans yields a real ratio -- how much slower this fill was than the
-  // last -- but that is not what the cache bought anyone, and printing it under
-  // "gain" invites exactly the wrong reading.
+  // walls tells how the fill compared to the baseline -- real, but not what
+  // the cache bought anyone, and printing it under "gain" invites exactly the
+  // wrong reading.
   if (run.originBytes > run.cacheBytes()) {
     g.reason = "this run filled the cache rather than being served by it";
     return g;
@@ -244,34 +255,30 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     return g;
   }
 
-  // A reference is an EARLIER run that actually fetched these files from the
-  // origin, healthily. Its rate is the only measurement of what the origin
-  // costs for this data on this machine.
+  // The reference is a measured BASELINE: the same files read once with the
+  // cache out of the loop. EITHER side of this run in time qualifies -- people
+  // usually think to measure a baseline only after they have been running
+  // cached for a while -- and among the ones that qualify the NEAREST in time
+  // wins, because origin drift is the only thing that separates them (a
+  // baseline has no cache machinery in its wall to distort).
   const Run* best = nullptr;
-  uint64_t bestMatchedWire = 0;
-  double bestC = 0.0, bestD = 0.0;            // closest near-miss, for the refusal text
-  double bestOverlapC = 0.0, bestOverlapD = 0.0; // the CHOSEN reference's overlap
-  double bestRefRate = 0.0;
-  std::vector<double> candidateRates;
-  size_t candidates = 0;
+  double bestC = 0.0, bestD = 0.0;         // closest near-miss, for the refusal text
+  double refC = 0.0, refD = 0.0, refWireTotalD = 0.0;
+  bool sawBaseline = false;
 
   for (const auto& r : all) {
-    if (r.stem == run.stem || r.startS > run.startS)
+    if (r.stem == run.stem || !r.disabled)
       continue;
-    if (r.originBytes < kMinBytes || r.files.empty())
+    if (r.files.empty() || r.durationS() < kMinDurationS || r.faults())
       continue;
-    if (r.durationS() < kMinDurationS)
-      continue; // same clock-resolution floor applies to the reference
-    if (r.faults())
-      continue; // a fill that hit faults is not a baseline for anything
-
     uint64_t refWireTotal = 0, matchedWire = 0, matchedServed = 0;
     for (const auto& [k, f] : r.files) {
       (void)k;
       refWireTotal += f.wireBytes;
     }
-    if (refWireTotal == 0)
+    if (refWireTotal < kMinBytes)
       continue;
+    sawBaseline = true;
     for (const auto& [k, f] : run.files) {
       auto it = r.files.find(k);
       if (it == r.files.end() || it->second.wireBytes == 0)
@@ -284,76 +291,53 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     const double c = static_cast<double>(matchedWire) / static_cast<double>(refWireTotal);
     const double d = static_cast<double>(matchedServed) / static_cast<double>(runServedTotal);
     if (c < kMinOverlap || d < kMinOverlap) {
-      // Remember the closest near-miss so the refusal can name real numbers.
-      if (c + d > bestC + bestD) {
+      if (c + d > bestC + bestD) { // remember the near-miss for the refusal text
         bestC = c;
         bestD = d;
       }
       continue;
     }
-    const double rate =
-        static_cast<double>(refWireTotal) / static_cast<double>(r.durationS());
-    ++candidates;
-    candidateRates.push_back(rate);
-    // Among references covering the same files, take the FASTEST. A fill can be
-    // slowed by things that are not the origin's doing -- a concurrent
-    // recompression pass costs 28% of the fill on an LZMA dataset -- and using
-    // that as the baseline credits the cache for our own interference. The
-    // fastest observed fetch is the most conservative claim about what the
-    // origin costs, which is the right direction for a number that must not
-    // overclaim.
-    if (rate > bestRefRate) {
-      bestRefRate = rate;
-      bestMatchedWire = matchedWire;
+    auto dist = [&](const Run& x) {
+      return x.startS > run.startS ? x.startS - run.startS : run.startS - x.startS;
+    };
+    if (!best || dist(r) < dist(*best)) {
       best = &r;
-      bestOverlapC = c;
-      bestOverlapD = d;
+      refC = c;
+      refD = d;
+      refWireTotalD = static_cast<double>(refWireTotal);
+      g.originEquivBytes = matchedWire;
     }
   }
 
   if (!best) {
-    // Distinguish "nothing fetched these files" from "something did, but was not
-    // doing the same work". They call for different actions, and the second is
-    // the one that has misled us before.
     if (bestC > 0.0 || bestD > 0.0) {
       char buf[192];
       std::snprintf(buf, sizeof buf,
-                    "the earlier fill and this run covered different files "
-                    "(%.0f%% of the fill, %.0f%% of this run) — not comparable",
+                    "the baseline and this run covered different files "
+                    "(%.0f%% of the baseline, %.0f%% of this run) — not comparable",
                     bestC * 100.0, bestD * 100.0);
       g.reason = buf;
+    } else if (sawBaseline) {
+      g.reason = "no baseline covers these files — run this work once with "
+                 "UCACHE_DISABLE=1 to measure one";
     } else {
-      g.reason = "no earlier run fetched these files from the origin, so there is "
-                 "nothing to compare against";
+      g.reason = "no baseline recorded — run the same work once with "
+                 "UCACHE_DISABLE=1 (cache out of the loop) to measure what the "
+                 "origin alone costs";
     }
     return g;
   }
 
-  // The one runtime check on whether the reference fill was itself typical:
-  // with several fills to compare, an outlier is visible. With one, it is not,
-  // and nothing here pretends otherwise.
-  if (candidates >= 3) {
-    std::vector<double> rates = candidateRates;
-    std::sort(rates.begin(), rates.end());
-    const double median = rates[rates.size() / 2];
-    if (median > 0 && (bestRefRate > 2.0 * median || bestRefRate < 0.5 * median)) {
-      g.reason = "the reference fill's origin rate is an outlier among the fills "
-                 "recorded here, so it does not represent the origin";
-      return g;
-    }
-  }
-
   const double refDur = static_cast<double>(best->durationS());
   const double runDur = static_cast<double>(run.durationS());
-  const double originTime = refDur * bestOverlapC; // what the origin charged for these
-  const double cacheTime = runDur * bestOverlapD;  // what they cost from the cache now
+  const double originTime = refDur * refC; // what these files cost with no cache
+  const double cacheTime = runDur * refD;  // what they cost from the cache now
 
   g.valid = true;
   g.savedS = originTime - cacheTime;
   g.gain = (runDur + g.savedS) / runDur;
-  g.originMBs = bestRefRate / 1e6;
+  g.originMBs = refWireTotalD / refDur / 1e6;
   g.cacheMBs = static_cast<double>(runServedTotal) / runDur / 1e6;
-  g.originEquivBytes = bestMatchedWire;
   g.matchedFiles = 0;
   for (const auto& [k, f] : run.files) {
     (void)f;
@@ -363,7 +347,6 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   g.referenceStartS = best->startS;
   return g;
 }
-
 
 Totals summarize(const std::vector<Run>& runs, size_t maxEstimates) {
   Totals t;

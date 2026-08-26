@@ -28,6 +28,8 @@ struct Run {
   uint64_t startS = 0;   // store construction, from the file name
   uint64_t endS = 0;     // last cumulative line, or the newest per-file record
   bool complete = false; // a cumulative line was found (a killed job has none)
+  bool disabled = false; // ran with the cache OUT OF THE LOOP (UCACHE_DISABLE):
+                         // a measured BASELINE, the only sound gain reference
 
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;
@@ -66,21 +68,32 @@ struct Run {
 // Every run in a stats directory, newest first. A missing directory yields an
 // empty vector rather than an error: a cache that has never been used by a job
 // is a normal state, not a fault.
-std::vector<Run> loadRuns(const std::string& statsDir);
-
-// What the cache bought, estimated from two rates the records already carry:
-// what the origin delivered when these files were first fetched, and what the
-// cache delivers now.
 //
-// The estimate is deliberately refusable. Outside the conditions it was
-// validated under it reports `valid == false` with a `reason`, and the caller
-// must print the reason rather than the number -- a confidently wrong speedup
-// is worse than no speedup.
+// `archiveDir`, when given, is read too. `ucache stats --reset` starts a fresh
+// COUNTER window by moving the records there rather than deleting them, so the
+// performance record outlives a measurement window -- losing months of history
+// to a command documented as "start a fresh measurement" would be a poor trade.
+std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir = "");
+
+// What the cache bought, measured against a BASELINE run -- the same work done
+// once with the cache out of the loop (UCACHE_DISABLE=1), which the plugin
+// records like any other run. Only a measured baseline is a sound reference:
+// two record-based substitutes were built and refuted against ground truth --
+// the fill's wall (its cost is set by the cache's own writes: reported 1.7x
+// where the truth was 0.70x) and service-time histograms (blocked-wait time is
+// not wall time under 32-way overlap: reported 2.8x for the same 0.70x). What
+// the records cannot carry, the estimate must not invent.
+//
+// The estimate is deliberately refusable. Outside the conditions it holds
+// under it reports `valid == false` with a `reason`, and the caller must print
+// the reason rather than the number -- a confidently wrong speedup is worse
+// than no speedup. A gain BELOW 1 is reported, not clamped: a cache slower
+// than the origin is a real answer and the whole point of measuring.
 struct GainEstimate {
   bool valid = false;
   double gain = 0.0;          // (wall + saved) / wall
   double savedS = 0.0;        // seconds the origin would have cost beyond the cache
-  double originMBs = 0.0;     // rate measured when the reference run filled
+  double originMBs = 0.0;     // rate the baseline run saw from the origin
   double cacheMBs = 0.0;      // rate this run delivered at
   uint64_t originEquivBytes = 0; // what the origin would have shipped, NOT bytes served
   uint64_t matchedFiles = 0, runFiles = 0;

@@ -364,8 +364,23 @@ void HandleState::releaseInner() {
 // Counted at issue time (a failed relay overcounts a little; the counter is
 // a tier-share indicator, not an accounting invariant).
 static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n) {
-  if (st->store && n)
+  if (st->store && n) {
     st->store->stats().relayBytes.fetch_add(n, std::memory_order_relaxed);
+    st->relayedBytes.fetch_add(n, std::memory_order_relaxed);
+  }
+}
+
+// First of Close/dtor decides: a handle that relayed and never had an entry
+// gets a per-file record now (FileEntry emits one only for entries).
+// `entry` is the handle's entry as swapped out by the caller — non-null means
+// FileEntry's own record covers this file and this one must not duplicate it.
+static void emitRelayObs(const std::shared_ptr<HandleState>& st,
+                         const std::shared_ptr<FileEntry>& entry) {
+  if (st->relayObsDone.exchange(true))
+    return;
+  const uint64_t n = st->relayedBytes.load(std::memory_order_relaxed);
+  if (!entry && st->store && n)
+    st->store->recordRelayObs(st->url, n);
 }
 
 // Request shape as the CLIENT asked for it, before the cache decides how to
@@ -1063,6 +1078,7 @@ UCacheFile::~UCacheFile() {
   }
   if (e)
     e->flushAll(); // synchronous (covers the no-explicit-Close path)
+  emitRelayObs(st_, e);
   st_->shutdownInner();
 }
 
@@ -1425,6 +1441,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   }
   if (e)
     e->flushAll(); // synchronous: staged pages + bitmap must hit disk before we may exit
+  emitRelayObs(st_, e);
   // Background recompression: a closed entry's read set is complete —
   // queue it for the drainer. Off the Close path (executor task); captures
   // only values, never the plugin object.

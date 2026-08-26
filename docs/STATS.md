@@ -203,13 +203,21 @@ reading was re-reading, and what the cache disk was asked to do.
   time (`cached_bytes / file_size` = the coverage signal gating replica
   materialization). Closed entries' coverage persists in their
   sidecars and is aggregated by `ucache stats` from there.
+- `disabled` — present (as `1`) when the process ran with `UCACHE_DISABLE`:
+  the cache was out of the loop and every byte was relayed. Such a run is a
+  measured NO-CACHE BASELINE; `ucache summary`/`history` compare cached runs
+  against it, matched by key through the per-file records.
 - Counters are process-lifetime monotonic; successive lines from one process
   supersede earlier ones (consumers take the last line per file).
 
 ## Companion files (same stem)
 
 - `<stem>.files.jsonl` — one record per entry per process lifetime, emitted
-  once (at last release, or at the final dump). Consumed by
+  once (at last release, or at the final dump). A handle the cache never
+  served — pass-through under `UCACHE_DISABLE`, or a write-opened file — also
+  leaves one at close, with the relayed bytes under `wire_bytes` and the
+  cache-side fields zero; that is what makes a baseline run matchable file by
+  file. Consumed by
   `ucache stats --files`:
 
   ```json
