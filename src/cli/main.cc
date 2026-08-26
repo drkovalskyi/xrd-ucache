@@ -1061,6 +1061,8 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   GainEstimate gain;
   if (last)
     gain = estimateGain(*last, runs);
+  else
+    gain.reason = "no runs recorded yet"; // a JSON consumer gets a reason too
 
   if (asJson) {
     std::printf("{\"cache_dir\":\"%s\",\"entries\":%zu,\"cached_bytes\":%llu,"
