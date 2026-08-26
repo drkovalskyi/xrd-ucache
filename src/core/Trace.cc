@@ -45,6 +45,19 @@ Tracer::~Tracer() {
     io_.close(fd_);
 }
 
+uint32_t Tracer::slot() {
+  // One counter per tracer, one cached id per thread. A process with a single
+  // tracer (the normal case) therefore numbers its workers 0..N-1 in the order
+  // they first do IO, which is what a replay wants to group by.
+  static thread_local const Tracer* owner = nullptr;
+  static thread_local uint32_t cached = 0;
+  if (owner != this) {
+    owner = this;
+    cached = nextSlot_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return cached;
+}
+
 void Tracer::rec(const char* op, const std::string& key, uint64_t off, uint64_t len,
                  uint64_t us, bool sampled) {
   if (sampled && sample_ > 1 &&
@@ -52,10 +65,13 @@ void Tracer::rec(const char* op, const std::string& key, uint64_t off, uint64_t 
     return;
   const uint64_t h = std::hash<std::string>{}(key);
   char line[192];
+  // `w` is this thread's worker slot. Recorded on every line because a replay
+  // reconstructs per-worker timelines, and the gap between one worker's
+  // completion and its next issue is that worker's compute.
   int n = std::snprintf(line, sizeof line,
-                        "{\"t\":%llu,\"op\":\"%s\",\"k\":\"%016llx\",\"off\":%llu,"
-                        "\"len\":%llu,\"us\":%llu}\n",
-                        static_cast<unsigned long long>(wallUs()), op,
+                        "{\"t\":%llu,\"w\":%u,\"op\":\"%s\",\"k\":\"%016llx\","
+                        "\"off\":%llu,\"len\":%llu,\"us\":%llu}\n",
+                        static_cast<unsigned long long>(wallUs()), slot(), op,
                         static_cast<unsigned long long>(h),
                         static_cast<unsigned long long>(off),
                         static_cast<unsigned long long>(len),

@@ -282,6 +282,36 @@ That is a real result from a real workload (a fast LAN origin and cheaply
 compressed data): the honest answer there is to not use a cache, and the tool
 says so.
 
+### Letting runs measure themselves
+
+Recording a baseline means running the same work twice, which only helps while
+your work stays the same. If your thread count changes, or your analysis gets
+faster, or you simply never have two comparable runs, set **`measure_permille`**
+instead:
+
+```sh
+ucache set measure_permille 50     # 5% of files served from the origin, on purpose
+```
+
+A small, rotating fraction of files is then served straight from the origin,
+cache untouched. Comparing how long those files take against the cached ones —
+**inside the same run** — measures what the cache is worth under that run's own
+conditions. Thread count, analysis speed, origin mood and disk contention are
+identical for both groups, so they cancel, and nothing older than the run itself
+enters the comparison. `summary` says when a number was measured that way, and
+`history` marks the row with `*`.
+
+What it costs: those files really do run at origin speed, so you give up roughly
+`fraction × (gain − 1)` of your wall — about 6% at 5% held out and a 2.3× gain,
+and **nothing at all when the cache is not helping**, which is exactly when you
+most want to be told. Once you have an answer, drop to a trickle
+(`measure_permille 5`) to notice drift, or back to `0`.
+
+One bias, stated because it is real: in a mostly-cached run the held-out files
+meet an origin serving few streams, where a no-cache run would meet it with all
+of them. On a busy origin that flatters the origin, so the number understates
+the cache rather than overstating it.
+
 ### Why a baseline, and not an estimate
 
 Nothing recorded during cached operation can stand in for the origin alone —

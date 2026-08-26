@@ -203,6 +203,11 @@ reading was re-reading, and what the cache disk was asked to do.
   time (`cached_bytes / file_size` = the coverage signal gating replica
   materialization). Closed entries' coverage persists in their
   sidecars and is aggregated by `ucache stats` from there.
+- `handles_high_water` — the most cache-engaged handles open at once in this
+  process. The origin's delivery is a non-monotone function of concurrency, so
+  measurements at different widths are not interchangeable; consumers pool runs
+  across time only when this agrees. Aggregated across processes it is a MAX,
+  never a sum.
 - `disabled` — present (as `1`) when the process ran with `UCACHE_DISABLE`:
   the cache was out of the loop and every byte was relayed. Such a run is a
   measured NO-CACHE BASELINE; `ucache summary`/`history` compare cached runs
@@ -223,12 +228,24 @@ reading was re-reading, and what the cache disk was asked to do.
   ```json
   {"ts": 0, "key": "root://…", "opens": 0, "served_bytes": 0, "ram_bytes": 0,
    "replica_bytes": 0, "disk_reads": 0, "disk_seq": 0, "disk_bytes": 0,
-   "first_touch_bytes": 0, "wire_bytes": 0}
+   "first_touch_bytes": 0, "wire_bytes": 0, "span_us": 0, "mode": "cached"}
   ```
+
+  `span_us` is the wall this file was live and working, from open to last
+  activity. Where one worker handles one file at a time that is the worker's
+  full cost for it — waits and the route's own CPU together — which is what
+  makes files served by different routes comparable. `mode` is `cached`,
+  `fill` (this process mostly fetched it), `holdout` (served from the origin
+  ON PURPOSE, for measurement — see `measure_permille`) or `relay` (passed
+  through for any other reason, including a `UCACHE_DISABLE` run).
 
 - `<stem>.trace.jsonl` — sampled per-operation IO trace, written only with
   `trace = io` (every `trace_sample`-th operation per class). Records are
-  `{"t": <wall µs>, "op": "<operation>", "k": "<16-hex key hash>", "off": 0,
-  "len": 0, "us": 0}`; the first record for each key is a legend line
+  `{"t": <wall µs>, "w": <worker slot>, "op": "<operation>", "k": "<16-hex key
+  hash>", "off": 0, "len": 0, "us": 0}`; `w` is a small per-thread slot id,
+  assigned on that thread's first record and stable for its life, so a consumer
+  can reconstruct each worker's timeline — the gap between one worker's
+  completion and its next issue is that worker's compute. The first record for
+  each key is a legend line
   `{"op": "key", "k": "<hash>", "url": "<full url>"}` mapping the hash back
   to the URL.

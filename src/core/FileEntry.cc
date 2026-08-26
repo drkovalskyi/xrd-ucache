@@ -98,6 +98,9 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
   e->lastFlushS_ = nowS();
   e->lastBufFlushS_ = nowS();
   stats.opens.fetch_add(1, std::memory_order_relaxed);
+  // The span starts HERE, not at first read: opening is part of what a file
+  // costs, and a file read exactly once would otherwise have no span at all.
+  e->noteActivity();
   return e;
 }
 
@@ -116,6 +119,15 @@ FileEntry::~FileEntry() {
     g_bufTotal_.fetch_sub(bufBytes_, std::memory_order_relaxed);
 }
 
+void FileEntry::noteActivity() {
+  const uint64_t t = nowUsSteady();
+  uint64_t expected = 0;
+  // Only the first caller sets the start; the rest just push the end forward.
+  // Monotone, so a stale racing store cannot shorten the span below truth.
+  obs_.firstUs.compare_exchange_strong(expected, t, std::memory_order_relaxed);
+  obs_.lastUs.store(t, std::memory_order_relaxed);
+}
+
 void FileEntry::emitObsRecord() {
   if (!obsSink_ || obs_.opens.load(std::memory_order_relaxed) == 0)
     return;
@@ -130,7 +142,12 @@ void FileEntry::emitObsRecord() {
      << ",\"disk_reads\":" << v(obs_.diskReads) << ",\"disk_seq\":" << v(obs_.diskSeq)
      << ",\"disk_bytes\":" << v(obs_.diskBytes)
      << ",\"first_touch_bytes\":" << v(obs_.firstTouchBytes)
-     << ",\"wire_bytes\":" << v(obs_.wireBytes) << "}\n";
+     << ",\"wire_bytes\":" << v(obs_.wireBytes)
+     << ",\"span_us\":" << spanUs()
+     // A file this process mostly FETCHED is a fill, whatever else it also
+     // served; the distinction decides which population a measurement joins.
+     << ",\"mode\":\"" << (v(obs_.wireBytes) > v(obs_.servedBytes) ? "fill" : "cached")
+     << "\"}\n";
   obsSink_->append(os.str());
 }
 
@@ -220,6 +237,7 @@ bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint3
 }
 
 bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
+  noteActivity();
   if (len == 0)
     return true;
   if (off + len < off || off + len > meta_.fileSize) // wrap, then range
@@ -356,6 +374,7 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
 }
 
 void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
+  noteActivity();
   if (cfg_.fillBufferMb <= 0) {
     writePagesDirect(off, len, buf);
     return;
@@ -397,6 +416,7 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
 }
 
 void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
+  noteActivity();
   if (len == 0)
     return;
   const uint32_t P = meta_.pageSize;

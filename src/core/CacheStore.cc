@@ -803,7 +803,8 @@ FileEntry::ScrubResult CacheStore::verify(const UrlKey& key, uint64_t originSize
   return e->verifyAll();
 }
 
-void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes) {
+void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
+                                uint64_t spanUs) {
   if (!obsSink_ || bytes == 0)
     return;
   // Normalized exactly like a cached entry's key, or the baseline record could
@@ -813,7 +814,8 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes) {
   os << "{\"ts\":" << nowS() << ",\"key\":\"" << jsonEscape(key ? key->key : url) << '\"'
      << ",\"opens\":1,\"served_bytes\":0,\"ram_bytes\":0,\"replica_bytes\":0"
      << ",\"disk_reads\":0,\"disk_seq\":0,\"disk_bytes\":0,\"first_touch_bytes\":0"
-     << ",\"wire_bytes\":" << bytes << "}\n";
+     << ",\"wire_bytes\":" << bytes << ",\"span_us\":" << spanUs << ",\"mode\":\"" << mode
+     << "\"}\n";
   obsSink_->append(os.str());
 }
 

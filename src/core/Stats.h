@@ -92,6 +92,11 @@ struct Stats {
   std::atomic<uint64_t> flushRunBytes{0};
   std::atomic<uint64_t> bufferStalls{0};      // cap-triggered synchronous drains
   std::atomic<uint64_t> bufferStallUs{0};     // wall time writers spent inside them
+  // Most cache-engaged handles open at once during this process. The origin's
+  // delivery is a non-monotone function of concurrency, so a measurement taken
+  // at one width says little about another: runs are only pooled across time
+  // when this agrees, and a change in it is what re-arms measurement.
+  std::atomic<uint64_t> handlesHighWater{0};
   Histogram hitReadUs;
   Histogram missReadUs;
   Histogram originRtUs;
@@ -128,6 +133,7 @@ struct StatsTotals {
            replicaOpens = 0, replicaPublished = 0, replicaInvalid = 0, replicaCrcFailures = 0,
            replicaPunchedBytes = 0, replicaOrphansSwept = 0;
   // Workflow counters:
+  uint64_t handlesHighWater = 0;
   uint64_t filesOpened = 0, ramHitBytes = 0, firstTouchBytes = 0, hitDiskReads = 0,
            hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
            replicaReadBytes = 0, relayBytes = 0,

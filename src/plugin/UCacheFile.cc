@@ -1,5 +1,6 @@
 #include "UCacheFile.h"
 
+#include "Holdout.h"
 #include "HelperPath.h"
 #include "Executor.h"
 #include "Log.h"
@@ -367,6 +368,10 @@ static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n) {
   if (st->store && n) {
     st->store->stats().relayBytes.fetch_add(n, std::memory_order_relaxed);
     st->relayedBytes.fetch_add(n, std::memory_order_relaxed);
+    const uint64_t t = nowUs();
+    uint64_t expected = 0;
+    st->relayFirstUs.compare_exchange_strong(expected, t, std::memory_order_relaxed);
+    st->relayLastUs.store(t, std::memory_order_relaxed);
   }
 }
 
@@ -379,8 +384,12 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
   if (st->relayObsDone.exchange(true))
     return;
   const uint64_t n = st->relayedBytes.load(std::memory_order_relaxed);
-  if (!entry && st->store && n)
-    st->store->recordRelayObs(st->url, n);
+  if (!entry && st->store && n) {
+    const uint64_t a = st->relayFirstUs.load(std::memory_order_relaxed);
+    const uint64_t b = nowUs(); // the handle is closing: this IS its last activity
+    st->store->recordRelayObs(st->url, n, st->heldOut ? "holdout" : "relay",
+                              b > a ? b - a : 0);
+  }
 }
 
 // Request shape as the CLIENT asked for it, before the cache decides how to
@@ -1018,6 +1027,7 @@ void stitchedServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> e
     stats.replicaBytesServed.fetch_add(overlayBytes, std::memory_order_relaxed);
     stats.replicaReadUs.add(nowUs() - t0);
     entry->obs().replicaBytes.fetch_add(overlayBytes, std::memory_order_relaxed);
+    entry->noteActivity(); // the replica path serves without touching readCached
     if (stats.tracer)
       stats.tracer->rec("replica", entry->key().key, userChunks[0].offset, overlayBytes,
                         nowUs() - t0);
@@ -1121,14 +1131,41 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
                                      XrdCl::Access::Mode mode, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
   st_->cpu0Us = processCpuUs(); // CPU-span start
-  if (gOpenUCacheHandles.fetch_add(1) > 0)
+  const int nowOpen = gOpenUCacheHandles.fetch_add(1) + 1;
+  if (nowOpen > 1)
     st_->cpuBlended = true; // another handle already open: spans overlap
+  if (st_->store) {
+    // Monotone max. Relaxed CAS loop: contention here is bounded by how often
+    // a NEW peak happens, which is rare after the first seconds of a job.
+    auto& hw = st_->store->stats().handlesHighWater;
+    uint64_t seen = hw.load(std::memory_order_relaxed);
+    while (static_cast<uint64_t>(nowOpen) > seen &&
+           !hw.compare_exchange_weak(seen, static_cast<uint64_t>(nowOpen),
+                                     std::memory_order_relaxed))
+      ; // seen is refreshed by the failed exchange
+  }
 
   const Config& cfg = globalConfig();
   st_->url = url;
   using OF = XrdCl::OpenFlags;
   bool writey = flags & (OF::Update | OF::Write | OF::New | OF::Delete);
-  passthroughOnly_ = writey || cfg.disable || !st_->store;
+  // Measurement holdout: this file is deliberately served from the origin so
+  // its wall span measures what the origin costs, under THIS run's conditions.
+  // Decided once per handle, from the normalized key so every process agrees.
+  if (!writey && !cfg.disable && st_->store && cfg.measurePermille > 0) {
+    if (auto k = UrlKey::parse(url, cfg.keepCgi))
+      st_->heldOut = holdoutSelected(k->key, cfg.measurePermille, cfg.measureRotateSeconds,
+                                     static_cast<uint64_t>(::time(nullptr)));
+  }
+  passthroughOnly_ = writey || cfg.disable || !st_->store || st_->heldOut;
+  if (passthroughOnly_ && st_->store) {
+    // Start a relayed handle's span at open for the same reason: its cost
+    // includes reaching the origin, and a one-read file must still have a span.
+    const uint64_t t0 = nowUs();
+    uint64_t expected = 0;
+    st_->relayFirstUs.compare_exchange_strong(expected, t0, std::memory_order_relaxed);
+    st_->relayLastUs.store(t0, std::memory_order_relaxed);
+  }
   if (writey && st_->store) {
     // §4.4: write access invalidates any cached entry for this URL.
     auto store = st_->store;

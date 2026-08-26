@@ -1,5 +1,6 @@
 #include "Stats.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <dirent.h>
@@ -106,6 +107,7 @@ std::string Stats::toJsonBody() const {
   f("flush_run_bytes", flushRunBytes);
   f("buffer_stalls", bufferStalls);
   f("buffer_stall_us", bufferStallUs);
+  f("handles_high_water", handlesHighWater);
   os << "\"hist_hit_read_us\":" << hitReadUs.toJson() << ',';
   os << "\"hist_miss_read_us\":" << missReadUs.toJson() << ',';
   os << "\"hist_origin_rt_us\":" << originRtUs.toJson() << ',';
@@ -194,6 +196,9 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.flushRunBytes += extractU64(last, "flush_run_bytes");
     t.bufferStalls += extractU64(last, "buffer_stalls");
     t.bufferStallUs += extractU64(last, "buffer_stall_us");
+    // A high-water mark is a MAX, not a sum: adding two processes' peaks would
+    // invent a concurrency neither reached.
+    t.handlesHighWater = std::max(t.handlesHighWater, extractU64(last, "handles_high_water"));
     extractHist(last, "hist_hit_read_us", t.histHitRead);
     extractHist(last, "hist_origin_rt_us", t.histOriginRt);
     extractHist(last, "hist_open_us", t.histOpen);

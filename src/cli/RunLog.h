@@ -30,6 +30,8 @@ struct Run {
   bool complete = false; // a cumulative line was found (a killed job has none)
   bool disabled = false; // ran with the cache OUT OF THE LOOP (UCACHE_DISABLE):
                          // a measured BASELINE, the only sound gain reference
+  uint64_t handlesHighWater = 0; // peak concurrent cache handles; runs are only
+                                 // pooled across time when this agrees
 
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;
@@ -47,6 +49,8 @@ struct Run {
   struct FileRec {
     uint64_t ts = 0, opens = 0, servedBytes = 0, ramBytes = 0, replicaBytes = 0;
     uint64_t diskReads = 0, diskSeq = 0, diskBytes = 0, firstTouchBytes = 0, wireBytes = 0;
+    uint64_t spanUs = 0;  // wall this file was live and working, µs
+    std::string mode;     // cached | fill | holdout | relay ("" = pre-span record)
   };
   std::map<std::string, FileRec> files;
 
@@ -106,7 +110,8 @@ struct GainEstimate {
 // says whether the cache is worth having.
 struct Totals {
   size_t runs = 0;          // runs with records
-  size_t runsEstimated = 0; // runs the gain estimate accepted
+  size_t runsEstimated = 0; // runs any method could measure
+  size_t runsInRun = 0;     // …of which measured from inside themselves (holdout)
   size_t distinctFiles = 0; // union across runs, not a sum
   uint64_t firstStartS = 0, lastEndS = 0;
   uint64_t durationS = 0;   // summed run spans, which is what the rates divide by
@@ -126,6 +131,37 @@ struct Totals {
 // to stop somewhere). Whatever it skips is reported in `gainCapped` rather
 // than silently dropped.
 Totals summarize(const std::vector<Run>& runs, size_t maxEstimates = 100);
+
+// What a run measured about ITSELF, from files it deliberately served straight
+// from the origin (`measure_permille`) next to files it served from cache.
+//
+// This is the device that survives what a cross-run comparison cannot: a
+// thread-count change, a faster analysis loop, a different origin mood. Both
+// populations ran in the SAME process, at the same width, against the same
+// origin, with the same code — so everything except the read route cancels.
+//
+// The comparison is per-file WALL SPAN per origin-equivalent byte. Spans carry
+// the route's CPU as well as its waits, which per-read service times do not,
+// and that difference is exactly where latency-based models sign-flipped.
+//
+// Known bias, stated wherever this is printed: in a mostly-cached run the
+// held-out files meet an origin serving few streams, where a no-cache world
+// would meet it with all of them. On a saturating origin that flatters the
+// origin, so the gain is UNDERSTATED — conservative, never inflated.
+struct InRunGain {
+  bool valid = false;
+  double gain = 0.0;         // cached seconds-per-byte vs holdout: >1 = cache wins
+  uint64_t holdoutFiles = 0, cachedFiles = 0;
+  uint64_t holdoutBytes = 0, cachedBytes = 0;
+  double holdoutUsPerMB = 0.0, cachedUsPerMB = 0.0;
+  double spanCoverage = 0.0; // Σ spans / (wall × concurrency): the composition
+                             // self-check — far from 1 means spans do not
+                             // account for the run and the answer is refused
+  std::string reason;        // always set when !valid; worth printing when valid
+};
+
+// Needs only the run itself — no history, no baseline, no other process.
+InRunGain inRunGain(const Run& run);
 
 // `all` should be the output of loadRuns (order is not relied on). The reference
 // is chosen from runs that precede `run` in time and actually fetched from

@@ -122,6 +122,20 @@ struct Config {
   // read-class op (1 = everything). Off ("") by default — zero cost.
   std::string trace;    // UCACHE_TRACE ("io" | "off"/"")
   int traceSample = 64; // UCACHE_TRACE_SAMPLE
+  // Measurement holdout, in PER MILLE of files (0 = off, the default).
+  // A selected file is served pure pass-through — origin only, cache
+  // untouched — so its wall span measures what the origin costs for real work
+  // under this run's own conditions. Comparing those spans against cached
+  // files' spans, within the same run, is the only device that survives a
+  // thread-count change or a faster analysis loop: nothing older than the run
+  // enters the comparison. The price is p*(gain-1) of the wall, so it is FREE
+  // exactly when the cache is buying nothing — which is when the truth matters
+  // most. Per mille, not percent, because a trickle (1-5 permille) is the
+  // steady-state setting once a measurement exists.
+  int measurePermille = 0; // UCACHE_MEASURE_PERMILLE
+  // Rotates which files are held out, so coverage accumulates over time
+  // instead of punishing the same files forever. 0 = never rotate.
+  uint64_t measureRotateSeconds = 86400; // UCACHE_MEASURE_ROTATE_SECONDS
   std::vector<std::string> keepCgi;       // UCACHE_KEEP_CGI comma list
   std::vector<std::string> allowHosts;    // UCACHE_ALLOW glob list (empty = all)
   std::vector<std::string> denyHosts;     // UCACHE_DENY glob list

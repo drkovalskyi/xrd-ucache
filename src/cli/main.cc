@@ -1038,6 +1038,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     const double pb = total ? 100.0 * static_cast<double>(r.hitBytes) / static_cast<double>(total) : 0.0;
     const double pr = total ? 100.0 * static_cast<double>(r.replicaBytesServed) / static_cast<double>(total) : 0.0;
     const double pl = total ? 100.0 * static_cast<double>(r.relayBytes) / static_cast<double>(total) : 0.0;
+    const InRunGain self = inRunGain(r);
     const GainEstimate g = estimateGain(r, runs);
     if (asJson) {
       std::printf("%s{\"start\":%llu,\"duration_s\":%llu,\"host\":\"%s\",\"pid\":%llu,"
@@ -1051,14 +1052,21 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   (unsigned long long)r.originBytes, (unsigned long long)r.hitBytes,
                   (unsigned long long)r.replicaBytesServed,
                   (unsigned long long)r.relayBytes, (unsigned long long)r.faults());
-      if (g.valid)
-        std::printf("%.3f}", g.gain);
+      if (self.valid)
+        std::printf("%.3f,\"gain_source\":\"in-run\"}", self.gain);
+      else if (g.valid)
+        std::printf("%.3f,\"gain_source\":\"baseline\"}", g.gain);
       else
-        std::printf("null}");
+        std::printf("null,\"gain_source\":null}");
       continue;
     }
     char gainCell[16];
-    if (g.valid)
+    // The in-run measurement is preferred: both of its sides ran in the SAME
+    // process, so thread count, analysis version and origin mood cancel. A `*`
+    // marks it, since a cross-run baseline number means something weaker.
+    if (self.valid)
+      std::snprintf(gainCell, sizeof gainCell, "%.2fx*", self.gain);
+    else if (g.valid)
       std::snprintf(gainCell, sizeof gainCell, "%.2fx", g.gain);
     else if (r.disabled)
       std::snprintf(gainCell, sizeof gainCell, "base");
@@ -1183,6 +1191,10 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                     "(%.1fx, vs a measured baseline)\n",
                     t.runsEstimated, humanDur(took).c_str(), humanDur(would).c_str(),
                     t.gain);
+      if (t.runsInRun)
+        std::printf("             %zu of those measured themselves (files held out to "
+                    "the origin); the rest against a recorded baseline\n",
+                    t.runsInRun);
       if (t.runsEstimated < t.runs)
         std::printf("             the other %zu run(s) could not be measured — "
                     "`ucache history` says which\n",
@@ -1261,7 +1273,23 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
 
   // The estimate, or the reason there isn't one. Never both a number and a
   // doubt: outside the conditions it was validated under it is not printed.
-  if (gain.valid) {
+  const InRunGain self = inRunGain(*last);
+  if (self.valid) {
+    if (self.gain >= 1.0)
+      std::printf("gain       : %.2fx versus the origin — measured INSIDE this run\n",
+                  self.gain);
+    else
+      std::printf("gain       : %.2fx — the cache made this run SLOWER than the origin "
+                  "(measured INSIDE this run)\n",
+                  self.gain);
+    std::printf("             %llu file(s) held out to the origin at %.0f ms/GiB, against "
+                "%llu cached at %.0f ms/GiB\n",
+                (unsigned long long)self.holdoutFiles, self.holdoutUsPerMB / 1e3 * 1024.0,
+                (unsigned long long)self.cachedFiles, self.cachedUsPerMB / 1e3 * 1024.0);
+    std::puts("             both sides ran in this process, so thread count and analysis "
+              "speed cancel; the held-out files met a less loaded origin than a");
+    std::puts("             no-cache run would, so if anything this understates the gain");
+  } else if (gain.valid) {
     if (gain.gain >= 1.0)
       std::printf("gain       : ~%.1fx versus no cache (measured baseline)\n", gain.gain);
     else
@@ -1274,7 +1302,10 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                 (unsigned long long)gain.matchedFiles, (unsigned long long)gain.runFiles,
                 gain.savedS >= 0 ? "saved ~" : "cost ~", std::fabs(gain.savedS));
   } else {
-    std::printf("gain       : not measured — %s\n", gain.reason.c_str());
+    // Two ways to get a number; name the one that is closer to hand.
+    std::printf("gain       : not measured — %s\n",
+                self.reason.find("measure_permille") != std::string::npos ? self.reason.c_str()
+                                                                         : gain.reason.c_str());
   }
   std::puts("next       : `ucache history` for the trend across runs");
   return 0;

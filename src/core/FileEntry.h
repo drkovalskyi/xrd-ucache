@@ -140,8 +140,22 @@ class FileEntry {
     std::atomic<uint64_t> diskBytes{0};
     std::atomic<uint64_t> firstTouchBytes{0}; // bytes served for the first time
     std::atomic<uint64_t> wireBytes{0};       // bytes staged/persisted (fills)
+    // Wall span this entry was live and doing work for, in µs of a steady
+    // clock: first activity to last. In a slot-based analysis (one worker per
+    // file at a time) this is that thread's FULL cost for the file — waits
+    // AND the route's own CPU — which is what makes spans composable where
+    // service times are not, and it is the quantity the gain methods divide.
+    std::atomic<uint64_t> firstUs{0};
+    std::atomic<uint64_t> lastUs{0};
   };
   Obs& obs() { return obs_; }
+  // Zero when the entry never recorded activity, or when all of it landed
+  // inside one clock tick — callers treat 0 as "no usable span".
+  uint64_t spanUs() const {
+    const uint64_t a = obs_.firstUs.load(std::memory_order_relaxed);
+    const uint64_t b = obs_.lastUs.load(std::memory_order_relaxed);
+    return b > a ? b - a : 0;
+  }
 
   // Append sink for the close-time record. shared_ptr: entries released
   // during/after store teardown must not reach into a dead store.
@@ -167,6 +181,9 @@ class FileEntry {
   // reference is dropped only at process teardown (leaked plugin globals,
   // executor task captures) would otherwise never record.
   void emitObsRecord();
+  // Stamp activity onto the span. Cheap (two relaxed atomics, one CAS only on
+  // the first call); called from the serve and fill paths.
+  void noteActivity();
 
  private:
   FileEntry(IOBackend& io, const Config& cfg, Stats& stats, UrlKey key)
