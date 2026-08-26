@@ -1,12 +1,12 @@
 # uCache
 
 xrd-ucache or simply uCache is a transparent, per-user read cache for
-remote ROOT/XRootD data. You install it once; thereafter every
-`root://…` file your jobs read is cached on local disk, so the
-**second and later** passes over the same data read from your NVMe
-instead of the network. Nothing in your analysis code changes and the
-first cold run has minimal overhead, so there's little to lose in
-trying it.
+remote ROOT/XRootD data. You install it once and point it at the servers
+you read from; thereafter every file your jobs read from them is cached
+on local disk, so the **second and later** passes over the same data
+come from that disk instead of the network. Nothing in your analysis
+code changes and the first cold run has minimal overhead, so there's
+little to lose in trying it.
 
 ## Try it
 
