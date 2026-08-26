@@ -1015,9 +1015,12 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                 human(t.originBytes).c_str(), allRate, allTiers,
                 (unsigned long long)t.faults, allGain);
     if (t.haveGain)
-      std::printf("%-16s estimated across %zu of %zu runs — about %s of origin time "
-                  "not spent\n",
-                  "", t.runsEstimated, t.runs, humanDur((uint64_t)t.savedS).c_str());
+      std::printf("%-16s %zu of %zu runs estimated: took %s, would have taken about %s "
+                  "from the origin — saved %s\n",
+                  "", t.runsEstimated, t.runs,
+                  humanDur((uint64_t)t.estimatedDurationS).c_str(),
+                  humanDur((uint64_t)(t.estimatedDurationS + t.savedS)).c_str(),
+                  humanDur((uint64_t)t.savedS).c_str());
     if (t.gainCapped)
       std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
                   "estimate)\n", "", t.gainCapped);
@@ -1152,17 +1155,26 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   // answers "is this cache worth having", which is the question being asked.
   const Totals t = summarize(runs);
   if (t.runs) {
-    std::printf("overall    : %zu run(s) over %s — %s served from cache, %s from the "
+    std::printf("overall    : %zu run(s) recorded — %s served from cache, %s from the "
                 "origin\n",
-                t.runs, humanDur(t.durationS).c_str(), human(t.cacheBytes()).c_str(),
-                human(t.originBytes).c_str());
-    if (t.haveGain)
-      std::printf("  gain     : ~%.1fx versus reading from the origin (estimate) — about "
-                  "%s of origin time not spent, across %zu of %zu run(s)\n",
-                  t.gain, humanDur(static_cast<uint64_t>(t.savedS)).c_str(),
-                  t.runsEstimated, t.runs);
-    else
-      std::printf("  gain     : not estimated for any run yet\n");
+                t.runs, human(t.cacheBytes()).c_str(), human(t.originBytes).c_str());
+    // TIME, not a ratio. A ratio across runs of different lengths is an average
+    // nobody experienced; seconds add up honestly and answer the question that
+    // was actually asked, which is whether the work went faster.
+    if (t.haveGain) {
+      const uint64_t took = static_cast<uint64_t>(t.estimatedDurationS);
+      const uint64_t would = static_cast<uint64_t>(t.estimatedDurationS + t.savedS);
+      std::printf("  saved    : %s — %zu run(s) took %s, and would have taken about %s "
+                  "reading from the origin (%.1fx, estimated)\n",
+                  humanDur(static_cast<uint64_t>(t.savedS)).c_str(), t.runsEstimated,
+                  humanDur(took).c_str(), humanDur(would).c_str(), t.gain);
+      if (t.runsEstimated < t.runs)
+        std::printf("             the other %zu run(s) could not be estimated — "
+                    "`ucache history` says which\n",
+                    t.runs - t.runsEstimated);
+    } else {
+      std::printf("  saved    : not estimated for any run yet — `ucache history` says why\n");
+    }
     if (t.faults)
       std::printf("  health   : %llu fault(s) across all runs — `ucache verify <url>`\n",
                   (unsigned long long)t.faults);

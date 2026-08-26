@@ -257,18 +257,23 @@ nothing needs to be running, and there is no sampling daemon to start.
 
 ```text
 $ ucache summary
-overall    : 7 run(s) over 1h08m — 720.8 GiB served from cache, 266.1 GiB from the origin
-  gain     : ~2.3x versus reading from the origin (estimate) — about 35m30s of origin
-             time not spent, across 4 of 7 run(s)
+overall    : 7 run(s) recorded — 720.8 GiB served from cache, 266.1 GiB from the origin
+  saved    : 35m30s — 4 run(s) took 27m14s, and would have taken about 1h02m reading
+             from the origin (2.3x, estimated)
+             the other 3 run(s) could not be estimated — `ucache history` says which
   health   : OK — no faults in any recorded run
 cache      : /scratch/ucache — 1456 entries, 202.8 GiB on disk, 1.3 TiB headroom
 next       : `ucache summary --detail` for the last run; `ucache history` for the trend
 ```
 
-That is the whole default: **what the cache has done across every run it still
-has records for.** The aggregate gain divides only by the spans of the runs it
-could actually estimate — folding in a cache-filling run would dilute the answer
-with time the cache was not serving anyone — and it says how many runs that was.
+**The headline is time, not a ratio.** Both walls are shown — what the runs took,
+and what the same work would have cost from the origin — because seconds add up
+honestly across runs of different lengths, where a ratio would be an average no
+single run experienced. The multiplier is there as shorthand, not as the claim.
+
+Only runs the estimate accepted are counted, and it says how many that was:
+folding a cache-filling run into the total would credit the cache for time it was
+not serving anyone.
 
 `ucache summary --detail` adds the last run underneath: tier split, delivered
 rate, per-tier read counts and sizes, replica coverage, and the basis for that
