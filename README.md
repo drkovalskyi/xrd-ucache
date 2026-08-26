@@ -12,8 +12,8 @@ little to lose in trying it.
 
 To use uCache with your analysis, install it and activate it with a
 plugin configuration file. The following instructions show how to do
-it using the EL9 (Alma/Rocky/RHEL 9) tarball. For Debian/Ubuntu, any other
-Linux, or macOS — and for building from source on any of them — see
+it using the EL9 (Alma/Rocky/RHEL 9) tarball. For Debian/Ubuntu, other Linux
+distributions, or macOS — and for building from source on any of them — see
 [the user guide](docs/USER_GUIDE.md).
 
 First, ensure that you have all relevant packages for data access over XRootD:
@@ -76,8 +76,8 @@ Further validation is performed with tools outside this repository.
 
 ## Documentation
 
-- [User guide](docs/USER_GUIDE.md) — install on any platform, activate, verify,
-  configure, CLI reference
+- [User guide](docs/USER_GUIDE.md) — install from the EL9 packages, or from
+  source on Linux and macOS; activate, verify, configure, CLI reference
 - [Cache management](docs/CACHE_MANAGEMENT.md) — space, eviction, choosing a
   cache disk
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — when it doesn't engage, or
