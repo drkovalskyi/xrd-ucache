@@ -16,7 +16,7 @@ else()
   message(STATUS "ucache: `bench` storage self-test unavailable on ${CMAKE_SYSTEM_NAME}")
 endif()
 
-add_executable(ucache main.cc ${UCACHE_DISKBENCH_SRC})
+add_executable(ucache main.cc RunLog.cc ${UCACHE_DISKBENCH_SRC})
 if (APPLE)
   # Per-device IO counters come from the IO registry here, not from /proc.
   target_link_libraries(ucache PRIVATE "-framework IOKit" "-framework CoreFoundation")

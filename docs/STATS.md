@@ -24,6 +24,12 @@ how to read the printed summary.
 
 ## Where the numbers are written
 
+These records are also what `ucache summary` and `ucache history` read: the
+file name carries the store's start time and the last line carries its end, so
+one process's work is bracketed without any periodic sampling, and the
+`.files.jsonl` companion says which entries the bytes belonged to. Consumers
+should take the file name's `<start_ts>` as the start of the run.
+
 One JSON line is appended to `$UCACHE_DIR/stats/<host>-<pid>-<start_ts>-<seq>.jsonl`
 at every `CacheStore::dumpStats()` (explicit calls, store destruction; the
 plugin adds close/atexit). External tooling consumes these — the

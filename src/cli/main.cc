@@ -8,6 +8,7 @@
 #include "IOBackend.h"
 #include "MetaFile.h"
 #include "ReplicaStore.h"
+#include "RunLog.h"
 #include "DiskBench.h"
 #include "UrlKey.h"
 #ifdef UCACHE_HAVE_TRANSPOSE
@@ -66,6 +67,10 @@ void usage() {
       "                    read via xrdcp; warm must be origin-free; cleans up the\n"
       "                    entry it created (a pre-existing entry is kept)\n"
       "  enable | disable  turn caching on/off (flips the plugin conf)\n"
+      "  summary           what the cache did for your last run: tiers, health,\n"
+      "                    and an estimate of what it saved versus the origin\n"
+      "  history [--top N] one row per run, newest first — whether the numbers\n"
+      "                    are holding up across runs, versions and machines\n"
       "  status            cache location, budget, usage, and aggregated stats\n"
       "  bench [PATH ...] [--size SZ] [--measurement-duration S] [--threads N]\n"
       "                    [--block KB] [--fill k=v,...] [--cache-path]\n"
@@ -897,6 +902,265 @@ std::string recompressStall(const Config& cfg, IOBackend& io, size_t queued, siz
 #endif
   return "nothing has been built yet (no cause identified — see " +
          cfg.cacheDir + "/recompress.log)";
+}
+
+// ---------------------------------------------------------------------------
+// Run-level readouts: `summary` (what the last run got) and `history` (whether
+// that is holding up over time). Both read only records the plugin already
+// writes -- there is no sampling loop and no new state file.
+// ---------------------------------------------------------------------------
+
+// "39s", "5m39s", "1h14m", "2d3h" -- a duration a person reads at a glance.
+std::string humanDur(uint64_t s) {
+  char out[32];
+  if (s < 60)
+    std::snprintf(out, sizeof out, "%llus", (unsigned long long)s);
+  else if (s < 3600)
+    std::snprintf(out, sizeof out, "%llum%02llus", (unsigned long long)(s / 60),
+                  (unsigned long long)(s % 60));
+  else if (s < 86400)
+    std::snprintf(out, sizeof out, "%lluh%02llum", (unsigned long long)(s / 3600),
+                  (unsigned long long)((s % 3600) / 60));
+  else
+    std::snprintf(out, sizeof out, "%llud%lluh", (unsigned long long)(s / 86400),
+                  (unsigned long long)((s % 86400) / 3600));
+  return out;
+}
+
+std::string stamp(uint64_t t) {
+  char out[32];
+  const time_t tt = static_cast<time_t>(t);
+  struct tm tmv;
+  ::localtime_r(&tt, &tmv);
+  std::strftime(out, sizeof out, "%Y-%m-%d %H:%M", &tmv);
+  return out;
+}
+
+double mbPerS(uint64_t bytes, uint64_t seconds) {
+  return seconds ? static_cast<double>(bytes) / static_cast<double>(seconds) / 1e6 : 0.0;
+}
+
+// What the run label should say. Deliberately not a percentage: "warm" and
+// "fill" are the two states a user acts on differently.
+const char* runKind(const Run& r) {
+  if (r.originBytes && r.cacheBytes() == 0)
+    return "fill";
+  if (r.originBytes == 0 && r.cacheBytes())
+    return "warm";
+  if (r.originBytes && r.cacheBytes())
+    return "mixed";
+  return "idle";
+}
+
+int cmdHistory(const Config& cfg, int argc, char** argv) {
+  size_t top = 20;
+  bool asJson = false;
+  for (int i = 2; i < argc; ++i) {
+    if (!std::strcmp(argv[i], "--json"))
+      asJson = true;
+    else if (!std::strcmp(argv[i], "--top") && i + 1 < argc)
+      top = static_cast<size_t>(std::max(1, ::atoi(argv[++i])));
+    else {
+      std::fprintf(stderr, "history: unknown argument %s\n", argv[i]);
+      return 2;
+    }
+  }
+  const auto runs = loadRuns(cfg.cacheDir + "/stats");
+  if (runs.empty()) {
+    if (asJson)
+      std::puts("{\"runs\":[]}");
+    else
+      std::puts("no runs recorded yet — records appear when a job that used the "
+                "cache exits (CLI invocations do not write them)");
+    return 0;
+  }
+  const size_t shown = std::min(top, runs.size());
+  if (!asJson)
+    std::printf("%zu run(s) recorded, newest first (showing %zu)\n", runs.size(), shown);
+
+  if (asJson)
+    std::printf("{\"runs\":[");
+  else
+    std::printf("%-16s %8s %7s %10s %10s %10s  %-18s %6s %s\n", "WHEN", "DUR", "FILES",
+                "SERVED", "ORIGIN", "RATE", "BYTE/REPL/RELAY", "FAULTS", "GAIN");
+
+  for (size_t i = 0; i < shown; ++i) {
+    const Run& r = runs[i];
+    const uint64_t total = r.hitBytes + r.replicaBytesServed + r.relayBytes;
+    const double pb = total ? 100.0 * static_cast<double>(r.hitBytes) / static_cast<double>(total) : 0.0;
+    const double pr = total ? 100.0 * static_cast<double>(r.replicaBytesServed) / static_cast<double>(total) : 0.0;
+    const double pl = total ? 100.0 * static_cast<double>(r.relayBytes) / static_cast<double>(total) : 0.0;
+    const GainEstimate g = estimateGain(r, runs);
+    if (asJson) {
+      std::printf("%s{\"start\":%llu,\"duration_s\":%llu,\"host\":\"%s\",\"pid\":%llu,"
+                  "\"kind\":\"%s\",\"files\":%llu,\"served_bytes\":%llu,"
+                  "\"origin_bytes\":%llu,\"hit_bytes\":%llu,\"replica_bytes\":%llu,"
+                  "\"relay_bytes\":%llu,\"faults\":%llu,\"gain\":",
+                  i ? "," : "", (unsigned long long)r.startS,
+                  (unsigned long long)r.durationS(), r.host.c_str(),
+                  (unsigned long long)r.pid, runKind(r),
+                  (unsigned long long)r.files.size(), (unsigned long long)r.servedBytes,
+                  (unsigned long long)r.originBytes, (unsigned long long)r.hitBytes,
+                  (unsigned long long)r.replicaBytesServed,
+                  (unsigned long long)r.relayBytes, (unsigned long long)r.faults());
+      if (g.valid)
+        std::printf("%.3f}", g.gain);
+      else
+        std::printf("null}");
+      continue;
+    }
+    char gainCell[16];
+    if (g.valid)
+      std::snprintf(gainCell, sizeof gainCell, "%.2fx", g.gain);
+    else
+      std::snprintf(gainCell, sizeof gainCell, "%s",
+                    r.originBytes && r.cacheBytes() == 0 ? "fill" : "-");
+    char tiers[32];
+    std::snprintf(tiers, sizeof tiers, "%.0f%%/%.0f%%/%.0f%%", pb, pr, pl);
+    char rate[16];
+    std::snprintf(rate, sizeof rate, "%.0f MB/s", mbPerS(total + r.originBytes, r.durationS()));
+    std::printf("%-16s %8s %7zu %10s %10s %10s  %-18s %6llu %s\n", stamp(r.startS).c_str(),
+                humanDur(r.durationS()).c_str(), r.files.size(), human(total).c_str(),
+                human(r.originBytes).c_str(), rate, tiers,
+                (unsigned long long)r.faults(), gainCell);
+  }
+  if (asJson)
+    std::puts("]}");
+  else if (runs.size() > shown)
+    std::printf("(%zu older run(s) not shown — `--top %zu` for more)\n", runs.size() - shown,
+                runs.size());
+  return 0;
+}
+
+int cmdSummary(CacheStore& store, int argc, char** argv) {
+  const Config& cfg = store.config();
+  bool asJson = false;
+  for (int i = 2; i < argc; ++i) {
+    if (!std::strcmp(argv[i], "--json"))
+      asJson = true;
+    else {
+      std::fprintf(stderr, "summary: unknown argument %s\n", argv[i]);
+      return 2;
+    }
+  }
+  const auto runs = loadRuns(cfg.cacheDir + "/stats");
+  auto entries = store.listEntries();
+  uint64_t used = 0, replicaTotal = 0, replicaN = 0;
+  for (const auto& e : entries) {
+    used += e.cachedBytes;
+    if (e.replicaBytes) {
+      replicaTotal += e.replicaBytes;
+      ++replicaN;
+    }
+  }
+  uint64_t avail = 0, totalSpace = 0, headroom = 0;
+  if (RealIO::instance().spaceInfo(cfg.cacheDir, avail, totalSpace) == 0 && totalSpace)
+    headroom = cfg.minFreeBytes && avail > cfg.minFreeBytes ? avail - cfg.minFreeBytes : 0;
+
+  const Run* last = runs.empty() ? nullptr : &runs.front();
+  GainEstimate gain;
+  if (last)
+    gain = estimateGain(*last, runs);
+
+  if (asJson) {
+    std::printf("{\"cache_dir\":\"%s\",\"entries\":%zu,\"cached_bytes\":%llu,"
+                "\"replica_bytes\":%llu,\"replicas\":%llu,\"headroom_bytes\":%llu",
+                cfg.cacheDir.c_str(), entries.size(), (unsigned long long)used,
+                (unsigned long long)replicaTotal, (unsigned long long)replicaN,
+                (unsigned long long)headroom);
+    if (last) {
+      std::printf(",\"last_run\":{\"start\":%llu,\"duration_s\":%llu,\"kind\":\"%s\","
+                  "\"files\":%zu,\"cache_bytes\":%llu,\"origin_bytes\":%llu,"
+                  "\"relay_bytes\":%llu,\"faults\":%llu}",
+                  (unsigned long long)last->startS, (unsigned long long)last->durationS(),
+                  runKind(*last), last->files.size(),
+                  (unsigned long long)last->cacheBytes(),
+                  (unsigned long long)last->originBytes,
+                  (unsigned long long)last->relayBytes,
+                  (unsigned long long)last->faults());
+    }
+    std::printf(",\"gain\":");
+    if (gain.valid)
+      std::printf("{\"estimate\":%.3f,\"saved_s\":%.1f,\"origin_mb_s\":%.1f,"
+                  "\"matched_files\":%llu,\"origin_equivalent_bytes\":%llu}",
+                  gain.gain, gain.savedS, gain.originMBs,
+                  (unsigned long long)gain.matchedFiles,
+                  (unsigned long long)gain.originEquivBytes);
+    else
+      std::printf("null");
+    std::printf(",\"gain_reason\":\"%s\"}\n", gain.reason.c_str());
+    return 0;
+  }
+
+  std::printf("cache      : %s\n", cfg.cacheDir.c_str());
+  std::printf("             %zu entries, %s on disk", entries.size(),
+              human(used + replicaTotal).c_str());
+  if (cfg.minFreeBytes)
+    std::printf(", %s headroom", headroom ? human(headroom).c_str() : "NO");
+  std::putchar('\n');
+
+  if (!last) {
+    std::puts("last run   : none recorded yet — records appear when a job that used "
+              "the cache exits");
+    std::puts("next       : run your analysis once, then `ucache summary` again");
+    return 0;
+  }
+
+  const uint64_t nowS = static_cast<uint64_t>(::time(nullptr));
+  std::printf("last run   : %s (%s ago), ran %s, %zu file(s) — %s\n",
+              stamp(last->startS).c_str(), humanAge(last->endS, nowS).c_str(),
+              humanDur(last->durationS()).c_str(), last->files.size(), runKind(*last));
+  std::printf("delivered  : %s from cache; %s crossed the network\n",
+              human(last->cacheBytes()).c_str(),
+              human(last->originBytes + last->relayBytes).c_str());
+  const uint64_t tiered = last->hitBytes + last->replicaBytesServed + last->relayBytes;
+  if (tiered)
+    std::printf("  tiers    : byte %.1f%% | replica %.1f%% | relay %.1f%%\n",
+                100.0 * static_cast<double>(last->hitBytes) / static_cast<double>(tiered),
+                100.0 * static_cast<double>(last->replicaBytesServed) / static_cast<double>(tiered),
+                100.0 * static_cast<double>(last->relayBytes) / static_cast<double>(tiered));
+  std::printf("  rate     : %.0f MB/s delivered over the run\n",
+              mbPerS(tiered + last->originBytes, last->durationS()));
+  if (last->hitDiskReads)
+    std::printf("  byte tier: %llu disk reads (mean %s)\n",
+                (unsigned long long)last->hitDiskReads,
+                human(last->hitDiskBytes / last->hitDiskReads).c_str());
+  if (last->replicaReads)
+    std::printf("  replica  : %llu disk reads (mean %s)\n",
+                (unsigned long long)last->replicaReads,
+                human(last->replicaReadBytes / last->replicaReads).c_str());
+  if (last->faults() == 0)
+    std::puts("health     : OK — no checksum failures, fail-open events, or invalid "
+              "replicas");
+  else
+    std::printf("health     : %llu fault(s) — crc %llu, replica crc %llu, invalid "
+                "replica %llu, fail-open %llu, sidecar %llu. Run `ucache verify <url>`\n",
+                (unsigned long long)last->faults(), (unsigned long long)last->crcFailures,
+                (unsigned long long)last->replicaCrcFailures,
+                (unsigned long long)last->replicaInvalid,
+                (unsigned long long)last->failopenEvents,
+                (unsigned long long)last->metaCorrupt);
+  if (!entries.empty())
+    std::printf("recompress : %llu of %zu entries have a replica (%.0f%%)\n",
+                (unsigned long long)replicaN, entries.size(),
+                100.0 * static_cast<double>(replicaN) / static_cast<double>(entries.size()));
+
+  // The estimate, or the reason there isn't one. Never both a number and a
+  // doubt: outside the conditions it was validated under it is not printed.
+  if (gain.valid) {
+    std::printf("gain       : ~%.1fx versus reading from the origin (estimate)\n", gain.gain);
+    std::printf("             basis: %.0f MB/s measured when these files were first "
+                "fetched (%s), %llu of %llu files matched; ~%.0f s saved\n",
+                gain.originMBs, stamp(gain.referenceStartS).c_str(),
+                (unsigned long long)gain.matchedFiles, (unsigned long long)gain.runFiles,
+                gain.savedS);
+    std::puts("             read-path estimate — an A/B against a direct run is the "
+              "only measurement");
+  } else {
+    std::printf("gain       : not estimated — %s\n", gain.reason.c_str());
+  }
+  std::puts("next       : `ucache history` for the trend across runs");
+  return 0;
 }
 
 int cmdStatus(CacheStore& store, IOBackend& io) {
@@ -3307,12 +3571,16 @@ int main(int argc, char** argv) {
     printStats(aggregateStats(cfg.cacheDir + "/stats"));
     return 0;
   }
+  if (cmd == "history") // pure file reads, no store
+    return cmdHistory(cfg, argc, argv);
 
   CacheStore store(io, cfg);
   store.disableStatsDump(); // a CLI run must not litter stats/
 
   if (cmd == "status")
     return cmdStatus(store, io);
+  if (cmd == "summary")
+    return cmdSummary(store, argc, argv);
   if (cmd == "ls")
     return cmdLs(store, argc, argv);
   if (cmd == "evict")

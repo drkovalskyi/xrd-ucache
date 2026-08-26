@@ -30,11 +30,14 @@ add_executable(ucache-unit-tests
   unit/fault_test.cc
   unit/open_retry_test.cc
   unit/executor_test.cc
+  unit/runlog_test.cc
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
+  ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
 )
 target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing gtest gtest_main)
-target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin)
+target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin
+                                                    ${CMAKE_SOURCE_DIR}/src/cli)
 if (TARGET ucache-transpose) # learner + seek-width + hole-verification contracts
   target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc
                  unit/transpose_hole_test.cc unit/rntuple_meta_test.cc
