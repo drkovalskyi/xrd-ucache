@@ -304,3 +304,43 @@ TEST(Gain, PrefersTheFastestQualifyingReference) {
   EXPECT_EQ(g.referenceStartS, 1000u);       // the clean fill
   EXPECT_LT(g.gain, 3.0);                    // the slow reference would say 4.0x
 }
+
+TEST(Totals, AggregatesBytesAndCountsFilesOnce) {
+  test::TempDir td;
+  twoFileFill(td.path(), 100);
+  writeRun(td.path(), "host", 200, 2000, 2050, warmCounters(kGiB),
+           {{"root://o//a", kGiB / 2, 0, 0, 0}, {"root://o//b", kGiB / 2, 0, 0, 0}});
+  auto runs = loadRuns(td.path());
+  auto t = summarize(runs);
+  EXPECT_EQ(t.runs, 2u);
+  EXPECT_EQ(t.distinctFiles, 2u); // the UNION across runs, not 4
+  EXPECT_EQ(t.originBytes, kGiB);
+  EXPECT_EQ(t.cacheBytes(), kGiB);
+  EXPECT_EQ(t.durationS, 150u); // 100 s fill + 50 s warm
+  EXPECT_EQ(t.faults, 0u);
+}
+
+// The aggregate gain divides only by the spans of the runs it could estimate.
+// Folding in a fill's span would dilute the answer with time the cache was
+// never serving anyone.
+TEST(Totals, GainCoversOnlyTheRunsItEstimated) {
+  test::TempDir td;
+  twoFileFill(td.path(), 100);
+  writeRun(td.path(), "host", 200, 2000, 2050, warmCounters(kGiB),
+           {{"root://o//a", kGiB / 2, 0, 0, 0}, {"root://o//b", kGiB / 2, 0, 0, 0}});
+  auto runs = loadRuns(td.path());
+  auto t = summarize(runs);
+  ASSERT_TRUE(t.haveGain);
+  EXPECT_EQ(t.runsEstimated, 1u);          // the fill is not one of them
+  EXPECT_NEAR(t.savedS, 50.0, 0.01);       // 100 s from the origin, 50 s from cache
+  EXPECT_NEAR(t.estimatedDurationS, 50.0, 0.01);
+  EXPECT_NEAR(t.gain, 2.0, 0.01);          // (50 + 50) / 50, not diluted by the fill
+}
+
+TEST(Totals, EmptyHistoryIsNotAGain) {
+  test::TempDir td;
+  auto t = summarize(loadRuns(td.path()));
+  EXPECT_EQ(t.runs, 0u);
+  EXPECT_FALSE(t.haveGain);
+  EXPECT_EQ(t.distinctFiles, 0u);
+}

@@ -88,6 +88,32 @@ struct GainEstimate {
   std::string reason;         // set whenever !valid; also worth printing when valid
 };
 
+// Everything the cache has done, across every run it still has records for.
+// This is the headline: one run says what happened last time, the aggregate
+// says whether the cache is worth having.
+struct Totals {
+  size_t runs = 0;          // runs with records
+  size_t runsEstimated = 0; // runs the gain estimate accepted
+  size_t distinctFiles = 0; // union across runs, not a sum
+  uint64_t firstStartS = 0, lastEndS = 0;
+  uint64_t durationS = 0;   // summed run spans, which is what the rates divide by
+  uint64_t hitBytes = 0, replicaBytes = 0, relayBytes = 0, originBytes = 0;
+  uint64_t faults = 0;
+  double savedS = 0.0;      // summed over the runs that were estimated
+  double estimatedDurationS = 0.0; // and their spans, so the ratio is honest
+  bool haveGain = false;
+  double gain = 0.0;        // (their span + what they saved) / their span
+  size_t gainCapped = 0;    // runs NOT estimated because of the work cap, if any
+
+  uint64_t cacheBytes() const { return hitBytes + replicaBytes; }
+};
+
+// Aggregate, estimating the gain for at most `maxEstimates` of the newest runs
+// (each estimate is a pass over every other run, so this is quadratic and has
+// to stop somewhere). Whatever it skips is reported in `gainCapped` rather
+// than silently dropped.
+Totals summarize(const std::vector<Run>& runs, size_t maxEstimates = 100);
+
 // `all` should be the output of loadRuns (order is not relied on). The reference
 // is chosen from runs that precede `run` in time and actually fetched from
 // the origin.

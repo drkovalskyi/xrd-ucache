@@ -251,30 +251,31 @@ and aggregate counters.
 
 ## Monitoring — start with `ucache summary`
 
-`ucache summary` answers the question you actually have: **what did the cache do
-for my last run?** It reads records the plugin already wrote — nothing needs to
-be running, and there is no sampling daemon to start.
+`ucache summary` answers the question you actually have: **is this cache worth
+having, and what has it saved me?** It reads records the plugin already wrote —
+nothing needs to be running, and there is no sampling daemon to start.
 
 ```text
 $ ucache summary
-cache      : /scratch/ucache
-             787 entries, 108.4 GiB on disk, 1.5 TiB headroom
-last run   : 2026-08-18 09:42 (2h ago), ran 3m21s, 787 file(s) — warm
-delivered  : 91.3 GiB from cache; 0 B crossed the network
-  tiers    : byte 0.0% | replica 100.0% | relay 0.0%
-  rate     : 456 MB/s delivered over the run
-  replica  : 171234 disk reads (mean 596.0 KiB)
-health     : OK — no checksum failures, fail-open events, or invalid replicas
-recompress : 787 of 787 entries have a replica (100%)
-gain       : ~2.5x versus reading from the origin (estimate)
-             basis: 167 MB/s measured when these files were first fetched
-             (2026-08-17), 787 of 787 files matched; ~301 s saved
+overall    : 7 run(s) over 1h08m — 720.8 GiB served from cache, 266.1 GiB from the origin
+  gain     : ~2.3x versus reading from the origin (estimate) — about 35m30s of origin
+             time not spent, across 4 of 7 run(s)
+  health   : OK — no faults in any recorded run
+cache      : /scratch/ucache — 1456 entries, 202.8 GiB on disk, 1.3 TiB headroom
+next       : `ucache summary --detail` for the last run; `ucache history` for the trend
 ```
 
-The line to read first is **`delivered`** — bytes served locally against bytes
-that crossed the network. That is measured, not inferred.
+That is the whole default: **what the cache has done across every run it still
+has records for.** The aggregate gain divides only by the spans of the runs it
+could actually estimate — folding in a cache-filling run would dilute the answer
+with time the cache was not serving anyone — and it says how many runs that was.
+
+`ucache summary --detail` adds the last run underneath: tier split, delivered
+rate, per-tier read counts and sizes, replica coverage, and the basis for that
+run's own estimate.
 
 ### About the gain estimate
+
 
 The estimate compares two rates the records already carry: what the origin
 delivered when these files were **first fetched**, and what the cache delivers
@@ -291,8 +292,19 @@ now. It is deliberately narrow, and it refuses more often than it answers:
   one-second resolution, or the reference rate is an outlier among the fetches
   recorded here. When that happens the line says why instead of printing a
   number.
+- A run that **filled** the cache gets no gain. Dividing one fill by another is
+  a real ratio, but it is not what the cache bought anyone.
+- Where several earlier fetches cover the same files, it uses the **fastest**.
+  A fetch can be slowed by things that are not the origin's doing — a
+  recompression pass running alongside it costs around a quarter of the fill on
+  an LZMA dataset — and using that as the baseline would credit the cache for
+  your own machine's contention.
 - A cache that is **slower** than the origin reports below 1.0. That is a real
   answer, and worth acting on.
+
+One thing it cannot see: **a run whose data was still in the page cache reads
+high**, and nothing in the records says the page cache was warm. If you are
+comparing runs over time, compare like with like.
 
 It is not a substitute for measuring: the only way to know the true speedup is
 to run the same analysis with and without the cache.
@@ -480,8 +492,8 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache doctor`    | check install, filesystem (sparse/flock), and activation |
 | `ucache test <url>` | end-to-end self-test: cold + warm whole-file read via xrdcp against your setup as-is; warm must be origin-free; cleans up the entry it created (pre-existing entries kept) |
 | `ucache enable` / `disable` | turn caching on/off (flips the conf) |
-| `ucache summary [--json]` | what the cache did for your last run: tiers, rate, health, replica coverage, and an estimate of what it saved versus the origin (suppressed rather than qualified when the comparison would not be sound) |
-| `ucache history [--top N] [--json]` | one row per run, newest first — whether the numbers are holding up across runs, versions and machines |
+| `ucache summary [--detail] [--json]` | **overall performance across every recorded run, and an estimate of what the cache has saved you** versus reading from the origin (suppressed rather than qualified when the comparison would not be sound). `--detail` adds the last run: tier split, delivered rate, per-tier read counts and sizes, replica coverage |
+| `ucache history [--top N] [--json]` | an **ALL** row aggregating every recorded run, then one row per run, newest first — whether the numbers are holding up across runs, versions and machines |
 | `ucache status`    | cache location, budget, usage, aggregate stats |
 | `ucache ls [--sort age\|size]` | list cached entries (size, cached, coverage, last-used age, replica, pinned) |
 | `ucache stats`     | aggregate `stats/*.jsonl` across all processes, plus the derived **workflow picture**: opens per distinct file, bytes served per tier (RAM / disk / replica / origin / relay), disk-read count + mean size + sequential share, re-read factor, fill flush shape, and p50/p95/p99 latencies |

@@ -67,8 +67,8 @@ void usage() {
       "                    read via xrdcp; warm must be origin-free; cleans up the\n"
       "                    entry it created (a pre-existing entry is kept)\n"
       "  enable | disable  turn caching on/off (flips the plugin conf)\n"
-      "  summary           what the cache did for your last run: tiers, health,\n"
-      "                    and an estimate of what it saved versus the origin\n"
+      "  summary [--detail]  overall performance and what the cache has saved you;\n"
+      "                    --detail adds the last run: tiers, read sizes, health\n"
       "  history [--top N] one row per run, newest first — whether the numbers\n"
       "                    are holding up across runs, versions and machines\n"
       "  status            cache location, budget, usage, and aggregated stats\n"
@@ -978,11 +978,52 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
   if (!asJson)
     std::printf("%zu run(s) recorded, newest first (showing %zu)\n", runs.size(), shown);
 
-  if (asJson)
-    std::printf("{\"runs\":[");
-  else
+  // The aggregate goes FIRST: one run says what happened last time, the total
+  // says whether the cache is worth having at all.
+  const Totals t = summarize(runs);
+  const uint64_t tServed = t.cacheBytes() + t.relayBytes;
+  auto pct = [](uint64_t part, uint64_t whole) {
+    return whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+  };
+  if (asJson) {
+    std::printf("{\"totals\":{\"runs\":%zu,\"runs_estimated\":%zu,\"distinct_files\":%zu,"
+                "\"duration_s\":%llu,\"cache_bytes\":%llu,\"origin_bytes\":%llu,"
+                "\"relay_bytes\":%llu,\"faults\":%llu,\"saved_s\":%.1f,\"gain\":",
+                t.runs, t.runsEstimated, t.distinctFiles, (unsigned long long)t.durationS,
+                (unsigned long long)t.cacheBytes(), (unsigned long long)t.originBytes,
+                (unsigned long long)t.relayBytes, (unsigned long long)t.faults, t.savedS);
+    if (t.haveGain)
+      std::printf("%.3f},\"runs\":[", t.gain);
+    else
+      std::printf("null},\"runs\":[");
+  } else {
     std::printf("%-16s %8s %7s %10s %10s %10s  %-18s %6s %s\n", "WHEN", "DUR", "FILES",
                 "SERVED", "ORIGIN", "RATE", "BYTE/REPL/RELAY", "FAULTS", "GAIN");
+    char allTiers[32], allRate[16], allGain[16], allWhen[24];
+    std::snprintf(allTiers, sizeof allTiers, "%.0f%%/%.0f%%/%.0f%%",
+                  pct(t.hitBytes, tServed), pct(t.replicaBytes, tServed),
+                  pct(t.relayBytes, tServed));
+    std::snprintf(allRate, sizeof allRate, "%.0f MB/s",
+                  mbPerS(tServed + t.originBytes, t.durationS));
+    if (t.haveGain)
+      std::snprintf(allGain, sizeof allGain, "%.2fx", t.gain);
+    else
+      std::snprintf(allGain, sizeof allGain, "-");
+    std::snprintf(allWhen, sizeof allWhen, "ALL (%zu runs)", t.runs);
+    std::printf("%-16s %8s %7zu %10s %10s %10s  %-18s %6llu %s\n", allWhen,
+                humanDur(t.durationS).c_str(), t.distinctFiles, human(tServed).c_str(),
+                human(t.originBytes).c_str(), allRate, allTiers,
+                (unsigned long long)t.faults, allGain);
+    if (t.haveGain)
+      std::printf("%-16s estimated across %zu of %zu runs — about %s of origin time "
+                  "not spent\n",
+                  "", t.runsEstimated, t.runs, humanDur((uint64_t)t.savedS).c_str());
+    if (t.gainCapped)
+      std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
+                  "estimate)\n", "", t.gainCapped);
+    std::printf("%-16s %8s %7s %10s %10s %10s  %-18s %6s %s\n", "----", "----", "-----",
+                "------", "------", "----", "---------------", "------", "----");
+  }
 
   for (size_t i = 0; i < shown; ++i) {
     const Run& r = runs[i];
@@ -1034,10 +1075,12 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
 
 int cmdSummary(CacheStore& store, int argc, char** argv) {
   const Config& cfg = store.config();
-  bool asJson = false;
+  bool asJson = false, detail = false;
   for (int i = 2; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--json"))
       asJson = true;
+    else if (!std::strcmp(argv[i], "--detail") || !std::strcmp(argv[i], "-d"))
+      detail = true;
     else {
       std::fprintf(stderr, "summary: unknown argument %s\n", argv[i]);
       return 2;
@@ -1065,11 +1108,22 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     gain.reason = "no runs recorded yet"; // a JSON consumer gets a reason too
 
   if (asJson) {
+    const Totals tj = summarize(runs);
     std::printf("{\"cache_dir\":\"%s\",\"entries\":%zu,\"cached_bytes\":%llu,"
                 "\"replica_bytes\":%llu,\"replicas\":%llu,\"headroom_bytes\":%llu",
                 cfg.cacheDir.c_str(), entries.size(), (unsigned long long)used,
                 (unsigned long long)replicaTotal, (unsigned long long)replicaN,
                 (unsigned long long)headroom);
+    std::printf(",\"overall\":{\"runs\":%zu,\"runs_estimated\":%zu,\"duration_s\":%llu,"
+                "\"cache_bytes\":%llu,\"origin_bytes\":%llu,\"faults\":%llu,"
+                "\"saved_s\":%.1f,\"gain\":",
+                tj.runs, tj.runsEstimated, (unsigned long long)tj.durationS,
+                (unsigned long long)tj.cacheBytes(), (unsigned long long)tj.originBytes,
+                (unsigned long long)tj.faults, tj.savedS);
+    if (tj.haveGain)
+      std::printf("%.3f}", tj.gain);
+    else
+      std::printf("null}");
     if (last) {
       std::printf(",\"last_run\":{\"start\":%llu,\"duration_s\":%llu,\"kind\":\"%s\","
                   "\"files\":%zu,\"cache_bytes\":%llu,\"origin_bytes\":%llu,"
@@ -1094,12 +1148,42 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     return 0;
   }
 
-  std::printf("cache      : %s\n", cfg.cacheDir.c_str());
-  std::printf("             %zu entries, %s on disk", entries.size(),
-              human(used + replicaTotal).c_str());
+  // Overall first. The last run answers "what just happened"; the aggregate
+  // answers "is this cache worth having", which is the question being asked.
+  const Totals t = summarize(runs);
+  if (t.runs) {
+    std::printf("overall    : %zu run(s) over %s — %s served from cache, %s from the "
+                "origin\n",
+                t.runs, humanDur(t.durationS).c_str(), human(t.cacheBytes()).c_str(),
+                human(t.originBytes).c_str());
+    if (t.haveGain)
+      std::printf("  gain     : ~%.1fx versus reading from the origin (estimate) — about "
+                  "%s of origin time not spent, across %zu of %zu run(s)\n",
+                  t.gain, humanDur(static_cast<uint64_t>(t.savedS)).c_str(),
+                  t.runsEstimated, t.runs);
+    else
+      std::printf("  gain     : not estimated for any run yet\n");
+    if (t.faults)
+      std::printf("  health   : %llu fault(s) across all runs — `ucache verify <url>`\n",
+                  (unsigned long long)t.faults);
+    else
+      std::printf("  health   : OK — no faults in any recorded run\n");
+  }
+
+  std::printf("cache      : %s — %zu entries, %s on disk", cfg.cacheDir.c_str(),
+              entries.size(), human(used + replicaTotal).c_str());
   if (cfg.minFreeBytes)
     std::printf(", %s headroom", headroom ? human(headroom).c_str() : "NO");
   std::putchar('\n');
+
+  if (!detail) {
+    if (last)
+      std::puts("next       : `ucache summary --detail` for the last run; "
+                "`ucache history` for the trend");
+    else
+      std::puts("next       : run your analysis once, then `ucache summary` again");
+    return 0;
+  }
 
   if (!last) {
     std::puts("last run   : none recorded yet — records appear when a job that used "

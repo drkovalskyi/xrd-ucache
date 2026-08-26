@@ -5,6 +5,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <set>
 
 namespace ucache {
 namespace {
@@ -361,6 +362,52 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   }
   g.referenceStartS = best->startS;
   return g;
+}
+
+
+Totals summarize(const std::vector<Run>& runs, size_t maxEstimates) {
+  Totals t;
+  std::set<std::string> keys;
+  for (const auto& r : runs) {
+    ++t.runs;
+    t.durationS += r.durationS();
+    t.hitBytes += r.hitBytes;
+    t.replicaBytes += r.replicaBytesServed;
+    t.relayBytes += r.relayBytes;
+    t.originBytes += r.originBytes;
+    t.faults += r.faults();
+    if (t.firstStartS == 0 || r.startS < t.firstStartS)
+      t.firstStartS = r.startS;
+    if (r.endS > t.lastEndS)
+      t.lastEndS = r.endS;
+    for (const auto& [k, f] : r.files) {
+      (void)f;
+      keys.insert(k);
+    }
+  }
+  t.distinctFiles = keys.size();
+
+  // Runs are newest-first, so the cap keeps the recent ones -- the part of the
+  // record anyone is actually asking about.
+  size_t done = 0;
+  for (const auto& r : runs) {
+    if (done >= maxEstimates) {
+      ++t.gainCapped;
+      continue;
+    }
+    ++done;
+    const GainEstimate g = estimateGain(r, runs);
+    if (!g.valid)
+      continue;
+    ++t.runsEstimated;
+    t.savedS += g.savedS;
+    t.estimatedDurationS += static_cast<double>(r.durationS());
+  }
+  if (t.runsEstimated && t.estimatedDurationS > 0) {
+    t.haveGain = true;
+    t.gain = (t.estimatedDurationS + t.savedS) / t.estimatedDurationS;
+  }
+  return t;
 }
 
 } // namespace ucache
