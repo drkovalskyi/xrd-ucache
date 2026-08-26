@@ -87,6 +87,52 @@ The only distro-specific part is the XRootD client package; the rest is the same
 liblzma-dev zlib1g-dev libzstd-dev liblz4-dev` (verify `xrootd-dev` ≥ 5.6). Any
 Linux with a C++17 compiler, CMake ≥ 3.20, and XRootD client ≥ 5.6 works.
 
+### Build from source — macOS
+
+There is no prebuilt macOS package, and there will not be one: a downloaded
+dylib carries Gatekeeper quarantine, and quarantine blocks the `dlopen` the
+XRootD client uses to load the plugin. Building it locally avoids that
+entirely.
+
+The requirements are the same as anywhere else — a C++17 compiler, CMake >= 3.20,
+an XRootD client >= 5.6 — plus one rule that matters more here: **build against
+the XRootD client your ROOT actually loads.** Check which that is first:
+
+```sh
+root-config --has-xrootd                                       # must say yes
+otool -L "$(root-config --libdir)/libNetxNG.so" | grep -i XrdCl
+```
+
+MacPorts is the tested route (Apple silicon, macOS 14). Command Line Tools are
+enough — Xcode is not required.
+
+```sh
+sudo port install xrootd root6 +xrootd
+sudo port install xz zstd lz4          # codec libs — recompression only, optional
+```
+
+```sh
+export TMPDIR=/tmp          # do this FIRST — see the note below
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_TESTS=OFF \
+      -DUCACHE_XROOTD_ROOT=/opt/local -DCMAKE_PREFIX_PATH=/opt/local
+cmake --build build -j"$(sysctl -n hw.ncpu)"
+cmake --install build --prefix ~/.local
+```
+
+> **Set `TMPDIR` before building.** With it unset, the compiler is handed a
+> per-session `/var/folders/...` path it may not own, and AppleClang then fails to
+> compile anything at all with "unable to make temporary file". Any writable
+> directory works.
+
+> **If both MacPorts and Homebrew are present**, CMake searches `/opt/homebrew`
+> first on Apple silicon. The two prefix flags above are what keep the build on
+> the same XrdCl your ROOT loads — confirm with `otool -L` rather than assuming.
+
+Everything after this is identical to Linux: activate with the same plugin
+configuration file (§2), and point the cache at an ordinary directory on a
+volume with room to spare.
+
 ### For site administrators (optional)
 
 Each release also ships `xrd-ucache-<version>-1.el9.x86_64.rpm` for a system-wide
