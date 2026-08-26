@@ -208,6 +208,14 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   // measurement. Below this the answer is refused rather than rounded.
   constexpr uint64_t kMinDurationS = 30;
 
+  // A run that fetched more than the cache served it is a FILL. Dividing two
+  // fills' spans yields a real ratio -- how much slower this fill was than the
+  // last -- but that is not what the cache bought anyone, and printing it under
+  // "gain" invites exactly the wrong reading.
+  if (run.originBytes > run.cacheBytes()) {
+    g.reason = "this run filled the cache rather than being served by it";
+    return g;
+  }
   if (run.cacheBytes() == 0) {
     g.reason = "the cache served nothing in this run";
     return g;
@@ -240,7 +248,9 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   // costs for this data on this machine.
   const Run* best = nullptr;
   uint64_t bestMatchedWire = 0;
-  double bestC = 0.0, bestD = 0.0, bestRefRate = 0.0;
+  double bestC = 0.0, bestD = 0.0;            // closest near-miss, for the refusal text
+  double bestOverlapC = 0.0, bestOverlapD = 0.0; // the CHOSEN reference's overlap
+  double bestRefRate = 0.0;
   std::vector<double> candidateRates;
   size_t candidates = 0;
 
@@ -270,31 +280,51 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     }
     if (matchedWire == 0)
       continue;
+    const double c = static_cast<double>(matchedWire) / static_cast<double>(refWireTotal);
+    const double d = static_cast<double>(matchedServed) / static_cast<double>(runServedTotal);
+    if (c < kMinOverlap || d < kMinOverlap) {
+      // Remember the closest near-miss so the refusal can name real numbers.
+      if (c + d > bestC + bestD) {
+        bestC = c;
+        bestD = d;
+      }
+      continue;
+    }
+    const double rate =
+        static_cast<double>(refWireTotal) / static_cast<double>(r.durationS());
     ++candidates;
-    candidateRates.push_back(static_cast<double>(refWireTotal) /
-                             static_cast<double>(r.durationS()));
-    if (matchedWire > bestMatchedWire) {
+    candidateRates.push_back(rate);
+    // Among references covering the same files, take the FASTEST. A fill can be
+    // slowed by things that are not the origin's doing -- a concurrent
+    // recompression pass costs 28% of the fill on an LZMA dataset -- and using
+    // that as the baseline credits the cache for our own interference. The
+    // fastest observed fetch is the most conservative claim about what the
+    // origin costs, which is the right direction for a number that must not
+    // overclaim.
+    if (rate > bestRefRate) {
+      bestRefRate = rate;
       bestMatchedWire = matchedWire;
       best = &r;
-      bestC = static_cast<double>(matchedWire) / static_cast<double>(refWireTotal);
-      bestD = static_cast<double>(matchedServed) / static_cast<double>(runServedTotal);
-      bestRefRate =
-          static_cast<double>(refWireTotal) / static_cast<double>(r.durationS());
+      bestOverlapC = c;
+      bestOverlapD = d;
     }
   }
 
   if (!best) {
-    g.reason = "no earlier run fetched these files from the origin, so there is "
-               "nothing to compare against";
-    return g;
-  }
-  if (bestC < kMinOverlap || bestD < kMinOverlap) {
-    char buf[192];
-    std::snprintf(buf, sizeof buf,
-                  "the earlier fill and this run covered different files "
-                  "(%.0f%% of the fill, %.0f%% of this run) — not comparable",
-                  bestC * 100.0, bestD * 100.0);
-    g.reason = buf;
+    // Distinguish "nothing fetched these files" from "something did, but was not
+    // doing the same work". They call for different actions, and the second is
+    // the one that has misled us before.
+    if (bestC > 0.0 || bestD > 0.0) {
+      char buf[192];
+      std::snprintf(buf, sizeof buf,
+                    "the earlier fill and this run covered different files "
+                    "(%.0f%% of the fill, %.0f%% of this run) — not comparable",
+                    bestC * 100.0, bestD * 100.0);
+      g.reason = buf;
+    } else {
+      g.reason = "no earlier run fetched these files from the origin, so there is "
+                 "nothing to compare against";
+    }
     return g;
   }
 
@@ -314,8 +344,8 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
 
   const double refDur = static_cast<double>(best->durationS());
   const double runDur = static_cast<double>(run.durationS());
-  const double originTime = refDur * bestC; // what the origin charged for these files
-  const double cacheTime = runDur * bestD;  // what they cost from the cache now
+  const double originTime = refDur * bestOverlapC; // what the origin charged for these
+  const double cacheTime = runDur * bestOverlapD;  // what they cost from the cache now
 
   g.valid = true;
   g.savedS = originTime - cacheTime;

@@ -265,3 +265,42 @@ TEST(Gain, SuppressedWhenEitherRunIsTooShortToTime) {
   auto runs2 = loadRuns(td2.path());
   EXPECT_FALSE(estimateGain(runs2[0], runs2).valid);
 }
+
+// Found by running a real campaign: a run that FILLED the cache was handed a
+// "gain" of 0.78x -- which was really just this fill divided by the previous
+// one. A true ratio, but not what the cache bought anyone.
+TEST(Gain, SuppressedForARunThatFilledTheCache) {
+  test::TempDir td;
+  twoFileFill(td.path(), 100);
+  writeRun(td.path(), "host", 200, 2000, 2200, // fetched 1 GiB, served 8 MiB
+           "\"opens\":2,\"origin_bytes\":" + std::to_string(kGiB) +
+               ",\"hit_bytes\":" + std::to_string(8 * kMiB) + ",\"served_bytes\":" +
+               std::to_string(kGiB),
+           {{"root://o//a", kGiB / 2, 0, kGiB / 2, 0},
+            {"root://o//b", kGiB / 2, 0, kGiB / 2, 0}});
+  auto runs = loadRuns(td.path());
+  auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_NE(g.reason.find("filled the cache"), std::string::npos);
+}
+
+// Also found by campaign: two fills covered the same files, but one ran while a
+// recompression pass was competing for CPU and fetched 22% slower. Choosing it
+// as the baseline credits the cache for our own interference. Among references
+// covering the same work, the FASTEST is the conservative claim.
+TEST(Gain, PrefersTheFastestQualifyingReference) {
+  test::TempDir td;
+  twoFileFill(td.path(), 100); // the clean fill: 1 GiB in 100 s
+  // A later, slower fill of the same two files -- 1 GiB in 200 s.
+  writeRun(td.path(), "host", 150, 1500, 1700, fillCounters(kGiB),
+           {{"root://o//a", kGiB / 2, 0, kGiB / 2, 0},
+            {"root://o//b", kGiB / 2, 0, kGiB / 2, 0}});
+  writeRun(td.path(), "host", 200, 2000, 2050, warmCounters(kGiB),
+           {{"root://o//a", kGiB / 2, 0, 0, 0}, {"root://o//b", kGiB / 2, 0, 0, 0}});
+  auto runs = loadRuns(td.path());
+  auto g = estimateGain(runs[0], runs);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_NEAR(g.gain, 2.0, 0.01);            // 100 s reference, not the 200 s one
+  EXPECT_EQ(g.referenceStartS, 1000u);       // the clean fill
+  EXPECT_LT(g.gain, 3.0);                    // the slow reference would say 4.0x
+}
