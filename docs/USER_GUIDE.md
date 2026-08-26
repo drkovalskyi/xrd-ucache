@@ -249,6 +249,75 @@ cache deliberately passes through, so `stats` stays at zero. If you must:
 `ucache status` shows where the cache lives, the disk budget, how much is cached,
 and aggregate counters.
 
+## Monitoring — reading `ucache stats`
+
+`ucache stats` aggregates the counters every process wrote and prints four
+blocks. Run it after a job to see what the cache actually did. An example from
+a warm pass:
+
+```text
+stats across 3 process file(s):
+  opens              1574
+  hit_bytes          58720256000 (54.7 GiB)
+  miss_bytes         0 (0 B)
+  origin_bytes       0 (0 B)
+  ...
+  crc_failures       0
+  failopen_events    0
+  admissions_bypassed 0
+workflow:
+  files opened       787 distinct (2.0 opens/file)
+  served by tier     ram 1.2 GiB | disk 53.5 GiB | replica 0 B | origin 0 B | relay 0 B
+  hit disk reads     2380995 (mean 41.8 KiB, 88% sequential)
+  re-read factor     1.8x (first touch 30.4 GiB of 54.7 GiB byte-tier serves)
+  fill flushes       4210 runs (mean 7.9 MiB)
+read size p50/p95/p99 (log2 buckets, floor):
+  requested          4.0 KiB / 64.0 KiB / 256.0 KiB
+  byte-tier pread    32.0 KiB / 128.0 KiB / 512.0 KiB
+latency p50/p95/p99:
+  hit read           48us / 210us / 1.4ms
+  origin rt          -
+```
+
+The first block is raw totals. `workflow:` is the arithmetic you would
+otherwise do by hand — which tier served the bytes, how often each file was
+opened, how much of the reading was re-reading. The last two blocks describe
+what the storage was asked for and how long it took; `-` means there were no
+samples, so `origin rt -` above is the point of a warm pass, not a gap.
+
+### The four questions worth asking
+
+1. **Did the cache engage at all?** On a warm pass `origin_bytes` should be
+   **0** — every byte came from local disk. If it is large, or `relay_bytes`
+   dominates, the cache is being bypassed rather than used; `ucache doctor`
+   and the activation section above are where to look.
+2. **Is anything wrong?** `crc_failures`, `failopen_events` and
+   `validations_failed` should **all be 0**. They are separate on purpose:
+   a CRC failure quarantines a page, a fail-open event means the cache
+   degraded to pass-through, and a validation failure means an entry was
+   discarded as stale.
+3. **Is the cache big enough?** A non-zero `admissions_bypassed` means files
+   were left uncached because everything resident was still in use — reads
+   succeeded, uncached. Together with a large `evicted_bytes` it says the
+   working set does not fit; `ucache status` names the remedy.
+4. **Is the cache disk keeping up?** `fill stalls` is time a job spent waiting
+   on the cache disk, and the `hit read` latency percentiles show what reads
+   cost. If those are slow, measure the disk itself with
+   `ucache bench <dir>` — a cache on the wrong device can be slower than the
+   origin.
+
+### Other forms
+
+```sh
+ucache stats --files --top 20   # per-file records, costliest first
+ucache stats --reset            # delete the window and start a fresh measurement
+```
+
+`--reset` warns if a job looks like it is still running, since its counters
+would vanish with the files.
+
+Every field, and the JSON schema tooling reads, is in [Metrics](STATS.md).
+
 ## How it works (briefly)
 
 - **Page cache, not file cache.** uCache stores the 4 KiB pages your analysis

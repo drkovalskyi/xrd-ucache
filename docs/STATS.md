@@ -5,7 +5,24 @@ of the JSON files it writes.
 
 **To simply see how your cache is doing, run `ucache stats`** — it prints a
 human-readable summary of these same numbers. This file is for reading the raw
-JSON, or building tooling on it.
+JSON, or building tooling on it. The user guide's monitoring section explains
+how to read the printed summary.
+
+## Which number answers which question
+
+| question | look at |
+|---|---|
+| Is the cache being used at all? | `opens`, `files_opened`, `hit_bytes` |
+| Did a warm pass avoid the network? | `origin_bytes` — 0 means everything came from local disk |
+| Is anything wrong? | `crc_failures`, `failopen_events`, `validations_failed` — **all three should be 0** |
+| Is the cache big enough? | `admissions_bypassed`, `evicted_bytes`, `evicted_entries` |
+| Where did the bytes come from? | `ram_hit_bytes`, `hit_bytes`, `replica_bytes_served`, `miss_bytes`, `relay_bytes` |
+| Is the job re-reading the same data? | `opens` / `files_opened`, `first_touch_bytes` against `hit_bytes` |
+| What is the cache disk being asked to do? | `hit_disk_reads`, `hit_disk_bytes`, `replica_reads`, `replica_read_bytes`, `hist_*_read_bytes` |
+| Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
+| Did the replica tier get used? | `replica_opens`, `replica_published`, `replica_bytes_served` |
+
+## Where the numbers are written
 
 One JSON line is appended to `$UCACHE_DIR/stats/<host>-<pid>-<start_ts>-<seq>.jsonl`
 at every `CacheStore::dumpStats()` (explicit calls, store destruction; the
@@ -79,7 +96,8 @@ consumers together.
   (`opens/files_opened` ≫ 1 = a reopen loop); `ram_hit_bytes` — hit bytes
   served from the fill buffer's staged RAM (subset of `hit_bytes`);
   `first_touch_bytes` — bytes served for the first time in the entry's
-  in-process lifetime (the rest are re-reads); `hit_disk_reads` /
+  in-process lifetime (the rest are re-reads).
+- Byte-tier disk reads: `hit_disk_reads` /
   `hit_disk_bytes` / `hit_disk_seq` — byte-tier disk reads, their bytes, and
   how many continued sequentially from the previous read. **One
   `hit_disk_reads` is one pread covering a whole contiguous run of cached
@@ -94,16 +112,19 @@ consumers together.
   already read some pages before discovering an absent one, whereas the planning
   pass now finds that page first and reads nothing — so a run with a non-zero
   acceptance triple can show slightly fewer bytes than an older one.
-  `replica_bytes_served` / `replica_reads` / `replica_read_bytes` — bytes
-  served from replica overlays, the physical `.tdata` preads that delivered
+
+- Replica-tier reads: `replica_bytes_served` / `replica_reads` /
+  `replica_read_bytes` — bytes served from replica overlays, the physical `.tdata` preads that delivered
   them, and the bytes those preads moved (the replica-tier analogue of the
   byte-tier trio, coalesced the same way; `replica_read_bytes` ≥
   `replica_bytes_served` because whole overlay pages are read and verified,
-  and a page read for two different user reads counts twice). `relay_bytes`
-  — pure pass-through, the cache never touched them; `readv_chunks` /
+  and a page read for two different user reads counts twice).
+- Pass-through and vector reads: `relay_bytes` — pure pass-through, the cache
+  never touched them; `readv_chunks` /
   `readv_calls` / `readv_mixed` — vector-read chunks seen, vector reads the
   cache handled (`readv_chunks / readv_calls` = mean batch width), and
-  vectors mixing hits with misses; `flush_runs` / `flush_run_bytes` — coalesced fill-buffer pwrite
+  vectors mixing hits with misses.
+- Fill path: `flush_runs` / `flush_run_bytes` — coalesced fill-buffer pwrite
   runs and their bytes; `buffer_stalls` / `buffer_stall_us` — fills that had
   to drain synchronously at the buffer cap, and the wall time lost;
   `fetches_joined` — misses that joined an identical in-flight fetch instead
