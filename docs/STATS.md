@@ -1,4 +1,11 @@
-# STATS.md — stats dump schema
+# Metrics
+
+The numbers uCache records about your jobs: what each one means, and the format
+of the JSON files it writes.
+
+**To simply see how your cache is doing, run `ucache stats`** — it prints a
+human-readable summary of these same numbers. This file is for reading the raw
+JSON, or building tooling on it.
 
 One JSON line is appended to `$UCACHE_DIR/stats/<host>-<pid>-<start_ts>-<seq>.jsonl`
 at every `CacheStore::dumpStats()` (explicit calls, store destruction; the

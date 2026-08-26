@@ -12,7 +12,9 @@ trying it.
 
 To use uCache with your analysis, install it and activate it with a
 plugin configuration file. The following instructions show how to do
-it using the EL9 (Alma/Rocky/RHEL 9) tarball.
+it using the EL9 (Alma/Rocky/RHEL 9) tarball. For Debian/Ubuntu, any other
+Linux, or macOS — and for building from source on any of them — see
+[the user guide](docs/USER_GUIDE.md).
 
 First, ensure that you have all relevant packages for data access over XRootD:
 
@@ -40,7 +42,7 @@ ucache test root://<host>//<file>   # end-to-end self-test (cold + warm, cleans 
 Activation is user-global and needs no root. The cache directory has **no
 default** — `doctor` complains until you set one. `ucache setup
 --host <host:port>` binds one host if a system plugin conf already claims the
-`*` slot (see the guide `docs/USER_GUIDE.md`). Eviction is on by default (keep the disk from
+`*` slot (see [the user guide](docs/USER_GUIDE.md)). Eviction is on by default (keep the disk from
 filling; `ucache status` shows the budget).
 
 Config file example
@@ -66,6 +68,18 @@ exercised by hand rather than in CI. The longer crash, soak and fuzz campaigns
 run outside CI because of their duration.
 
 Further validation is performed with tools outside this repository.
+
+## Documentation
+
+- [User guide](docs/USER_GUIDE.md) — install on any platform, activate, verify,
+  configure, CLI reference
+- [Cache management](docs/CACHE_MANAGEMENT.md) — space, eviction, choosing a
+  cache disk
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — when it doesn't engage, or
+  behaves oddly
+- [Monitoring metrics](docs/STATS.md) — the numbers uCache records about your
+  jobs, and the JSON files it writes
+- [On-disk format](docs/FORMAT.md) · [Storage benchmarking](docs/BENCH.md)
 
 ## License
 
