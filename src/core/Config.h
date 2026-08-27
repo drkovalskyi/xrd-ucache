@@ -122,20 +122,20 @@ struct Config {
   // read-class op (1 = everything). Off ("") by default — zero cost.
   std::string trace;    // UCACHE_TRACE ("io" | "off"/"")
   int traceSample = 64; // UCACHE_TRACE_SAMPLE
-  // Measurement holdout, in PER MILLE of files (0 = off, the default).
-  // A selected file is served pure pass-through — origin only, cache
-  // untouched — so its wall span measures what the origin costs for real work
-  // under this run's own conditions. Comparing those spans against cached
-  // files' spans, within the same run, is the only device that survives a
-  // thread-count change or a faster analysis loop: nothing older than the run
-  // enters the comparison. The price is p*(gain-1) of the wall, so it is FREE
-  // exactly when the cache is buying nothing — which is when the truth matters
-  // most. Per mille, not percent, because a trickle (1-5 permille) is the
-  // steady-state setting once a measurement exists.
-  int measurePermille = 0; // UCACHE_MEASURE_PERMILLE
-  // Rotates which files are held out, so coverage accumulates over time
-  // instead of punishing the same files forever. 0 = never rotate.
-  uint64_t measureRotateSeconds = 86400; // UCACHE_MEASURE_ROTATE_SECONDS
+  // Measurement by TIME SLICING (0 = off, the default). For one window in
+  // every cycle the cache steps aside and every newly-opened file is served
+  // straight from the origin, uncached. Because the WHOLE application is on one
+  // route for that window, the window's wall contains that route's overlap --
+  // which is the term per-file and per-read methods cannot see, and the reason
+  // they report a gain where there is a loss.
+  //
+  // The window must be several times a file's lifetime, or the population is
+  // still mixed when the window ends: a run whose files take ~25 s wants
+  // windows of minutes, and short runs cannot host this at all.
+  uint64_t measureWindowSeconds = 0; // UCACHE_MEASURE_WINDOW_SECONDS
+  // Share of time spent bypassing. The cost is duty x (gain - 1) of the wall,
+  // so it is free exactly when the cache is not helping.
+  int measureDutyPermille = 200; // UCACHE_MEASURE_DUTY_PERMILLE
   std::vector<std::string> keepCgi;       // UCACHE_KEEP_CGI comma list
   std::vector<std::string> allowHosts;    // UCACHE_ALLOW glob list (empty = all)
   std::vector<std::string> denyHosts;     // UCACHE_DENY glob list

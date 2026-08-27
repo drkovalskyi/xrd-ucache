@@ -387,8 +387,18 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
   if (!entry && st->store && n) {
     const uint64_t a = st->relayFirstUs.load(std::memory_order_relaxed);
     const uint64_t b = nowUs(); // the handle is closing: this IS its last activity
-    st->store->recordRelayObs(st->url, n, st->heldOut ? "holdout" : "relay",
-                              b > a ? b - a : 0);
+    // The file's size at the origin, which is the one figure that means the
+    // same thing on both routes. force=false answers from the open response,
+    // so this costs no round trip.
+    uint64_t originSize = 0;
+    if (st->inner && st->inner->IsOpen()) {
+      XrdCl::StatInfo* si = nullptr;
+      if (st->inner->Stat(false, si).IsOK() && si)
+        originSize = si->GetSize();
+      delete si;
+    }
+    st->store->recordRelayObs(st->url, n, st->heldOut ? "bypass" : "relay",
+                              b > a ? b - a : 0, originSize, st->measureWindow);
   }
 }
 
@@ -1134,7 +1144,11 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   const int nowOpen = gOpenUCacheHandles.fetch_add(1) + 1;
   if (nowOpen > 1)
     st_->cpuBlended = true; // another handle already open: spans overlap
-  if (st_->store) {
+  // nowOpen can be <= 0: the counter has one increment here and one decrement
+  // in Close, so a Close without a matching Open (a handle XrdCl closes after
+  // a failed open) drives it negative. Casting that to uint64_t stored 2^64-3
+  // as the "peak" and silently disabled every consumer of it.
+  if (st_->store && nowOpen > 0) {
     // Monotone max. Relaxed CAS loop: contention here is bounded by how often
     // a NEW peak happens, which is rare after the first seconds of a job.
     auto& hw = st_->store->stats().handlesHighWater;
@@ -1149,13 +1163,21 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   st_->url = url;
   using OF = XrdCl::OpenFlags;
   bool writey = flags & (OF::Update | OF::Write | OF::New | OF::Delete);
-  // Measurement holdout: this file is deliberately served from the origin so
-  // its wall span measures what the origin costs, under THIS run's conditions.
-  // Decided once per handle, from the normalized key so every process agrees.
-  if (!writey && !cfg.disable && st_->store && cfg.measurePermille > 0) {
-    if (auto k = UrlKey::parse(url, cfg.keepCgi))
-      st_->heldOut = holdoutSelected(k->key, cfg.measurePermille, cfg.measureRotateSeconds,
-                                     static_cast<uint64_t>(::time(nullptr)));
+  // Measurement bypass: during one window in every cycle the cache steps aside
+  // so the whole application runs on the origin, and that window's wall carries
+  // the origin route's OVERLAP as well as its cost. Decided once per handle --
+  // a file keeps its route for life, because switching mid-file would measure
+  // neither. Derived from the wall clock so every process switches together.
+  if (!writey && !cfg.disable && st_->store && cfg.measureWindowSeconds > 0) {
+    const auto ph = bypassPhase(static_cast<uint64_t>(::time(nullptr)),
+                                cfg.measureWindowSeconds, cfg.measureDutyPermille);
+    st_->heldOut = ph.bypass;
+    st_->measureWindow = ph.window;
+  } else if (st_->store && cfg.measureWindowSeconds > 0) {
+    st_->measureWindow =
+        bypassPhase(static_cast<uint64_t>(::time(nullptr)), cfg.measureWindowSeconds,
+                    cfg.measureDutyPermille)
+            .window;
   }
   passthroughOnly_ = writey || cfg.disable || !st_->store || st_->heldOut;
   if (passthroughOnly_ && st_->store) {

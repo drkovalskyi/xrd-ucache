@@ -84,6 +84,15 @@ void Tracer::rec(const char* op, const std::string& key, uint64_t off, uint64_t 
     fd_ = io_.open(path_, O_WRONLY | O_CREAT, 0600);
     if (fd_ < 0)
       return; // trace loss is acceptable; job health is not
+    // Announce the sampling rate FIRST. Without it a consumer cannot tell a
+    // complete trace from a 1-in-64 one, and a timeline reconstructed from a
+    // sampled trace is nonsense that looks plausible: the 63 missing
+    // operations become "compute gaps" and the run reads as if it had slack.
+    char hdr[96];
+    const int hn = std::snprintf(hdr, sizeof hdr, "{\"op\":\"meta\",\"sample\":%d}\n",
+                                 sample_ < 1 ? 1 : sample_);
+    if (hn > 0 && io_.pwriteFull(fd_, hdr, static_cast<size_t>(hn), off_) == hn)
+      off_ += static_cast<uint64_t>(hn);
   }
   if (legend_.insert(h).second) {
     const std::string leg = "{\"op\":\"key\",\"k\":\"" +

@@ -111,7 +111,6 @@ struct GainEstimate {
 struct Totals {
   size_t runs = 0;          // runs with records
   size_t runsEstimated = 0; // runs any method could measure
-  size_t runsInRun = 0;     // …of which measured from inside themselves (holdout)
   size_t distinctFiles = 0; // union across runs, not a sum
   uint64_t firstStartS = 0, lastEndS = 0;
   uint64_t durationS = 0;   // summed run spans, which is what the rates divide by
@@ -132,36 +131,13 @@ struct Totals {
 // than silently dropped.
 Totals summarize(const std::vector<Run>& runs, size_t maxEstimates = 100);
 
-// What a run measured about ITSELF, from files it deliberately served straight
-// from the origin (`measure_permille`) next to files it served from cache.
-//
-// This is the device that survives what a cross-run comparison cannot: a
-// thread-count change, a faster analysis loop, a different origin mood. Both
-// populations ran in the SAME process, at the same width, against the same
-// origin, with the same code — so everything except the read route cancels.
-//
-// The comparison is per-file WALL SPAN per origin-equivalent byte. Spans carry
-// the route's CPU as well as its waits, which per-read service times do not,
-// and that difference is exactly where latency-based models sign-flipped.
-//
-// Known bias, stated wherever this is printed: in a mostly-cached run the
-// held-out files meet an origin serving few streams, where a no-cache world
-// would meet it with all of them. On a saturating origin that flatters the
-// origin, so the gain is UNDERSTATED — conservative, never inflated.
-struct InRunGain {
-  bool valid = false;
-  double gain = 0.0;         // cached seconds-per-byte vs holdout: >1 = cache wins
-  uint64_t holdoutFiles = 0, cachedFiles = 0;
-  uint64_t holdoutBytes = 0, cachedBytes = 0;
-  double holdoutUsPerMB = 0.0, cachedUsPerMB = 0.0;
-  double spanCoverage = 0.0; // Σ spans / (wall × concurrency): the composition
-                             // self-check — far from 1 means spans do not
-                             // account for the run and the answer is refused
-  std::string reason;        // always set when !valid; worth printing when valid
-};
-
-// Needs only the run itself — no history, no baseline, no other process.
-InRunGain inRunGain(const Run& run);
+// NOTE. An estimate built from per-file spans lived here and was REMOVED. It
+// compared per-file COST between the two routes and was blind to OVERLAP --
+// how much of that cost runs concurrently -- which differs between routes by
+// more than the cost does. On a workload whose measured truth was a 0.72x LOSS
+// it reported a 1.34x gain. Wall time is cost divided by overlap, and only a
+// measurement spanning a period when the whole application used ONE route
+// contains the overlap term.
 
 // `all` should be the output of loadRuns (order is not relied on). The reference
 // is chosen from runs that precede `run` in time and actually fetched from

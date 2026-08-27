@@ -393,164 +393,58 @@ TEST(RunLog, ReadsTheHistoryDirectoryAndDedupsByStem) {
 }
 
 // ---------------------------------------------------------------------------
-// In-run measurement (holdout files vs cached files, same process).
+// Measurement windows. A per-file holdout was tested here and was refuted by
+// measurement: it compares per-file COST and is blind to OVERLAP, which differs
+// between routes by more than cost does, so it reported a 1.34x gain on a
+// workload whose measured truth was a 0.72x loss. Time slicing replaces it --
+// within a window the whole application is on one route, so the window's wall
+// carries that route's overlap.
 // ---------------------------------------------------------------------------
 
-// A run that measured itself: `nCached` cached files and `nHoldout` held out,
-// each side at the given µs-per-MB, at concurrency `conc`. The wall is DERIVED
-// from the spans (Σspans / conc) so the run is self-consistent — a real slot
-// scheduler produces that identity, and tests that want to break it pass
-// `wallOverrideS`.
-void measuredRun(const std::string& dir, uint64_t pid, uint64_t startS,
-                 size_t nCached, double cachedUsPerMB, size_t nHoldout,
-                 double holdoutUsPerMB, uint64_t conc = 32, uint64_t perFileMB = 64,
-                 uint64_t wallOverrideS = 0) {
-  const double totalUs = static_cast<double>(nCached) * cachedUsPerMB * perFileMB +
-                         static_cast<double>(nHoldout) * holdoutUsPerMB * perFileMB;
-  const uint64_t wallS =
-      wallOverrideS ? wallOverrideS
-                    : std::max<uint64_t>(1, (uint64_t)(totalUs / conc / 1e6 + 0.5));
-  const uint64_t bytes = perFileMB << 20;
-  std::vector<FileLine> files;
-  std::string counters = "\"opens\":" + std::to_string(nCached + nHoldout) +
-                         ",\"origin_bytes\":0,\"hit_bytes\":" +
-                         std::to_string(bytes * nCached) + ",\"served_bytes\":" +
-                         std::to_string(bytes * (nCached + nHoldout)) +
-                         ",\"relay_bytes\":" + std::to_string(bytes * nHoldout) +
-                         ",\"handles_high_water\":" + std::to_string(conc);
-  for (size_t i = 0; i < nCached; ++i)
-    files.push_back({"root://o//c" + std::to_string(i), bytes, 0, 0, 0,
-                     (uint64_t)(cachedUsPerMB * perFileMB), "cached"});
-  for (size_t i = 0; i < nHoldout; ++i)
-    files.push_back({"root://o//h" + std::to_string(i), 0, 0, bytes, 0,
-                     (uint64_t)(holdoutUsPerMB * perFileMB), "holdout"});
-  writeRun(dir, "host", pid, startS, startS + wallS, counters, files);
+TEST(Bypass, OffByDefault) {
+  EXPECT_FALSE(bypassPhase(12345, 0, 200).bypass);   // no window configured
+  EXPECT_FALSE(bypassPhase(12345, 120, 0).bypass);   // no duty
 }
 
-TEST(InRun, MeasuresGainFromHeldOutFiles) {
-  test::TempDir td;
-  // Cached files move a MB in 100 µs, held-out ones in 250 µs -> 2.5x.
-  // 40 files x 64 MiB, spans summing to ~1 thread-hour equivalent: pick a wall
-  // and concurrency that put span coverage inside the band.
-  measuredRun(td.path(), 1, 1000, /*nCached=*/36, /*cachedUsPerMB=*/80000.0,
-              /*nHoldout=*/9, /*holdoutUsPerMB=*/200000.0, /*conc=*/8);
-  auto runs = loadRuns(td.path());
-  auto g = inRunGain(runs[0]);
-  ASSERT_TRUE(g.valid) << g.reason << " (coverage " << g.spanCoverage << ")";
-  EXPECT_NEAR(g.gain, 2.5, 0.01);
-  EXPECT_EQ(g.holdoutFiles, 9u);
-  EXPECT_EQ(g.cachedFiles, 36u);
+TEST(Bypass, OneWindowPerCycleAtTheRequestedDuty) {
+  // 120 s windows at 200 per mille -> a 600 s cycle whose first 120 s bypass.
+  size_t on = 0;
+  for (uint64_t t = 0; t < 6000; ++t)
+    if (bypassPhase(t, 120, 200).bypass)
+      ++on;
+  EXPECT_NEAR(static_cast<double>(on) / 6000.0, 0.20, 0.01);
+  EXPECT_TRUE(bypassPhase(0, 120, 200).bypass);
+  EXPECT_TRUE(bypassPhase(119, 120, 200).bypass);
+  EXPECT_FALSE(bypassPhase(120, 120, 200).bypass); // cache for the rest
+  EXPECT_FALSE(bypassPhase(599, 120, 200).bypass);
+  EXPECT_TRUE(bypassPhase(600, 120, 200).bypass);  // next cycle
 }
 
-// THE REGRESSION THIS METHOD EXISTS FOR. On the ZSTD-1 campaign the cache was
-// SLOWER than the origin; every record-only model reported a gain. Held-out
-// files finish FASTER than cached ones, and the answer is below 1.
-TEST(InRun, ReportsBelowOneWhenTheCacheIsSlower) {
-  test::TempDir td;
-  measuredRun(td.path(), 1, 1000, 36, /*cached=*/200000.0, 9, /*holdout=*/140000.0, 8);
-  auto runs = loadRuns(td.path());
-  auto g = inRunGain(runs[0]);
-  ASSERT_TRUE(g.valid) << g.reason;
-  EXPECT_LT(g.gain, 1.0);
-  EXPECT_NEAR(g.gain, 0.70, 0.01);
-}
-
-// The replica tier serves DECOMPRESSED bytes. Comparing served bytes would
-// credit the cache for the expansion; only origin-equivalent bytes may count.
-TEST(InRun, UsesOriginEquivalentBytesForTheReplicaTier) {
-  test::TempDir td;
-  const uint64_t mb = 1ull << 20;
-  std::vector<FileLine> files;
-  std::string counters = "\"opens\":45,\"origin_bytes\":0,\"hit_bytes\":0,"
-                         "\"replica_bytes_served\":0,\"handles_high_water\":2";
-  for (size_t i = 0; i < 36; ++i) {
-    // 64 MiB origin-equivalent, served as 128 MiB decompressed, in 6400 µs.
-    FileLine f{"root://o//c" + std::to_string(i), 128 * mb, 64 * mb, 0, 0, 6400000, "cached"};
-    files.push_back(f);
+// Lowering the duty must lengthen the CYCLE, never shrink the window: the
+// window length is what has to outlast the in-flight files after a switch, and
+// a shrinking window would silently stop clearing that transient.
+TEST(Bypass, LowerDutyKeepsTheWindowLength) {
+  for (int duty : {500, 200, 100, 50}) {
+    uint64_t len = 0;
+    for (uint64_t t = 0; t < 100000 && bypassPhase(t, 120, duty).bypass; ++t)
+      len = t + 1;
+    EXPECT_EQ(len, 120u) << "duty " << duty;
   }
-  for (size_t i = 0; i < 9; ++i)
-    files.push_back({"root://o//h" + std::to_string(i), 0, 0, 64 * mb, 0, 16000000, "holdout"});
-  // Σspans = 36*6400 + 9*16000 ms-equivalents; wall chosen for coverage ~1 at
-  // concurrency 2.
-  writeRun(td.path(), "host", 1, 1000, 1000 + 189, counters, files);
-  auto runs = loadRuns(td.path());
-  auto g = inRunGain(runs[0]);
-  ASSERT_TRUE(g.valid) << g.reason;
-  // 6400 µs / 64 MiB cached vs 16000 / 64 held out = 2.5x. Counting the 128 MiB
-  // served would halve cached µs/MB and report 5x.
-  EXPECT_NEAR(g.gain, 2.5, 0.01);
-  EXPECT_LT(g.gain, 3.0);
 }
 
-TEST(InRun, RefusesWithoutHeldOutFiles) {
-  test::TempDir td;
-  measuredRun(td.path(), 1, 1000, 40, 80000.0, 0, 0.0, 8);
-  auto runs = loadRuns(td.path());
-  auto g = inRunGain(runs[0]);
-  EXPECT_FALSE(g.valid);
-  EXPECT_NE(g.reason.find("measure_permille"), std::string::npos);
-}
-
-TEST(InRun, RefusesOnTooFewFiles) {
-  test::TempDir td;
-  measuredRun(td.path(), 1, 1000, 36, 80000.0, 3, 200000.0, 8);
-  auto runs = loadRuns(td.path());
-  auto g = inRunGain(runs[0]);
-  EXPECT_FALSE(g.valid);
-  EXPECT_NE(g.reason.find("too few files"), std::string::npos);
-}
-
-// The composition self-check: when file spans do not account for the run's
-// thread-time, spans are not comparable slices of the wall and the answer is
-// refused rather than reported.
-TEST(InRun, RefusesWhenSpansDoNotComposeIntoTheWall) {
-  test::TempDir td;
-  // Same spans, but the run took ten times as long as its file work accounts
-  // for: coverage collapses far below the band.
-  measuredRun(td.path(), 1, 1000, 36, 80000.0, 9, 200000.0, /*conc=*/8,
-              /*perFileMB=*/64, /*wallOverrideS=*/4000);
-  auto runs = loadRuns(td.path());
-  auto g = inRunGain(runs[0]);
-  EXPECT_FALSE(g.valid);
-  EXPECT_NE(g.reason.find("spans account for"), std::string::npos);
-}
-
-TEST(InRun, RefusesADisabledRun) {
-  test::TempDir td;
-  twoFileBaseline(td.path(), 100);
-  auto runs = loadRuns(td.path());
-  auto g = inRunGain(runs[0]);
-  EXPECT_FALSE(g.valid);
-  EXPECT_NE(g.reason.find("cache disabled"), std::string::npos);
-}
-
-TEST(Holdout, SelectionIsDeterministicAndRoughlyProportional) {
-  size_t hits = 0;
-  const size_t n = 20000;
-  for (size_t i = 0; i < n; ++i) {
-    const std::string k = "root://o//f" + std::to_string(i) + ".root";
-    const bool a = holdoutSelected(k, 50, 0, 0);
-    EXPECT_EQ(a, holdoutSelected(k, 50, 0, 0)); // same answer every time
-    hits += a ? 1 : 0;
+TEST(Bypass, EveryProcessAgreesAndWindowsAreIdentified) {
+  // Derived from the wall clock, so two processes decide alike at the same
+  // instant -- otherwise one would bypass while the other cached and neither
+  // window would be pure.
+  for (uint64_t t : {0ull, 61ull, 119ull, 121ull, 599ull, 601ull}) {
+    auto a = bypassPhase(t, 120, 200), b = bypassPhase(t, 120, 200);
+    EXPECT_EQ(a.bypass, b.bypass);
+    EXPECT_EQ(a.window, b.window);
+    EXPECT_EQ(a.window, t / 120);
   }
-  EXPECT_NEAR(static_cast<double>(hits) / n, 0.05, 0.01); // 50 per mille
-  EXPECT_FALSE(holdoutSelected("root://o//f0.root", 0, 0, 0));   // off
-  EXPECT_TRUE(holdoutSelected("root://o//f0.root", 1000, 0, 0)); // everything
 }
 
-TEST(Holdout, RotationChangesTheSetOverTime) {
-  size_t moved = 0;
-  const size_t n = 4000;
-  for (size_t i = 0; i < n; ++i) {
-    const std::string k = "root://o//f" + std::to_string(i) + ".root";
-    // Same key, two different daily windows.
-    if (holdoutSelected(k, 100, 86400, 0) != holdoutSelected(k, 100, 86400, 86400 * 3))
-      ++moved;
-  }
-  EXPECT_GT(moved, n / 100); // the held-out set is not frozen
-  // …and within one window it is stable.
-  for (size_t i = 0; i < 100; ++i) {
-    const std::string k = "root://o//f" + std::to_string(i) + ".root";
-    EXPECT_EQ(holdoutSelected(k, 100, 86400, 1000), holdoutSelected(k, 100, 86400, 2000));
-  }
+TEST(Bypass, FullDutyBypassesEverything) {
+  for (uint64_t t = 0; t < 1000; ++t)
+    EXPECT_TRUE(bypassPhase(t, 120, 1000).bypass);
 }

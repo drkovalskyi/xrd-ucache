@@ -357,112 +357,6 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   return g;
 }
 
-InRunGain inRunGain(const Run& run) {
-  InRunGain g;
-
-  // Floors. Small populations produce ratios dominated by which particular
-  // files happened to be picked, and a handful of files is not a measurement.
-  constexpr uint64_t kMinFilesPerSide = 8;
-  constexpr uint64_t kMinBytesPerSide = 256ull << 20;
-  // Σspans/(wall × concurrency) must land near 1 for spans to account for the
-  // run. Far below: much of the wall was outside file work (startup, merging,
-  // compute between files) and the two populations' spans are not comparable
-  // slices of it. Far above: files overlapped on a slot, so a span is not one
-  // worker's serial cost. The band is deliberately wide -- it rejects the
-  // shape being wrong, not small inefficiencies.
-  constexpr double kMinCoverage = 0.5, kMaxCoverage = 1.6;
-
-  if (run.disabled) {
-    g.reason = "this run had the cache disabled entirely — nothing to compare";
-    return g;
-  }
-
-  uint64_t hFiles = 0, cFiles = 0, hBytes = 0, cBytes = 0, hSpan = 0, cSpan = 0, allSpan = 0;
-  for (const auto& [k, f] : run.files) {
-    (void)k;
-    allSpan += f.spanUs;
-    if (f.spanUs == 0)
-      continue; // no usable span (pre-span records, or all inside one tick)
-    if (f.mode == "holdout") {
-      // A held-out file is pure origin: its wire bytes ARE what it moved.
-      if (f.wireBytes == 0)
-        continue;
-      ++hFiles;
-      hBytes += f.wireBytes;
-      hSpan += f.spanUs;
-    } else if (f.mode == "cached") {
-      // Origin-EQUIVALENT bytes for a cached file: what the origin would have
-      // shipped, which is the byte-tier volume, not the replica tier's
-      // decompressed output. Using served bytes would flatter the replica tier
-      // by its expansion ratio.
-      const uint64_t equiv = f.servedBytes > f.replicaBytes ? f.servedBytes - f.replicaBytes
-                                                            : f.servedBytes;
-      if (equiv == 0)
-        continue;
-      ++cFiles;
-      cBytes += equiv;
-      cSpan += f.spanUs;
-    }
-  }
-
-  g.holdoutFiles = hFiles;
-  g.cachedFiles = cFiles;
-  g.holdoutBytes = hBytes;
-  g.cachedBytes = cBytes;
-
-  if (hFiles == 0) {
-    g.reason = "no files were held out for measurement — set `measure_permille` "
-               "(e.g. 50 = 5% of files served from the origin) to have runs measure "
-               "themselves";
-    return g;
-  }
-  if (hFiles < kMinFilesPerSide || cFiles < kMinFilesPerSide) {
-    char buf[192];
-    std::snprintf(buf, sizeof buf,
-                  "too few files to compare (%llu held out, %llu cached; need %llu each)",
-                  (unsigned long long)hFiles, (unsigned long long)cFiles,
-                  (unsigned long long)kMinFilesPerSide);
-    g.reason = buf;
-    return g;
-  }
-  if (hBytes < kMinBytesPerSide || cBytes < kMinBytesPerSide) {
-    g.reason = "too little data on one side to compare (under 256 MiB)";
-    return g;
-  }
-
-  // The composition check. Concurrency is the run's own high-water; without it
-  // there is nothing to normalize against and the check is skipped rather than
-  // guessed at.
-  const double wallUs = static_cast<double>(run.durationS()) * 1e6;
-  if (run.handlesHighWater > 0 && wallUs > 0) {
-    g.spanCoverage = static_cast<double>(allSpan) /
-                     (wallUs * static_cast<double>(run.handlesHighWater));
-    if (g.spanCoverage < kMinCoverage || g.spanCoverage > kMaxCoverage) {
-      char buf[224];
-      std::snprintf(buf, sizeof buf,
-                    "file spans account for %.0f%% of the run's thread-time — outside "
-                    "the band where per-file spans compose into the wall, so the "
-                    "comparison is refused",
-                    g.spanCoverage * 100.0);
-      g.reason = buf;
-      return g;
-    }
-  }
-
-  // µs per MB on each route. Cached over holdout: >1 means the cache delivered
-  // the same origin-equivalent bytes in less time.
-  g.holdoutUsPerMB = static_cast<double>(hSpan) / (static_cast<double>(hBytes) / 1e6);
-  g.cachedUsPerMB = static_cast<double>(cSpan) / (static_cast<double>(cBytes) / 1e6);
-  if (g.cachedUsPerMB <= 0) {
-    g.reason = "cached files recorded no time";
-    return g;
-  }
-  g.valid = true;
-  g.gain = g.holdoutUsPerMB / g.cachedUsPerMB;
-  g.reason = "measured inside this run, held-out files against cached ones";
-  return g;
-}
-
 Totals summarize(const std::vector<Run>& runs, size_t maxEstimates) {
   Totals t;
   std::set<std::string> keys;
@@ -497,17 +391,10 @@ Totals summarize(const std::vector<Run>& runs, size_t maxEstimates) {
     // Prefer what the run measured about itself: both sides of that comparison
     // ran in one process, so a thread-count change or a faster analysis loop
     // cannot leak into it. Fall back to a baseline comparison otherwise.
-    const InRunGain self = inRunGain(r);
-    double gain = 0.0;
-    if (self.valid) {
-      gain = self.gain;
-      ++t.runsInRun;
-    } else {
-      const GainEstimate g = estimateGain(r, runs);
-      if (!g.valid)
-        continue;
-      gain = g.gain;
-    }
+    const GainEstimate g = estimateGain(r, runs);
+    if (!g.valid)
+      continue;
+    const double gain = g.gain;
     const double dur = static_cast<double>(r.durationS());
     ++t.runsEstimated;
     // saved = what no cache would have cost, minus what this took.
