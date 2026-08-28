@@ -98,11 +98,14 @@ struct Run {
   // recompressed data and its byte count is not in the same units as the
   // origin's.
   double originShare() const;
-  // Buffer-stall time as a share of wall x threads. THREAD-NORMALISED on
-  // purpose: the counter sums across threads, so its raw share of wall exceeds
-  // 100% and flags every run. Checked against recorded campaigns, this
-  // separates a fill that paced its own run (17.2%, wall 2.49x its direct
-  // reference) from one that did not (0.3%, 1.01x).
+  // Share of this run's THREAD-TIME that went into blocking on cache writes:
+  // stall / (cpu + stall). Both terms are thread-time, so the ratio needs no
+  // thread count -- which is what makes it usable. A version normalised by
+  // threads_high_water was tried and FAILED in the field: that counter is
+  // every thread the process owns, and an RNTuple job reported 584 where the
+  // job was given 32, scaling a 35% fill down to 0.9% and passing a fill whose
+  // wall was 2.12x its own direct reference. Measured across three fills whose
+  // truth is known: 34.8% (2.12x, reject), 1.9% (0.97x) and 0.7% (1.01x).
   double fillCost() const;
   static constexpr double kMinOriginShare = 0.95;
   static constexpr double kMaxFillCost = 0.05;

@@ -494,11 +494,15 @@ double Run::originShare() const {
 }
 
 double Run::fillCost() const {
-  const uint64_t threads = threadsHighWater ? threadsHighWater : 1;
-  const double denom = static_cast<double>(durationS()) * static_cast<double>(threads);
-  if (denom <= 0.0)
+  if (!bufferStallUs)
     return 0.0;
-  return (static_cast<double>(bufferStallUs) / 1e6) / denom;
+  const double stall = static_cast<double>(bufferStallUs);
+  const double cpu = static_cast<double>(cpuUs);
+  // Without cpu_us there is nothing to compare against; treat the run as
+  // unqualified rather than silently passing it on a missing field.
+  if (cpu <= 0.0)
+    return 1.0;
+  return stall / (cpu + stall);
 }
 
 double Run::coresBusy() const {

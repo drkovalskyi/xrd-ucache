@@ -442,18 +442,28 @@ TEST(Baseline, OriginShareIsWeightedByOriginSize) {
   EXPECT_NEAR(runs[0].originShare(), 0.9, 0.01);
 }
 
-TEST(Baseline, FillCostIsThreadNormalised) {
+TEST(Baseline, FillCostIsRelativeToCpuNotToThreadCount) {
   test::TempDir d;
-  // 300 s of stall over a 100 s run at 32 threads is 9.4% of the machine, not
-  // 300% of the wall. The counter sums across threads: without the division
-  // every run looks like a runaway fill and the test never discriminates.
+  // The same fill -- same stall thread-time against the same CPU thread-time --
+  // reported at two widths. 584 is what an RNTuple job actually reports for a
+  // 32-thread job, because threads_high_water counts every thread the process
+  // owns. A width-normalised measure scales one of these 18x and passes a fill
+  // whose wall was 2.12x its own direct reference; a cpu-relative one cannot,
+  // because both terms are thread-time.
+  const std::string stall = ",\"buffer_stall_us\":1902000000,\"cpu_us\":3565000000";
   writeRun(d.path(), "h", 1, 1000, 1100,
-           fillCounters(kGiB) + ",\"buffer_stall_us\":300000000,\"threads_high_water\":32",
+           fillCounters(kGiB) + stall + ",\"threads_high_water\":32",
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           fillCounters(kGiB) + stall + ",\"threads_high_water\":584",
            {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
   const auto runs = loadRuns(d.path());
-  ASSERT_EQ(runs.size(), 1u);
-  EXPECT_NEAR(runs[0].fillCost(), 0.094, 0.005);
-  EXPECT_FALSE(runs[0].baselineQualified()) << "9.4% fill cost is over the 5% bound";
+  ASSERT_EQ(runs.size(), 2u);
+  for (const auto& r : runs) {
+    EXPECT_NEAR(r.fillCost(), 0.348, 0.01)
+        << "threads_high_water " << r.threadsHighWater << " must not change it";
+    EXPECT_FALSE(r.baselineQualified());
+  }
 }
 
 TEST(Baseline, AQuietFillQualifiesAndALoudOneDoesNot) {
@@ -461,11 +471,13 @@ TEST(Baseline, AQuietFillQualifiesAndALoudOneDoesNot) {
   // Both are ~100% origin-served, so coverage alone cannot separate them --
   // which is why the write-side bound exists. Checked against recorded
   // campaigns: 0.3% (wall 1.01x its direct reference) vs 17.2% (2.49x).
+  // Real numbers from three fills whose direct reference is known: 1.9% went
+  // with a 0.97x wall, 34.8% with 2.12x.
   writeRun(d.path(), "h", 1, 1000, 1100,
-           fillCounters(kGiB) + ",\"buffer_stall_us\":9600000,\"threads_high_water\":32",
+           fillCounters(kGiB) + ",\"buffer_stall_us\":66000000,\"cpu_us\":3368000000",
            {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
   writeRun(d.path(), "h", 2, 2000, 2100,
-           fillCounters(kGiB) + ",\"buffer_stall_us\":550000000,\"threads_high_water\":32",
+           fillCounters(kGiB) + ",\"buffer_stall_us\":1902000000,\"cpu_us\":3565000000",
            {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
   const auto runs = loadRuns(d.path());
   ASSERT_EQ(runs.size(), 2u);
