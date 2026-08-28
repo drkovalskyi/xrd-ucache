@@ -22,6 +22,7 @@
 #pragma once
 
 #include "Config.h"
+#include "CpuCounters.h"
 #include "FileEntry.h"
 #include "IOBackend.h"
 #include "Stats.h"
@@ -223,6 +224,9 @@ class CacheStore {
   IOBackend& io_;
   Config cfg_;
   Stats stats_;
+  // Work done by this process while the cache was engaged (CpuCounters.h):
+  // instruction totals are the fingerprint that says two runs are comparable.
+  CpuCounters cpu_;
   std::mutex regMu_;
   std::map<std::string, std::weak_ptr<FileEntry>> registry_; // hash -> entry
   // Session summaries of closed entries for the per-entry coverage dump.

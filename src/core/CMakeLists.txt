@@ -2,6 +2,7 @@
 # Static with PIC — the plugin .so links it.
 add_library(ucache-core STATIC
   CacheStore.cc
+  CpuCounters.cc
   Config.cc
   FileEntry.cc
   IOBackend.cc
