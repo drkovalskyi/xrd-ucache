@@ -805,6 +805,16 @@ FileEntry::ScrubResult CacheStore::verify(const UrlKey& key, uint64_t originSize
 
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
                                 uint64_t spanUs, uint64_t originSize) {
+  // Sample the process width here too: a cache-disabled run -- the BASELINE --
+  // never creates an entry, so this is its only chance to record the width its
+  // wall must be divided by.
+  {
+    const uint64_t n = CpuCounters::liveThreads();
+    uint64_t prev = stats_.threadsHighWater.load(std::memory_order_relaxed);
+    while (n > prev &&
+           !stats_.threadsHighWater.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+    }
+  }
   if (!obsSink_ || bytes == 0)
     return;
   // Normalized exactly like a cached entry's key, or the baseline record could

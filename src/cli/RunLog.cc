@@ -101,6 +101,10 @@ void loadCounters(const std::string& path, Run& r) {
   r.endS = fieldU64(last, "ts");
   r.disabled = fieldU64(last, "disabled") != 0;
   r.handlesHighWater = fieldU64(last, "handles_high_water");
+  r.threadsHighWater = fieldU64(last, "threads_high_water");
+  r.cpuUs = fieldU64(last, "cpu_us");
+  r.instructions = fieldU64(last, "instructions");
+  r.cycles = fieldU64(last, "cycles");
   r.opens = fieldU64(last, "opens");
   r.filesOpened = fieldU64(last, "files_opened");
   r.servedBytes = fieldU64(last, "served_bytes");
@@ -157,6 +161,7 @@ void loadFiles(const std::string& path, Run& r) {
     f.firstTouchBytes += fieldU64(line, "first_touch_bytes");
     f.wireBytes += fieldU64(line, "wire_bytes");
     f.spanUs += fieldU64(line, "span_us");
+    f.originSize = std::max(f.originSize, fieldU64(line, "origin_size"));
     const std::string m = fieldStr(line, "mode");
     // A re-opened entry emits a second record. Modes agree in practice (the
     // mode is a per-key property, not per-open; if they ever disagree, the
@@ -167,6 +172,11 @@ void loadFiles(const std::string& path, Run& r) {
   }
 }
 
+} // namespace
+
+namespace {
+std::string signatureOf(const std::map<std::string, Run::FileRec>& files);
+std::string hostOf(const std::string& url);
 } // namespace
 
 std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiveDir) {
@@ -204,6 +214,14 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
     }
     if (!r.complete && r.files.empty())
       continue; // an empty claimed name, or a store that never served anything
+    // Identity: which files this run opened, and where they came from.
+    r.sig = signatureOf(r.files);
+    for (const auto& [k, f] : r.files) {
+      (void)f;
+      const std::string h = hostOf(k);
+      if (!h.empty())
+        ++r.originHosts[h];
+    }
     runs.push_back(std::move(r));
   }
   std::sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
@@ -406,6 +424,89 @@ Totals summarize(const std::vector<Run>& runs, size_t maxEstimates) {
     t.gain = (t.estimatedDurationS + t.savedS) / t.estimatedDurationS;
   }
   return t;
+}
+
+
+// ---------------------------------------------------------------------------
+// Identity and baseline qualification.
+// ---------------------------------------------------------------------------
+
+namespace {
+// FNV-1a over the sorted key set. Order-independent by construction (the keys
+// are visited in map order, which is sorted), so two runs that opened the same
+// files agree whatever order they opened them in.
+std::string signatureOf(const std::map<std::string, Run::FileRec>& files) {
+  if (files.empty())
+    return std::string();
+  uint64_t h = 1469598103934665603ull;
+  for (const auto& [k, _] : files) {
+    for (unsigned char c : k) {
+      h ^= c;
+      h *= 1099511628211ull;
+    }
+    h ^= '\n';
+    h *= 1099511628211ull;
+  }
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "%06llx", static_cast<unsigned long long>(h & 0xffffffull));
+  return std::string(buf);
+}
+
+// Host out of `root://host:port//path`; empty when the key is not a URL.
+std::string hostOf(const std::string& url) {
+  const auto p = url.find("://");
+  if (p == std::string::npos)
+    return std::string();
+  const auto start = p + 3;
+  const auto end = url.find('/', start);
+  std::string hp = url.substr(start, end == std::string::npos ? end : end - start);
+  const auto colon = hp.find(':');
+  return colon == std::string::npos ? hp : hp.substr(0, colon);
+}
+} // namespace
+
+std::string Run::topOriginHost() const {
+  const std::string* best = nullptr;
+  uint64_t n = 0;
+  for (const auto& [h, c] : originHosts)
+    if (c > n) {
+      n = c;
+      best = &h;
+    }
+  return best ? *best : std::string();
+}
+
+double Run::originShare() const {
+  // Weighted by size AT THE ORIGIN: the replica tier serves recompressed
+  // bytes, so served-byte counters are not in comparable units.
+  uint64_t fromOrigin = 0, total = 0;
+  for (const auto& [k, f] : files) {
+    const uint64_t w = f.originSize ? f.originSize : f.servedBytes;
+    if (!w)
+      continue;
+    total += w;
+    if (f.mode == "relay" || f.mode == "fill" || f.wireBytes > f.servedBytes / 2)
+      fromOrigin += w;
+  }
+  if (!total)
+    return disabled ? 1.0 : 0.0; // a disabled run with no records is still direct
+  return static_cast<double>(fromOrigin) / static_cast<double>(total);
+}
+
+double Run::fillCost() const {
+  const uint64_t threads = threadsHighWater ? threadsHighWater : 1;
+  const double denom = static_cast<double>(durationS()) * static_cast<double>(threads);
+  if (denom <= 0.0)
+    return 0.0;
+  return (static_cast<double>(bufferStallUs) / 1e6) / denom;
+}
+
+double Run::busy() const {
+  const uint64_t threads = threadsHighWater ? threadsHighWater : 0;
+  if (!cpuUs || !threads)
+    return 0.0;
+  const double denom = static_cast<double>(durationS()) * static_cast<double>(threads);
+  return denom > 0.0 ? (static_cast<double>(cpuUs) / 1e6) / denom : 0.0;
 }
 
 } // namespace ucache

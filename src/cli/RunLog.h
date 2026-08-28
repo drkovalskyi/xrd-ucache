@@ -32,6 +32,11 @@ struct Run {
                          // a measured BASELINE, the only sound gain reference
   uint64_t handlesHighWater = 0; // peak concurrent cache handles; runs are only
                                  // pooled across time when this agrees
+  // Work done and the width it was done at (CpuCounters.h). Instructions are
+  // the fingerprint that says two runs are comparable; cpuUs against
+  // wall x threads is the share of the machine that was computing rather than
+  // waiting, which bounds from above what any cache could still win.
+  uint64_t cpuUs = 0, instructions = 0, cycles = 0, threadsHighWater = 0;
 
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;
@@ -49,8 +54,11 @@ struct Run {
   struct FileRec {
     uint64_t ts = 0, opens = 0, servedBytes = 0, ramBytes = 0, replicaBytes = 0;
     uint64_t diskReads = 0, diskSeq = 0, diskBytes = 0, firstTouchBytes = 0, wireBytes = 0;
-    uint64_t spanUs = 0;  // wall this file was live and working, µs
-    std::string mode;     // cached | fill | relay ("" = pre-span record)
+    uint64_t spanUs = 0;     // wall this file was live and working, µs
+    uint64_t originSize = 0; // the file's size AT THE ORIGIN — the one work
+                             // measure that means the same on every route, and
+                             // therefore the only sound weight for a share
+    std::string mode;        // cached | fill | relay ("" = pre-span record)
   };
   std::map<std::string, FileRec> files;
 
@@ -67,6 +75,42 @@ struct Run {
   uint64_t faults() const {
     return crcFailures + replicaCrcFailures + replicaInvalid + failopenEvents + metaCorrupt;
   }
+
+  // ---- identity -----------------------------------------------------------
+  // Hash of the sorted set of input URLs, as 6 hex characters. Two runs over
+  // the same files share it; a run that died early opened fewer files and so
+  // does not, which is what keeps a truncated run from being compared.
+  // Computed by loadRuns; empty when the run left no per-file records.
+  std::string sig;
+  // Origin hosts seen, by file count. A dataset can be served from several
+  // sites (redirectors, distributed sets), and the mix is a property of a RUN,
+  // not of the input set: a baseline drawn from one site is weak evidence for
+  // a run whose data came from another.
+  std::map<std::string, uint64_t> originHosts;
+  std::string topOriginHost() const;
+
+  // ---- baseline qualification --------------------------------------------
+  // A run is usable as a baseline when it is close enough to a pure direct
+  // run. Two deviations, opposite signs, both bounded:
+  //   * bytes served from cache make it FASTER  -> understates gain (safe)
+  //   * fill-side cost makes it SLOWER          -> overstates gain (unsafe)
+  // Measured in origin-equivalent bytes, because the replica tier serves
+  // recompressed data and its byte count is not in the same units as the
+  // origin's.
+  double originShare() const;
+  // Buffer-stall time as a share of wall x threads. THREAD-NORMALISED on
+  // purpose: the counter sums across threads, so its raw share of wall exceeds
+  // 100% and flags every run. Checked against recorded campaigns, this
+  // separates a fill that paced its own run (17.2%, wall 2.49x its direct
+  // reference) from one that did not (0.3%, 1.01x).
+  double fillCost() const;
+  static constexpr double kMinOriginShare = 0.95;
+  static constexpr double kMaxFillCost = 0.05;
+  bool baselineQualified() const {
+    return originShare() >= kMinOriginShare && fillCost() <= kMaxFillCost;
+  }
+  // Share of wall x threads spent on CPU; 0 when unknown.
+  double busy() const;
 };
 
 // Every run in a stats directory, newest first. A missing directory yields an
