@@ -282,32 +282,6 @@ That is a real result from a real workload (a fast LAN origin and cheaply
 compressed data): the honest answer there is to not use a cache, and the tool
 says so.
 
-### Letting runs measure themselves (experimental)
-
-Recording a baseline means running the same work twice, which only helps while
-your work stays the same. **`measure_window_seconds`** is an alternative under
-development: for one window in every cycle the cache steps aside and every
-newly-opened file is served straight from the origin, uncached.
-
-```sh
-ucache set measure_window_seconds 120   # 2-minute windows
-ucache set measure_duty_permille 100    # 10% of the time on the origin
-```
-
-Why windows and not a sample of files: wall time is per-item cost divided by how
-much of that cost overlaps, and the two routes overlap differently — by more
-than they differ in cost. So a measurement only means something if the **whole**
-application used one route for its duration. Splitting files between routes
-cannot do that at any fraction, and a version of this that did so reported a
-1.34x gain on a workload that was really a 0.72x loss.
-
-**This is not yet a source of numbers in `summary`.** The windows are recorded;
-the analysis that turns them into a gain lives in the benchmark harness until it
-has reproduced known results. Two limits are already clear: a window must be
-several times longer than a file takes to process, so **short jobs cannot host
-this at all**, and the cost is the duty cycle times the gain, so it is only free
-when the cache is not helping.
-
 ### Why a baseline, and not an estimate
 
 Nothing recorded during cached operation can stand in for the origin alone —

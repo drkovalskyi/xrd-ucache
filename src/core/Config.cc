@@ -203,17 +203,6 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     }
   } else if (k == "trace_sample")
     c.traceSample = ::atoi(v.c_str());
-  else if (k == "measure_window_seconds")
-    c.measureWindowSeconds = static_cast<uint64_t>(::atoll(v.c_str()));
-  else if (k == "measure_duty_permille") {
-    const int n = ::atoi(v.c_str());
-    if (n < 0 || n > 1000) {
-      UCACHE_WARN("%s: measure_duty_permille '%s' out of range 0..1000; ignored", src,
-                  v.c_str());
-      return false;
-    }
-    c.measureDutyPermille = n;
-  }
   else if (k == "keep_cgi")
     c.keepCgi = splitCommas(v);
   else if (k == "allow")
@@ -363,8 +352,6 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress_drain_jobs", "UCACHE_RECOMPRESS_DRAIN_JOBS"},
       {"trace", "UCACHE_TRACE"},
       {"trace_sample", "UCACHE_TRACE_SAMPLE"},
-      {"measure_window_seconds", "UCACHE_MEASURE_WINDOW_SECONDS"},
-      {"measure_duty_permille", "UCACHE_MEASURE_DUTY_PERMILLE"},
       {"keep_cgi", "UCACHE_KEEP_CGI"},
       {"allow", "UCACHE_ALLOW"},
       {"deny", "UCACHE_DENY"},
@@ -457,10 +444,6 @@ std::string Config::valueOf(const std::string& key) const {
     return trace.empty() ? "off" : trace;
   if (key == "trace_sample")
     return std::to_string(traceSample);
-  if (key == "measure_window_seconds")
-    return std::to_string(measureWindowSeconds);
-  if (key == "measure_duty_permille")
-    return std::to_string(measureDutyPermille);
   if (key == "keep_cgi")
     return join(keepCgi);
   if (key == "allow")

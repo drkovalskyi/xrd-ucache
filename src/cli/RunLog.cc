@@ -159,10 +159,10 @@ void loadFiles(const std::string& path, Run& r) {
     f.spanUs += fieldU64(line, "span_us");
     const std::string m = fieldStr(line, "mode");
     // A re-opened entry emits a second record. Modes agree in practice (the
-    // holdout decision is per key, not per open); if they ever disagree, the
+    // mode is a per-key property, not per-open; if they ever disagree, the
     // origin-served mode wins, because a file half-served from cache cannot
     // measure the origin and must not join that population.
-    if (!m.empty() && (f.mode.empty() || m == "holdout" || m == "relay"))
+    if (!m.empty() && (f.mode.empty() || m == "relay"))
       f.mode = m;
   }
 }

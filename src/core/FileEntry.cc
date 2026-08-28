@@ -1,6 +1,5 @@
 #include "FileEntry.h"
 
-#include "Holdout.h"
 
 #include "Log.h"
 #include "Trace.h"
@@ -97,8 +96,6 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
     e->meta_.originCksum = originCksum;
     e->dirty_ = true;
   }
-  e->obsWindow_ =
-      bypassPhase(nowS(), cfg.measureWindowSeconds, cfg.measureDutyPermille).window;
   e->lastFlushS_ = nowS();
   e->lastBufFlushS_ = nowS();
   stats.opens.fetch_add(1, std::memory_order_relaxed);
@@ -152,7 +149,7 @@ void FileEntry::emitObsRecord() {
      // differ by route -- the replica tier hands over decompressed data, the
      // origin compressed -- so they cannot normalise a comparison between
      // routes; the file's size at the origin can.
-     << ",\"origin_size\":" << meta_.fileSize << ",\"window\":" << obsWindow_
+     << ",\"origin_size\":" << meta_.fileSize
      // A file this process mostly FETCHED is a fill, whatever else it also
      // served; the distinction decides which population a measurement joins.
      << ",\"mode\":\"" << (v(obs_.wireBytes) > v(obs_.servedBytes) ? "fill" : "cached")

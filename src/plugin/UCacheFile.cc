@@ -1,6 +1,5 @@
 #include "UCacheFile.h"
 
-#include "Holdout.h"
 #include "HelperPath.h"
 #include "Executor.h"
 #include "Log.h"
@@ -397,8 +396,7 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
         originSize = si->GetSize();
       delete si;
     }
-    st->store->recordRelayObs(st->url, n, st->heldOut ? "bypass" : "relay",
-                              b > a ? b - a : 0, originSize, st->measureWindow);
+    st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize);
   }
 }
 
@@ -1163,23 +1161,7 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   st_->url = url;
   using OF = XrdCl::OpenFlags;
   bool writey = flags & (OF::Update | OF::Write | OF::New | OF::Delete);
-  // Measurement bypass: during one window in every cycle the cache steps aside
-  // so the whole application runs on the origin, and that window's wall carries
-  // the origin route's OVERLAP as well as its cost. Decided once per handle --
-  // a file keeps its route for life, because switching mid-file would measure
-  // neither. Derived from the wall clock so every process switches together.
-  if (!writey && !cfg.disable && st_->store && cfg.measureWindowSeconds > 0) {
-    const auto ph = bypassPhase(static_cast<uint64_t>(::time(nullptr)),
-                                cfg.measureWindowSeconds, cfg.measureDutyPermille);
-    st_->heldOut = ph.bypass;
-    st_->measureWindow = ph.window;
-  } else if (st_->store && cfg.measureWindowSeconds > 0) {
-    st_->measureWindow =
-        bypassPhase(static_cast<uint64_t>(::time(nullptr)), cfg.measureWindowSeconds,
-                    cfg.measureDutyPermille)
-            .window;
-  }
-  passthroughOnly_ = writey || cfg.disable || !st_->store || st_->heldOut;
+  passthroughOnly_ = writey || cfg.disable || !st_->store;
   if (passthroughOnly_ && st_->store) {
     // Start a relayed handle's span at open for the same reason: its cost
     // includes reaching the origin, and a one-read file must still have a span.

@@ -235,12 +235,8 @@ reading was re-reading, and what the cache disk was asked to do.
   activity. Where one worker handles one file at a time that is the worker's
   full cost for it — waits and the route's own CPU together — which is what
   makes files served by different routes comparable. `mode` is `cached`,
-  `fill` (this process mostly fetched it), `bypass` (served from the origin ON
-  PURPOSE during a measurement window — see `measure_window_seconds`) or
-  `relay` (passed through for any other reason, including a `UCACHE_DISABLE`
-  run). `window` is the measurement window the file was opened in, so records
-  can be grouped by the period whose wall they belong to; 0 when measurement is
-  off.
+  `fill` (this process mostly fetched it) or `relay` (passed through, including
+  a `UCACHE_DISABLE` run).
 
 - `<stem>.trace.jsonl` — sampled per-operation IO trace, written only with
   `trace = io` (every `trace_sample`-th operation per class). Records are

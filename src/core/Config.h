@@ -132,10 +132,8 @@ struct Config {
   // The window must be several times a file's lifetime, or the population is
   // still mixed when the window ends: a run whose files take ~25 s wants
   // windows of minutes, and short runs cannot host this at all.
-  uint64_t measureWindowSeconds = 0; // UCACHE_MEASURE_WINDOW_SECONDS
   // Share of time spent bypassing. The cost is duty x (gain - 1) of the wall,
   // so it is free exactly when the cache is not helping.
-  int measureDutyPermille = 200; // UCACHE_MEASURE_DUTY_PERMILLE
   std::vector<std::string> keepCgi;       // UCACHE_KEEP_CGI comma list
   std::vector<std::string> allowHosts;    // UCACHE_ALLOW glob list (empty = all)
   std::vector<std::string> denyHosts;     // UCACHE_DENY glob list

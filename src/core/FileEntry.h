@@ -252,7 +252,6 @@ class FileEntry {
   // interleaving deliberately counts as non-sequential).
   Obs obs_;
   std::shared_ptr<ObsSink> obsSink_;
-  uint64_t obsWindow_ = 0;
   std::atomic<bool> obsEmitted_{false};
   PageBitmap servedOnce_;
   std::atomic<uint64_t> lastDiskEnd_{~0ull};

@@ -6,7 +6,6 @@
 // flattered by serving decompressed bytes, a cache that is SLOWER than the
 // origin must say so rather than round up to 1, and every condition the
 // estimate was not validated under must suppress it rather than caveat it.
-#include "Holdout.h"
 #include "RunLog.h"
 
 #include "TestUtil.h"
@@ -392,59 +391,3 @@ TEST(RunLog, ReadsTheHistoryDirectoryAndDedupsByStem) {
   EXPECT_EQ(runs[1].hitBytes, kGiB); // live copy won over the stale duplicate
 }
 
-// ---------------------------------------------------------------------------
-// Measurement windows. A per-file holdout was tested here and was refuted by
-// measurement: it compares per-file COST and is blind to OVERLAP, which differs
-// between routes by more than cost does, so it reported a 1.34x gain on a
-// workload whose measured truth was a 0.72x loss. Time slicing replaces it --
-// within a window the whole application is on one route, so the window's wall
-// carries that route's overlap.
-// ---------------------------------------------------------------------------
-
-TEST(Bypass, OffByDefault) {
-  EXPECT_FALSE(bypassPhase(12345, 0, 200).bypass);   // no window configured
-  EXPECT_FALSE(bypassPhase(12345, 120, 0).bypass);   // no duty
-}
-
-TEST(Bypass, OneWindowPerCycleAtTheRequestedDuty) {
-  // 120 s windows at 200 per mille -> a 600 s cycle whose first 120 s bypass.
-  size_t on = 0;
-  for (uint64_t t = 0; t < 6000; ++t)
-    if (bypassPhase(t, 120, 200).bypass)
-      ++on;
-  EXPECT_NEAR(static_cast<double>(on) / 6000.0, 0.20, 0.01);
-  EXPECT_TRUE(bypassPhase(0, 120, 200).bypass);
-  EXPECT_TRUE(bypassPhase(119, 120, 200).bypass);
-  EXPECT_FALSE(bypassPhase(120, 120, 200).bypass); // cache for the rest
-  EXPECT_FALSE(bypassPhase(599, 120, 200).bypass);
-  EXPECT_TRUE(bypassPhase(600, 120, 200).bypass);  // next cycle
-}
-
-// Lowering the duty must lengthen the CYCLE, never shrink the window: the
-// window length is what has to outlast the in-flight files after a switch, and
-// a shrinking window would silently stop clearing that transient.
-TEST(Bypass, LowerDutyKeepsTheWindowLength) {
-  for (int duty : {500, 200, 100, 50}) {
-    uint64_t len = 0;
-    for (uint64_t t = 0; t < 100000 && bypassPhase(t, 120, duty).bypass; ++t)
-      len = t + 1;
-    EXPECT_EQ(len, 120u) << "duty " << duty;
-  }
-}
-
-TEST(Bypass, EveryProcessAgreesAndWindowsAreIdentified) {
-  // Derived from the wall clock, so two processes decide alike at the same
-  // instant -- otherwise one would bypass while the other cached and neither
-  // window would be pure.
-  for (uint64_t t : {0ull, 61ull, 119ull, 121ull, 599ull, 601ull}) {
-    auto a = bypassPhase(t, 120, 200), b = bypassPhase(t, 120, 200);
-    EXPECT_EQ(a.bypass, b.bypass);
-    EXPECT_EQ(a.window, b.window);
-    EXPECT_EQ(a.window, t / 120);
-  }
-}
-
-TEST(Bypass, FullDutyBypassesEverything) {
-  for (uint64_t t = 0; t < 1000; ++t)
-    EXPECT_TRUE(bypassPhase(t, 120, 1000).bypass);
-}

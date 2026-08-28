@@ -50,7 +50,7 @@ struct Run {
     uint64_t ts = 0, opens = 0, servedBytes = 0, ramBytes = 0, replicaBytes = 0;
     uint64_t diskReads = 0, diskSeq = 0, diskBytes = 0, firstTouchBytes = 0, wireBytes = 0;
     uint64_t spanUs = 0;  // wall this file was live and working, µs
-    std::string mode;     // cached | fill | holdout | relay ("" = pre-span record)
+    std::string mode;     // cached | fill | relay ("" = pre-span record)
   };
   std::map<std::string, FileRec> files;
 

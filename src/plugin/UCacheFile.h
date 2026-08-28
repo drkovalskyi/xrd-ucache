@@ -59,13 +59,8 @@ struct HandleState {
   // matchable, file by file, against the cached runs that follow it.
   std::atomic<uint64_t> relayedBytes{0};
   std::atomic<bool> relayObsDone{false};
-  // Bypassed for measurement: served from the origin on purpose, during a
-  // measurement window. Tagged `bypass` on the record so a reader can tell a
-  // deliberate origin read from an incidental relay, and grouped by window.
-  bool heldOut = false;
-  uint64_t measureWindow = 0;
   // Wall span of a handle the cache never served, in µs of a steady clock —
-  // the same quantity FileEntry tracks for cached files, so a holdout file and
+  // the same quantity FileEntry tracks for cached files, so a relayed file and
   // a cached file are directly comparable.
   std::atomic<uint64_t> relayFirstUs{0};
   std::atomic<uint64_t> relayLastUs{0};

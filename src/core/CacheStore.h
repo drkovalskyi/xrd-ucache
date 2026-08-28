@@ -166,7 +166,7 @@ class CacheStore {
   // it is what a cache-disabled BASELINE run leaves behind, and the gain
   // readout matches later cached runs against it by key.
   void recordRelayObs(const std::string& url, uint64_t bytes, const char* mode = "relay",
-                      uint64_t spanUs = 0, uint64_t originSize = 0, uint64_t window = 0);
+                      uint64_t spanUs = 0, uint64_t originSize = 0);
   // The CLI opens a store only to read/mutate; suppress the destructor's stats
   // dump so `ucache` invocations don't litter stats/ with zero-counter lines.
   // Also drops the stats file the constructor reserved, while it is still

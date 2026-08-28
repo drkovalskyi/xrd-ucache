@@ -4,7 +4,6 @@ add_library(ucache-core STATIC
   CacheStore.cc
   Config.cc
   FileEntry.cc
-  Holdout.cc
   IOBackend.cc
   Log.cc
   MetaFile.cc
