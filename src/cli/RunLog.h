@@ -109,7 +109,15 @@ struct Run {
   bool baselineQualified() const {
     return originShare() >= kMinOriginShare && fillCost() <= kMaxFillCost;
   }
-  // Share of wall x threads spent on CPU; 0 when unknown.
+  // Average cores executing over the run: CPU time divided by wall. Absolute
+  // on purpose -- a SHARE needs a denominator, and threads_high_water counts
+  // every thread the process owns (TBB workers, XrdCl, ROOT), not the width
+  // the job was asked for, so a percentage against it reads about half what a
+  // user expects. Cores busy needs no such assumption: 6 cores on a 32-thread
+  // job is starving, 23 is working.
+  double coresBusy() const;
+  // Share of wall x threads spent on CPU. Only meaningful where the caller
+  // knows the intended width; prefer coresBusy() for display.
   double busy() const;
 };
 
@@ -187,5 +195,41 @@ Totals summarize(const std::vector<Run>& runs, size_t maxEstimates = 100);
 // is chosen from runs that precede `run` in time and actually fetched from
 // the origin.
 GainEstimate estimateGain(const Run& run, const std::vector<Run>& all);
+
+// One input set, across every run that used it. This is the view that answers
+// "is the cache of use to me": gain is a property of a WORKLOAD, not of a
+// cache, and a single aggregate hides the case that matters -- one dataset
+// gaining 2.8x while another loses. Keyed by the input signature, so grouping
+// needs nothing from the user.
+struct Dataset {
+  std::string sig;
+  size_t runs = 0, measured = 0;
+  size_t baselines = 0;          // runs usable as a reference for this set
+  size_t incomplete = 0;         // runs that left no cumulative line (killed,
+                                 // or still going) -- not a reason to advise
+                                 // anything, they simply have not finished
+  size_t files = 0;              // distinct files, the largest run's set
+  size_t dirs = 0;               // distinct directories the inputs live in
+  uint64_t originSize = 0;       // the input set's size at the origin
+  uint64_t readBytes = 0;        // summed over its runs
+  uint64_t measuredBytes = 0;    // ... over the runs that got a gain: coverage
+                                 // by VOLUME, which run counts misrepresent
+  std::map<std::string, uint64_t> hosts; // origin host -> file count
+  // Aggregated per tier, by summed walls rather than averaged ratios: a mean
+  // of ratios weights a two-minute run like a two-hour one.
+  double byteWall = 0.0, byteSaved = 0.0;
+  double replWall = 0.0, replSaved = 0.0;
+  size_t byteRuns = 0, replRuns = 0;
+
+  bool haveByte() const { return byteRuns && byteWall > 0.0; }
+  bool haveRepl() const { return replRuns && replWall > 0.0; }
+  double gainByte() const { return (byteWall + byteSaved) / byteWall; }
+  double gainRepl() const { return (replWall + replSaved) / replWall; }
+  std::string topHost() const;
+};
+
+// Group runs by input signature, newest-first within each. `maxEstimates`
+// caps the gain estimation as in summarize().
+std::vector<Dataset> byDataset(const std::vector<Run>& runs, size_t maxEstimates = 100);
 
 } // namespace ucache

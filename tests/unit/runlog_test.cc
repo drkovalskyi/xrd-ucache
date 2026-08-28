@@ -22,13 +22,14 @@ struct FileLine {
   std::string key;
   uint64_t served = 0, replica = 0, wire = 0, ts = 0;
   uint64_t spanUs = 0;
+  uint64_t originSize = 0;
   std::string mode;
   // A constructor rather than an aggregate: the trailing fields arrived later
   // and every existing five-argument call site should keep compiling.
   FileLine(std::string k, uint64_t s = 0, uint64_t r = 0, uint64_t w = 0, uint64_t t = 0,
-           uint64_t sp = 0, std::string m = {})
+           uint64_t sp = 0, std::string m = {}, uint64_t osz = 0)
       : key(std::move(k)), served(s), replica(r), wire(w), ts(t), spanUs(sp),
-        mode(std::move(m)) {}
+        originSize(osz), mode(std::move(m)) {}
 };
 
 // One process's pair of files, as the store would have left them.
@@ -50,7 +51,8 @@ void writeRun(const std::string& dir, const std::string& host, uint64_t pid, uin
       << ",\"replica_bytes\":" << f.replica
       << ",\"disk_reads\":1,\"disk_seq\":0,\"disk_bytes\":" << f.served
       << ",\"first_touch_bytes\":" << f.served << ",\"wire_bytes\":" << f.wire
-      << ",\"span_us\":" << f.spanUs << ",\"mode\":\"" << f.mode << "\"}\n";
+      << ",\"span_us\":" << f.spanUs << ",\"origin_size\":"
+      << (f.originSize ? f.originSize : f.served) << ",\"mode\":\"" << f.mode << "\"}\n";
 }
 
 constexpr uint64_t kGiB = 1ull << 30;
@@ -391,3 +393,119 @@ TEST(RunLog, ReadsTheHistoryDirectoryAndDedupsByStem) {
   EXPECT_EQ(runs[1].hitBytes, kGiB); // live copy won over the stale duplicate
 }
 
+// ---------------------------------------------------------------------------
+// Identity and baseline qualification. A run is only comparable with another
+// that did the same work, and only usable as a reference when it was close
+// enough to a pure direct run -- bounded on BOTH deviations, because they push
+// the answer opposite ways.
+// ---------------------------------------------------------------------------
+
+TEST(Signature, SameFilesAgreeAndAShortRunDoesNot) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, fillCounters(kGiB),
+           {{"root://o//a", kGiB}, {"root://o//b", kGiB}});
+  writeRun(d.path(), "h", 2, 2000, 2100, fillCounters(kGiB),
+           {{"root://o//b", kGiB}, {"root://o//a", kGiB}}); // same set, other order
+  writeRun(d.path(), "h", 3, 3000, 3100, fillCounters(kGiB),
+           {{"root://o//a", kGiB}}); // died early: a DIFFERENT input set
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 3u);
+  std::map<uint64_t, std::string> sig;
+  for (const auto& r : runs)
+    sig[r.pid] = r.sig;
+  EXPECT_FALSE(sig[1].empty());
+  EXPECT_EQ(sig[1], sig[2]) << "order of opening must not change the signature";
+  EXPECT_NE(sig[1], sig[3]) << "a truncated run opened fewer files and is not comparable";
+}
+
+TEST(Signature, OriginHostComesFromTheUrl) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, fillCounters(kGiB),
+           {{"root://siteA:1094//a", kGiB}, {"root://siteA:1094//b", kGiB},
+            {"root://siteB:1094//c", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_EQ(runs[0].topOriginHost(), "siteA");
+  EXPECT_EQ(runs[0].originHosts.size(), 2u);
+}
+
+TEST(Baseline, OriginShareIsWeightedByOriginSize) {
+  test::TempDir d;
+  // One big file from the origin, one small one served from cache: by FILE
+  // COUNT that is 50%, by origin-equivalent bytes it is 90%. Bytes is the
+  // honest weight -- a file's cost is its size, not its existence.
+  writeRun(d.path(), "h", 1, 1000, 1100, fillCounters(9 * kGiB),
+           {{"root://o//big", 0, 0, 9 * kGiB, 0, 0, "relay", 9 * kGiB},
+            {"root://o//small", kGiB, 0, 0, 0, 0, "cached", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NEAR(runs[0].originShare(), 0.9, 0.01);
+}
+
+TEST(Baseline, FillCostIsThreadNormalised) {
+  test::TempDir d;
+  // 300 s of stall over a 100 s run at 32 threads is 9.4% of the machine, not
+  // 300% of the wall. The counter sums across threads: without the division
+  // every run looks like a runaway fill and the test never discriminates.
+  writeRun(d.path(), "h", 1, 1000, 1100,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":300000000,\"threads_high_water\":32",
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NEAR(runs[0].fillCost(), 0.094, 0.005);
+  EXPECT_FALSE(runs[0].baselineQualified()) << "9.4% fill cost is over the 5% bound";
+}
+
+TEST(Baseline, AQuietFillQualifiesAndALoudOneDoesNot) {
+  test::TempDir d;
+  // Both are ~100% origin-served, so coverage alone cannot separate them --
+  // which is why the write-side bound exists. Checked against recorded
+  // campaigns: 0.3% (wall 1.01x its direct reference) vs 17.2% (2.49x).
+  writeRun(d.path(), "h", 1, 1000, 1100,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":9600000,\"threads_high_water\":32",
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":550000000,\"threads_high_water\":32",
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 2u);
+  for (const auto& r : runs) {
+    EXPECT_NEAR(r.originShare(), 1.0, 0.01) << "both are origin-served";
+    if (r.pid == 1)
+      EXPECT_TRUE(r.baselineQualified());
+    else
+      EXPECT_FALSE(r.baselineQualified());
+  }
+}
+
+TEST(Baseline, CoresBusyNeedsNoThreadCount) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100,
+           fillCounters(kGiB) + ",\"cpu_us\":640000000", // 640 s over a 100 s wall
+           {{"root://o//a", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NEAR(runs[0].coresBusy(), 6.4, 0.05);
+}
+
+TEST(Datasets, GroupedBySignatureAndCoverageIsByVolume) {
+  test::TempDir d;
+  // Two input sets. The second has one tiny run and one large one; counting
+  // runs would call it half measured, counting BYTES says otherwise.
+  writeRun(d.path(), "h", 1, 1000, 1100, fillCounters(kGiB),
+           {{"root://o//a", kGiB}, {"root://o//b", kGiB}});
+  writeRun(d.path(), "h", 2, 2000, 2100, fillCounters(kGiB), {{"root://o//c", kGiB}});
+  const auto runs = loadRuns(d.path());
+  const auto sets = byDataset(runs);
+  ASSERT_EQ(sets.size(), 2u);
+  size_t twoFile = 0, oneFile = 0;
+  for (const auto& s : sets) {
+    if (s.files == 2)
+      ++twoFile;
+    if (s.files == 1)
+      ++oneFile;
+    EXPECT_FALSE(s.sig.empty());
+  }
+  EXPECT_EQ(twoFile, 1u);
+  EXPECT_EQ(oneFile, 1u);
+}

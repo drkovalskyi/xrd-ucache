@@ -501,12 +501,90 @@ double Run::fillCost() const {
   return (static_cast<double>(bufferStallUs) / 1e6) / denom;
 }
 
+double Run::coresBusy() const {
+  if (!cpuUs)
+    return 0.0;
+  return (static_cast<double>(cpuUs) / 1e6) / static_cast<double>(durationS());
+}
+
 double Run::busy() const {
   const uint64_t threads = threadsHighWater ? threadsHighWater : 0;
   if (!cpuUs || !threads)
     return 0.0;
   const double denom = static_cast<double>(durationS()) * static_cast<double>(threads);
   return denom > 0.0 ? (static_cast<double>(cpuUs) / 1e6) / denom : 0.0;
+}
+
+
+std::string Dataset::topHost() const {
+  const std::string* best = nullptr;
+  uint64_t n = 0;
+  for (const auto& [h, c] : hosts)
+    if (c > n) {
+      n = c;
+      best = &h;
+    }
+  return best ? *best : std::string();
+}
+
+std::vector<Dataset> byDataset(const std::vector<Run>& runs, size_t maxEstimates) {
+  std::map<std::string, Dataset> by;
+  size_t estimated = 0;
+  for (const auto& r : runs) {
+    if (r.sig.empty())
+      continue;
+    Dataset& d = by[r.sig];
+    d.sig = r.sig;
+    ++d.runs;
+    if (!r.complete)
+      ++d.incomplete;
+    if (r.disabled || r.baselineQualified())
+      ++d.baselines;
+    d.readBytes += r.servedBytes;
+    if (r.files.size() > d.files) {
+      // Take the identity from the most complete run: a truncated run has its
+      // own signature, so anything grouped here saw the same set.
+      d.files = r.files.size();
+      d.hosts = r.originHosts;
+      std::set<std::string> dirs;
+      uint64_t osz = 0;
+      for (const auto& [k, f] : r.files) {
+        osz += f.originSize;
+        const auto slash = k.rfind('/');
+        dirs.insert(slash == std::string::npos ? k : k.substr(0, slash));
+      }
+      d.dirs = dirs.size();
+      d.originSize = osz;
+    }
+    if (r.disabled || estimated >= maxEstimates)
+      continue;
+    ++estimated;
+    const GainEstimate g = estimateGain(r, runs);
+    if (!g.valid)
+      continue;
+    ++d.measured;
+    d.measuredBytes += r.servedBytes;
+    // Which tier did the work? The replica tier serves recompressed bytes, so
+    // a run that used it at all is not comparable with a byte-tier run.
+    if (r.replicaBytesServed > r.hitBytes) {
+      d.replWall += static_cast<double>(r.durationS());
+      d.replSaved += g.savedS;
+      ++d.replRuns;
+    } else {
+      d.byteWall += static_cast<double>(r.durationS());
+      d.byteSaved += g.savedS;
+      ++d.byteRuns;
+    }
+  }
+  std::vector<Dataset> out;
+  out.reserve(by.size());
+  for (auto& [k, d] : by) {
+    (void)k;
+    out.push_back(std::move(d));
+  }
+  std::sort(out.begin(), out.end(),
+            [](const Dataset& a, const Dataset& b) { return a.readBytes > b.readBytes; });
+  return out;
 }
 
 } // namespace ucache

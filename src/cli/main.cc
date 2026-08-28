@@ -941,6 +941,14 @@ double mbPerS(uint64_t bytes, uint64_t seconds) {
   return seconds ? static_cast<double>(bytes) / static_cast<double>(seconds) / 1e6 : 0.0;
 }
 
+// Volumes and rates are DECIMAL here (GB, GB/s), not powers of two: the run
+// table puts them next to each other, and mixing GiB with GB/s makes a reader
+// do arithmetic to check a rate against a volume.
+double gb(uint64_t bytes) { return static_cast<double>(bytes) / 1e9; }
+double gbPerS(uint64_t bytes, uint64_t seconds) {
+  return seconds ? gb(bytes) / static_cast<double>(seconds) : 0.0;
+}
+
 // What the run label should say. Deliberately not a percentage: "warm" and
 // "fill" are the two states a user acts on differently.
 const char* runKind(const Run& r) {
@@ -1000,23 +1008,23 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::printf("null},\"runs\":[");
   } else {
-    std::printf("%-16s %8s %7s %10s %10s %10s  %-18s %6s %s\n", "WHEN", "DUR", "FILES",
-                "SERVED", "ORIGIN", "RATE", "BYTE/REPL/RELAY", "FAULTS", "GAIN");
-    char allTiers[32], allRate[16], allGain[16], allWhen[24];
-    std::snprintf(allTiers, sizeof allTiers, "%.0f%%/%.0f%%/%.0f%%",
-                  pct(t.hitBytes, tServed), pct(t.replicaBytes, tServed),
-                  pct(t.relayBytes, tServed));
-    std::snprintf(allRate, sizeof allRate, "%.0f MB/s",
-                  mbPerS(tServed + t.originBytes, t.durationS));
+    std::printf("%-16s %-7s %-6s %3s %6s %8s  %-18s %10s %7s %8s %6s %4s %7s\n",
+                "WHEN", "DUR", "SIG", "THR", "FILES", "READ GB",
+                "ORIG/BYTE/REPL/RLY", "RATE GB/s", "INS T", "INS/s G", "CORES", "WR%",
+                "GAIN");
+    char allTiers[32], allGain[16], allWhen[24];
+    const uint64_t allTotal = tServed + t.originBytes;
+    std::snprintf(allTiers, sizeof allTiers, "%4.0f/%4.0f/%4.0f/%3.0f",
+                  pct(t.originBytes, allTotal), pct(t.hitBytes, allTotal),
+                  pct(t.replicaBytes, allTotal), pct(t.relayBytes, allTotal));
     if (t.haveGain)
-      std::snprintf(allGain, sizeof allGain, "%.2fx", t.gain);
+      std::snprintf(allGain, sizeof allGain, "%6.2fx", t.gain);
     else
-      std::snprintf(allGain, sizeof allGain, "-");
+      std::snprintf(allGain, sizeof allGain, "%7s", "-");
     std::snprintf(allWhen, sizeof allWhen, "ALL (%zu runs)", t.runs);
-    std::printf("%-16s %8s %7zu %10s %10s %10s  %-18s %6llu %s\n", allWhen,
-                humanDur(t.durationS).c_str(), t.distinctFiles, human(tServed).c_str(),
-                human(t.originBytes).c_str(), allRate, allTiers,
-                (unsigned long long)t.faults, allGain);
+    std::printf("%-16s %-7s %-6s %3s %6zu %8.1f  %-18s %10s %7s %8s %6s %4s %7s\n", allWhen,
+                humanDur(t.durationS).c_str(), "", "", t.distinctFiles, gb(allTotal),
+                allTiers, "", "", "", "", "", allGain);
     if (t.haveGain)
       std::printf("%-16s %zu of %zu runs measured vs baseline: took %s, no cache would "
                   "have taken about %s — %s %s\n",
@@ -1028,51 +1036,83 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     if (t.gainCapped)
       std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
                   "estimate)\n", "", t.gainCapped);
-    std::printf("%-16s %8s %7s %10s %10s %10s  %-18s %6s %s\n", "----", "----", "-----",
-                "------", "------", "----", "---------------", "------", "----");
+    std::printf("%-16s %-7s %-6s %3s %6s %8s  %-18s %10s %7s %8s %6s %4s %7s\n", "----",
+                "----", "----", "---", "-----", "-------", "------------------",
+                "---------", "-----", "-------", "-----", "---", "------");
   }
 
   for (size_t i = 0; i < shown; ++i) {
     const Run& r = runs[i];
     const uint64_t total = r.hitBytes + r.replicaBytesServed + r.relayBytes;
-    const double pb = total ? 100.0 * static_cast<double>(r.hitBytes) / static_cast<double>(total) : 0.0;
-    const double pr = total ? 100.0 * static_cast<double>(r.replicaBytesServed) / static_cast<double>(total) : 0.0;
-    const double pl = total ? 100.0 * static_cast<double>(r.relayBytes) / static_cast<double>(total) : 0.0;
     const GainEstimate g = estimateGain(r, runs);
     if (asJson) {
       std::printf("%s{\"start\":%llu,\"duration_s\":%llu,\"host\":\"%s\",\"pid\":%llu,"
                   "\"kind\":\"%s\",\"files\":%llu,\"served_bytes\":%llu,"
                   "\"origin_bytes\":%llu,\"hit_bytes\":%llu,\"replica_bytes\":%llu,"
-                  "\"relay_bytes\":%llu,\"faults\":%llu,\"gain\":",
+                  "\"relay_bytes\":%llu,\"faults\":%llu,\"sig\":\"%s\","
+                  "\"threads\":%llu,\"cpu_us\":%llu,\"instructions\":%llu,"
+                  "\"cycles\":%llu,\"origin_share\":%.3f,\"fill_cost\":%.4f,\"gain\":",
                   i ? "," : "", (unsigned long long)r.startS,
                   (unsigned long long)r.durationS(), r.host.c_str(),
                   (unsigned long long)r.pid, runKind(r),
                   (unsigned long long)r.files.size(), (unsigned long long)r.servedBytes,
                   (unsigned long long)r.originBytes, (unsigned long long)r.hitBytes,
                   (unsigned long long)r.replicaBytesServed,
-                  (unsigned long long)r.relayBytes, (unsigned long long)r.faults());
+                  (unsigned long long)r.relayBytes, (unsigned long long)r.faults(),
+                  r.sig.c_str(), (unsigned long long)r.threadsHighWater,
+                  (unsigned long long)r.cpuUs, (unsigned long long)r.instructions,
+                  (unsigned long long)r.cycles, r.originShare(), r.fillCost());
       if (g.valid)
         std::printf("%.3f,\"gain_source\":\"baseline\"}", g.gain);
       else
         std::printf("null,\"gain_source\":null}");
       continue;
     }
+    // GAIN carries three things and no more: a measured number, `base` for a
+    // run that IS the reference, or `-`. Why a run has no number belongs in
+    // --detail, not in a column a reader scans.
     char gainCell[16];
     if (g.valid)
-      std::snprintf(gainCell, sizeof gainCell, "%.2fx", g.gain);
-    else if (r.disabled)
-      std::snprintf(gainCell, sizeof gainCell, "base");
+      std::snprintf(gainCell, sizeof gainCell, "%6.2fx", g.gain);
+    else if (r.disabled || r.baselineQualified())
+      std::snprintf(gainCell, sizeof gainCell, "%7s", "base");
     else
-      std::snprintf(gainCell, sizeof gainCell, "%s",
-                    r.originBytes && r.cacheBytes() == 0 ? "fill" : "-");
+      std::snprintf(gainCell, sizeof gainCell, "%7s", "-");
+    const uint64_t rowTotal = total + r.originBytes;
     char tiers[32];
-    std::snprintf(tiers, sizeof tiers, "%.0f%%/%.0f%%/%.0f%%", pb, pr, pl);
-    char rate[16];
-    std::snprintf(rate, sizeof rate, "%.0f MB/s", mbPerS(total + r.originBytes, r.durationS()));
-    std::printf("%-16s %8s %7zu %10s %10s %10s  %-18s %6llu %s\n", stamp(r.startS).c_str(),
-                humanDur(r.durationS()).c_str(), r.files.size(), human(total).c_str(),
-                human(r.originBytes).c_str(), rate, tiers,
-                (unsigned long long)r.faults(), gainCell);
+    std::snprintf(tiers, sizeof tiers, "%4.0f/%4.0f/%4.0f/%3.0f",
+                  pct(r.originBytes, rowTotal), pct(r.hitBytes, rowTotal),
+                  pct(r.replicaBytesServed, rowTotal), pct(r.relayBytes, rowTotal));
+    // Work done, and the split of the wall. STL is a REMAINDER -- read waiting
+    // plus any serial phase -- and is labelled as one wherever it is explained.
+    char insT[16], insRate[16], cpuSplit[16];
+    if (r.instructions) {
+      std::snprintf(insT, sizeof insT, "%7.2f", r.instructions / 1e12);
+      std::snprintf(insRate, sizeof insRate, "%8.1f",
+                    r.instructions / 1e9 / static_cast<double>(r.durationS()));
+    } else {
+      std::snprintf(insT, sizeof insT, "%7s", "-");
+      std::snprintf(insRate, sizeof insRate, "%8s", "-");
+    }
+    if (r.cpuUs)
+      std::snprintf(cpuSplit, sizeof cpuSplit, "%6.1f", r.coresBusy());
+    else
+      std::snprintf(cpuSplit, sizeof cpuSplit, "%6s", "-");
+    char wrCell[16];
+    if (r.threadsHighWater && r.bufferStallUs)
+      std::snprintf(wrCell, sizeof wrCell, "%4.1f", 100.0 * r.fillCost());
+    else
+      std::snprintf(wrCell, sizeof wrCell, "%4s", "-");
+    char thr[24];
+    if (r.threadsHighWater)
+      std::snprintf(thr, sizeof thr, "%3llu", (unsigned long long)r.threadsHighWater);
+    else
+      std::snprintf(thr, sizeof thr, "%3s", "-");
+    std::printf("%-16s %-7s %-6s %3s %6zu %8.1f  %-18s %10.3f %7s %8s %6s %4s %7s\n",
+                stamp(r.startS).c_str(), humanDur(r.durationS()).c_str(),
+                r.sig.empty() ? "-" : r.sig.c_str(), thr, r.files.size(), gb(rowTotal),
+                tiers, gbPerS(rowTotal, r.durationS()), insT, insRate, cpuSplit, wrCell,
+                gainCell);
   }
   if (asJson)
     std::puts("]}");
@@ -1162,9 +1202,10 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   // answers "is this cache worth having", which is the question being asked.
   const Totals t = summarize(runs);
   if (t.runs) {
-    std::printf("overall    : %zu run(s) recorded — %s served from cache, %s from the "
+    std::printf("overall    : %zu run(s) recorded — %.1f GB read, %.1f GB from the "
                 "origin\n",
-                t.runs, human(t.cacheBytes()).c_str(), human(t.originBytes).c_str());
+                t.runs, gb(t.cacheBytes() + t.relayBytes + t.originBytes),
+                gb(t.originBytes));
     // TIME, not a ratio. A ratio across runs of different lengths is an average
     // nobody experienced; seconds add up honestly and answer the question that
     // was actually asked, which is whether the work went faster.
@@ -1198,10 +1239,61 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
       std::printf("  health   : OK — no faults in any recorded run\n");
   }
 
-  std::printf("cache      : %s — %zu entries, %s on disk", cfg.cacheDir.c_str(),
-              entries.size(), human(used + replicaTotal).c_str());
-  if (cfg.minFreeBytes)
-    std::printf(", %s headroom", headroom ? human(headroom).c_str() : "NO");
+  // BY DATASET. Gain is a property of a workload, not of a cache: one input
+  // set can gain 2.8x while another loses, and a single aggregate hides
+  // exactly the case a user needs to act on. Grouped by input signature, so
+  // nothing has to be labelled by hand.
+  const auto sets = byDataset(runs);
+  if (sets.size() > 1 || (sets.size() == 1 && t.runs > 1)) {
+    std::puts("\nby dataset");
+    for (const auto& d : sets) {
+      char hosts[96];
+      if (d.hosts.size() <= 1)
+        std::snprintf(hosts, sizeof hosts, "%s", d.topHost().c_str());
+      else
+        std::snprintf(hosts, sizeof hosts, "%s +%zu site(s)", d.topHost().c_str(),
+                      d.hosts.size() - 1);
+      std::printf("  %-6s %6zu files  %9.1f GB at origin  %3zu dir(s)  %s\n", d.sig.c_str(),
+                  d.files, gb(d.originSize), d.dirs, hosts);
+      // Coverage by VOLUME, not by run count: an aborted 17-second run and a
+      // 700 GB campaign are one run each and nothing alike.
+      const double covered =
+          d.readBytes ? 100.0 * static_cast<double>(d.measuredBytes) /
+                            static_cast<double>(d.readBytes)
+                      : 0.0;
+      char byteCell[16], replCell[16];
+      if (d.haveByte())
+        std::snprintf(byteCell, sizeof byteCell, "%.2fx", d.gainByte());
+      else
+        std::snprintf(byteCell, sizeof byteCell, "%s", "-");
+      if (d.haveRepl())
+        std::snprintf(replCell, sizeof replCell, "%.2fx", d.gainRepl());
+      else
+        std::snprintf(replCell, sizeof replCell, "%s", "-");
+      std::printf("         %3zu run(s), %zu measured (%.0f%% of GB)   %9.1f GB read   "
+                  "gain  byte %-7s repl %-7s\n",
+                  d.runs, d.measured, covered, gb(d.readBytes), byteCell, replCell);
+      if (!d.measured && d.baselines)
+        std::printf("         a baseline is recorded; no comparable run to measure "
+                    "against it yet\n");
+      else if (!d.measured && d.incomplete == d.runs)
+        std::printf("         no finished run yet\n");
+      else if (!d.measured)
+        std::printf("         no baseline — run these inputs once with UCACHE_DISABLE=1 "
+                    "and every later run on them is measured\n");
+    }
+    std::putchar('\n');
+  }
+
+  std::printf("cache      : %s — %zu entries, %.1f GB on disk (%.1f byte + %.1f replica)",
+              cfg.cacheDir.c_str(), entries.size(), gb(used + replicaTotal), gb(used),
+              gb(replicaTotal));
+  if (cfg.minFreeBytes) {
+    if (headroom)
+      std::printf(", %.1f GB headroom", gb(headroom));
+    else
+      std::printf(", NO headroom");
+  }
   std::putchar('\n');
 
   if (!detail) {
