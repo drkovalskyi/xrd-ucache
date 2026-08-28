@@ -1,5 +1,8 @@
 #include "CpuCounters.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -66,6 +69,25 @@ uint64_t CpuCounters::instructions() const { return 0; }
 uint64_t CpuCounters::cycles() const { return 0; }
 
 #endif
+
+uint64_t CpuCounters::liveThreads() {
+#if defined(__linux__)
+  FILE* f = ::fopen("/proc/self/status", "re");
+  if (!f)
+    return 0;
+  char buf[256];
+  uint64_t n = 0;
+  while (::fgets(buf, sizeof buf, f))
+    if (::strncmp(buf, "Threads:", 8) == 0) {
+      n = ::strtoull(buf + 8, nullptr, 10);
+      break;
+    }
+  ::fclose(f);
+  return n;
+#else
+  return 0;
+#endif
+}
 
 uint64_t CpuCounters::processCpuUs() {
   struct rusage ru;

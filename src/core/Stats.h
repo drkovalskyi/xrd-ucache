@@ -97,6 +97,10 @@ struct Stats {
   // at one width says little about another: runs are only pooled across time
   // when this agrees, and a change in it is what re-arms measurement.
   std::atomic<uint64_t> handlesHighWater{0};
+  // Most threads alive in this process at any sampled moment. A run's wall is
+  // only interpretable against the width it ran at, and CPU time divided by
+  // wall x this is the share of the machine that was actually computing.
+  std::atomic<uint64_t> threadsHighWater{0};
   Histogram hitReadUs;
   Histogram missReadUs;
   Histogram originRtUs;
@@ -133,7 +137,7 @@ struct StatsTotals {
            replicaOpens = 0, replicaPublished = 0, replicaInvalid = 0, replicaCrcFailures = 0,
            replicaPunchedBytes = 0, replicaOrphansSwept = 0;
   // Workflow counters:
-  uint64_t handlesHighWater = 0;
+  uint64_t handlesHighWater = 0, threadsHighWater = 0;
   uint64_t filesOpened = 0, ramHitBytes = 0, firstTouchBytes = 0, hitDiskReads = 0,
            hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
            replicaReadBytes = 0, relayBytes = 0,

@@ -49,6 +49,12 @@ class CpuCounters {
   // available, and covers the whole process rather than only our lifetime.
   static uint64_t processCpuUs();
 
+  // Threads alive in this process right now (/proc/self/status). 0 where
+  // unavailable. Sampled while the run is active rather than at exit, because
+  // by exit the pool has wound down and the peak is what a wall must be
+  // divided by to mean anything.
+  static uint64_t liveThreads();
+
  private:
   int insFd_ = -1;
   int cycFd_ = -1;

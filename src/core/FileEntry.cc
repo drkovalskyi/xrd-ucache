@@ -1,5 +1,7 @@
 #include "FileEntry.h"
 
+#include "CpuCounters.h"
+
 
 #include "Log.h"
 #include "Trace.h"
@@ -101,6 +103,15 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
   stats.opens.fetch_add(1, std::memory_order_relaxed);
   // The span starts HERE, not at first read: opening is part of what a file
   // costs, and a file read exactly once would otherwise have no span at all.
+  // Sample the process width while the run is active: at exit the pool has
+  // wound down, and the peak is what the wall must be divided by.
+  {
+    const uint64_t n = CpuCounters::liveThreads();
+    uint64_t prev = stats.threadsHighWater.load(std::memory_order_relaxed);
+    while (n > prev &&
+           !stats.threadsHighWater.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+    }
+  }
   e->noteActivity();
   return e;
 }
