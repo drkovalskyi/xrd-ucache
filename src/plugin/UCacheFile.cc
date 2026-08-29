@@ -409,8 +409,15 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
     // coordinates: relocated data lands past the end of the file and is
     // dropped, data still in place lands correctly, and the result is a
     // confident partial answer that matches no other route.
-    if (!view->hasOriginMap())
+    if (!view->hasOriginMap()) {
+      // Poisoned, not merely skipped. The footprint is shared across every
+      // handle on this file for the life of the process, so returning here
+      // would leave whatever a v1 open of the same file contributed -- and
+      // that gets emitted as a confident signature describing part of the
+      // work. Partial and confident is worse than absent.
+      entry->footprint().poison();
       return;
+    }
     std::vector<ReplicaMeta::Range> orig;
     view->originRanges(off, len, orig);
     for (const auto& r : orig)
@@ -1645,8 +1652,14 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   auto entry = ensureEntry();
   if (entry)
     noteRequestBytes(st_, size);
-  noteAppRead(st_, entry, currentView(), offset, size);
-  if (auto view = currentView(); entry && view) {
+  // ONE sample of the view, used for both. Taking it twice is not merely
+  // wasteful: a replica published between the two calls has the footprint
+  // recorded in the original file's coordinates and the read served in the
+  // replica's, which produces a WRONG signature rather than an absent one --
+  // and a wrong signature is evidence, so it is worse than none.
+  auto view = currentView();
+  noteAppRead(st_, entry, view, offset, size);
+  if (entry && view) {
     // Stitched entry: serve on the executor — overlay + v1
     // cache locally, residual original sub-ranges via the miss machinery.
     if (offset + size < offset) { // overflow: not a request we can reason about
@@ -1791,8 +1804,14 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
   // default -- signed only whatever it happened to fetch through Read, so the
   // same work looked different depending on which call the reader chose. The
   // in-flight count and the width sample were missing for the same reason.
-  noteAppRead(st_, entry, currentView(), offset, size);
-  if (auto view = currentView(); entry && view) {
+  // ONE sample of the view, used for both. Taking it twice is not merely
+  // wasteful: a replica published between the two calls has the footprint
+  // recorded in the original file's coordinates and the read served in the
+  // replica's, which produces a WRONG signature rather than an absent one --
+  // and a wrong signature is evidence, so it is worse than none.
+  auto view = currentView();
+  noteAppRead(st_, entry, view, offset, size);
+  if (entry && view) {
     if (offset + size < offset) { // overflow
       noteRelayBytes(st_, size, offset, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
@@ -1857,11 +1876,13 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
-  {
-    const auto view = currentView();
-    for (const auto& c : chunks)
-      noteAppRead(st_, entry, view, c.offset, c.length);
-  }
+  // ONE sample, for the footprint AND the serving decision below. The loop had
+  // its own and the decision took another, so a replica published between them
+  // recorded the chunks in the original file's coordinates and served them in
+  // the replica's -- a WRONG signature rather than an absent one.
+  auto view = currentView();
+  for (const auto& c : chunks)
+    noteAppRead(st_, entry, view, c.offset, c.length);
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {
     noteRelayChunks(st_, chunks);
@@ -1870,7 +1891,7 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     });
   }
 
-  if (auto view = currentView()) {
+  if (view) {
     // Stitched entry: whole vector served on the executor.
     for (const auto& c : chunks)
       if (c.length == 0 || c.offset + c.length > view->virtualSize()) {

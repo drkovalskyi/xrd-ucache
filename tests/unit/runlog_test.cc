@@ -738,20 +738,114 @@ TEST(ReadAgreement, FilesWithoutAFootprintCountForNeitherSide) {
   EXPECT_TRUE(gainOfWarm(d.path()).valid);
 }
 
-TEST(ReadAgreement, UnknownFilesCannotDiluteADisagreement) {
-  // ONE file has signatures and they disagree; nineteen carry none. Counting
-  // the unknown ones as agreement would read 95% and admit the comparison on
-  // the strength of files nobody has any evidence about -- while the only file
-  // that CAN be checked says the work differed. Excluded, this reads 0%.
-  // The ratio is chosen to land on the far side of the threshold: a test where
-  // both readings refuse anyway would pin nothing.
+TEST(ReadAgreement, ABaselineThatSignsNothingIsNotSilentlyTrusted) {
+  // THE dangerous shape. The work-identity check needs a signature from BOTH
+  // runs, so if one side signs nothing there are no pairs at all -- and a rule
+  // that only runs "when there are pairs" does not run, silently, leaving the
+  // walls compared on file names alone.
+  //
+  // It is reachable on the BASELINE in particular: a run with the cache
+  // switched off never populates the file sizes the signature is expressed in,
+  // so one bad teardown can leave a whole baseline unsigned. Every later run
+  // is then measured against it with nothing checked, and reports a gain.
   test::TempDir d;
   std::vector<FileLine> base, warm;
   for (size_t i = 0; i < 20; ++i) {
     const std::string key = "root://o//f" + std::to_string(i);
-    const bool known = i < 1;
-    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, known ? "aaaa" : ""));
-    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, known ? "bbbb" : ""));
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, "")); // signs nothing
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, "aaaa"));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
+  writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
+           warm);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_FALSE(g.valid) << "gain " << g.gain;
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kReadUnverified);
+  // The refusal has to name the cause, or the remedy is a guess: this is not
+  // "no baseline" and not "different files", which have different fixes.
+  EXPECT_NE(g.reason.find("could be checked"), std::string::npos) << g.reason;
+}
+
+TEST(ReadAgreement, OneCheckableFileCannotVouchForFourHundred) {
+  // A single agreeing pair used to admit a comparison over any number of
+  // matched files. That is the same defect the agreement rule exists to
+  // prevent, one level up: agreement measured over the one file that happens
+  // to be checkable says nothing about the other three hundred and ninety.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < 400; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    const std::string sig = i < 1 ? "aaaa" : ""; // one checkable pair, and it AGREES
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, sig));
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, sig));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
+  writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
+           warm);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_FALSE(g.valid) << "one agreeing pair is not evidence about 400 files";
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kReadUnverified);
+}
+
+TEST(ReadAgreement, RecordsFromBeforeSignaturesExistedStillMeasureButSaySo) {
+  // Neither side signs anything, which is every record written before the
+  // footprint existed. Refusing those would retire every measurement taken
+  // before the feature, so they are still compared -- but the estimate must
+  // not imply a check happened. A reader who cannot tell the difference
+  // between "verified" and "unverifiable" has been told the stronger thing.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < 20; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, ""));
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, ""));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
+  writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
+           warm);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_FALSE(g.workVerified) << "nothing signed, so nothing was verified";
+  EXPECT_EQ(g.sigPairs, 0u);
+}
+
+TEST(ReadAgreement, AFullySignedComparisonReportsItselfVerified) {
+  // The other side of the same claim: when every file signs on both sides the
+  // check really did run, and the estimate says so. Without this the flag
+  // could be wired to a constant false and nothing would notice.
+  test::TempDir d;
+  writeAgreementPair(d.path(), 100, 0);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_TRUE(g.workVerified);
+  EXPECT_EQ(g.sigPairs, 100u);
+}
+
+TEST(ReadAgreement, UnknownFilesCannotDiluteADisagreement) {
+  // Half the files carry signatures; of those, 44 of 50 agree, so agreement
+  // reads 88% and the comparison is refused. Counting the 50 unknown files as
+  // agreement would read 94% and admit it -- on the strength of files nobody
+  // has any evidence about.
+  //
+  // The ratios are picked to sit on OPPOSITE sides of the threshold, so the
+  // test pins the choice rather than merely passing: a split where both
+  // readings refuse anyway would prove nothing. Coverage is exactly at the
+  // floor for the same reason -- the point here is dilution, and a shortage of
+  // checkable files is refused earlier by a different rule, which would make
+  // this a test of that rule instead.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < 100; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    const bool known = i < 50;
+    const bool differs = known && i < 6;
+    const std::string bs = known ? "aaaa" : "";
+    const std::string ws = known ? (differs ? "bbbb" : "aaaa") : "";
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, bs));
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, ws));
   }
   writeRun(d.path(), "h", 1, 1000, 1200,
            "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);

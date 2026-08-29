@@ -1317,7 +1317,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
         // baseline" bucket, which told the reader to go record a baseline that
         // would have changed nothing.
         size_t bases = 0, tooShort = 0, tooSmall = 0, filled = 0, readDiff = 0, noBase = 0,
-               other = 0;
+               unverified = 0, other = 0;
         // Each estimate walks every run, so this is quadratic and stops where
         // the headline's own count stops.
         size_t examined = 0;
@@ -1333,6 +1333,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
             case ucache::GainEstimate::Why::kTooSmall: ++tooSmall; break;
             case ucache::GainEstimate::Why::kIncomplete: ++other; break;
             case ucache::GainEstimate::Why::kReadDifferent: ++readDiff; break;
+            case ucache::GainEstimate::Why::kReadUnverified: ++unverified; break;
             case ucache::GainEstimate::Why::kNoBaseline: ++noBase; break;
           }
         }
@@ -1348,6 +1349,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
         add(tooShort, "under 30s");
         add(tooSmall, "moved too little data");
         add(readDiff, "read different work than the baseline");
+        add(unverified, "could not be checked against the baseline");
         add(noBase, "with no comparable baseline");
         add(other, "incomplete");
         if (examined < runs.size())

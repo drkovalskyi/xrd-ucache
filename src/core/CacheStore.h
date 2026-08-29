@@ -183,7 +183,14 @@ class CacheStore {
   //
   // Returns nullptr once the table is full. A signature that stops growing
   // would be a confident wrong answer, so the file records none at all --
-  // "unknown", which every reader already treats as no evidence.
+  // "unknown", which every reader already treats as no evidence. The entry
+  // enforces that by poisoning its private footprint when it is handed a null
+  // (see FileEntry::useSharedFootprint); for a while this header promised the
+  // behaviour and the entry quietly filled its own footprint instead.
+  //
+  // The cap is a bound on memory, and not a generous one: at a bucket per
+  // MiB, a table of 2 GiB files runs to tens of megabytes of bitmaps. It is
+  // sized to stop unbounded growth, not because the memory is negligible.
   ReadFootprint* footprintFor(const std::string& url);
   ReadFootprint& relayFootprint(const std::string& url); // legacy name, relay path
 
@@ -248,10 +255,15 @@ class CacheStore {
   CpuCounters cpu_;
   std::mutex relayFpMu_;
   std::map<std::string, std::unique_ptr<ReadFootprint>> relayFp_;
-  // One bitmap plus a key per distinct file this process touched. Small per
-  // file, but a long-lived server process touches an unbounded number of them,
-  // so it stops rather than grows for ever. The ceiling is far above any
-  // analysis job and far below anything that matters for memory.
+  // One bitmap plus a key per distinct file this process touched. A
+  // long-lived server process touches an unbounded number of them, so this
+  // stops rather than grows for ever.
+  //
+  // The ceiling is far above any analysis job. It is NOT negligible in memory,
+  // and an earlier note here saying so was wrong: at one bucket per MiB a
+  // 2 GiB file is 256 bytes of bitmap, and with the URL key and the map node
+  // each file costs a few hundred bytes, so a full table is on the order of a
+  // hundred megabytes. It is a bound on growth, not a free one.
   static constexpr size_t kMaxFootprints = 200000;
   std::mutex regMu_;
   std::map<std::string, std::weak_ptr<FileEntry>> registry_; // hash -> entry

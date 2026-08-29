@@ -240,8 +240,9 @@ struct GainEstimate {
     kTooShort,      // under the duration floor
     kTooSmall,      // too little data moved to divide
     kIncomplete,    // no per-file records, or nothing attributable
-    kReadDifferent, // a baseline exists but the two read different work
-    kNoBaseline,    // nothing recorded that could serve as a reference
+    kReadDifferent,  // a baseline exists but the two read different work
+    kReadUnverified, // too few of the compared files could be checked at all
+    kNoBaseline,     // nothing recorded that could serve as a reference
   };
   Why why = Why::kNoBaseline;
   bool valid = false;
@@ -251,6 +252,13 @@ struct GainEstimate {
   double cacheMBs = 0.0;      // rate this run delivered at
   uint64_t originEquivBytes = 0; // what the origin would have shipped, NOT bytes served
   uint64_t matchedFiles = 0, runFiles = 0;
+  // How many of the matched files BOTH runs left a read signature for, and
+  // whether that was enough to actually check that the two runs did the same
+  // work. False means the walls were compared on the strength of the file
+  // names alone -- true of records written before signatures existed, and
+  // worth saying rather than leaving a reader to assume the check ran.
+  uint64_t sigPairs = 0;
+  bool workVerified = false;
   uint64_t referenceStartS = 0;
   std::string reason;         // set whenever !valid; also worth printing when valid
 };

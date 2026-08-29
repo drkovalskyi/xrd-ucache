@@ -65,6 +65,21 @@ class ReadFootprint {
   std::string sig(uint64_t limitBytes = 0) const;
   bool empty() const;
   uint64_t count(uint64_t limitBytes = 0) const;
+
+  // Declare this file's footprint permanently UNKNOWN. Sticky, and it wins
+  // over anything recorded before or after.
+  //
+  // Skipping a read that cannot be expressed in the original file's
+  // coordinates is not enough, because a footprint outlives the handle that
+  // filled it: one process can read a file through a replica with no map
+  // (contributing nothing) and then through the byte tier (contributing its
+  // ranges), and what is emitted is a CONFIDENT signature covering part of the
+  // work. Partial and confident is the one answer worse than none -- an empty
+  // signature is treated as no evidence, while a partial one is compared and
+  // silently disagrees. Once any read on a file could not be translated, the
+  // file has nothing trustworthy to say for the rest of the process.
+  void poison();
+  bool poisoned() const;
   // Touched bucket indices, ascending. For diagnosis only: comparing two
   // signatures tells you THAT they differ, this tells you where.
   std::vector<uint64_t> buckets(uint64_t limitBytes = 0) const;
@@ -72,6 +87,7 @@ class ReadFootprint {
  private:
   mutable std::mutex mu_;
   std::vector<uint64_t> bits_;
+  bool poisoned_ = false;
 };
 
 } // namespace ucache

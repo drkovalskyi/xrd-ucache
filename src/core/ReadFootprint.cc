@@ -41,8 +41,20 @@ uint64_t lastBucket(uint64_t limitBytes) {
 }
 } // namespace
 
+void ReadFootprint::poison() {
+  std::lock_guard<std::mutex> g(mu_);
+  poisoned_ = true;
+}
+
+bool ReadFootprint::poisoned() const {
+  std::lock_guard<std::mutex> g(mu_);
+  return poisoned_;
+}
+
 uint64_t ReadFootprint::count(uint64_t limitBytes) const {
   std::lock_guard<std::mutex> g(mu_);
+  if (poisoned_)
+    return 0;
   const uint64_t last = lastBucket(limitBytes);
   uint64_t n = 0;
   for (size_t i = 0; i < bits_.size(); ++i) {
@@ -75,6 +87,8 @@ std::vector<uint64_t> ReadFootprint::buckets(uint64_t limitBytes) const {
 
 std::string ReadFootprint::sig(uint64_t limitBytes) const {
   std::lock_guard<std::mutex> g(mu_);
+  if (poisoned_)
+    return {};
   const uint64_t last = lastBucket(limitBytes);
   uint64_t h = 1469598103934665603ull;
   bool any = false;

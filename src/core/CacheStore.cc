@@ -838,8 +838,16 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
   // past the end routinely, and a signature that counts those bytes agrees
   // with no other route. Unknown is the honest answer, and every reader
   // already treats an empty signature as no evidence.
-  const std::string readSig = (fp && originSize) ? fp->sig(originSize) : std::string();
-  const uint64_t readBuckets = fp ? fp->count(originSize) : 0;
+  // BOTH are gated on the size, and for the same reason. A zero limit means
+  // "no limit" to the footprint, so counting with it counts the reader's
+  // overshoot past the end as though it were content -- which is exactly what
+  // the signature refuses to do. Gating only the signature let one record say
+  // `read_sig: "" , read_buckets: 4211`: no evidence and a confident count of
+  // it, in the same line. Consumers are told to prefer the record with the
+  // most buckets, so the unusable one won.
+  const bool sizeKnown = fp && originSize;
+  const std::string readSig = sizeKnown ? fp->sig(originSize) : std::string();
+  const uint64_t readBuckets = sizeKnown ? fp->count(originSize) : 0;
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its
   // wall must be divided by.

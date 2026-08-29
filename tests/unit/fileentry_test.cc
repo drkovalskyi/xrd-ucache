@@ -645,3 +645,41 @@ TEST(FileEntry, ObservabilityCountersTrackFlushRuns) {
   e2->writePages(0, big.size(), big.data());
   EXPECT_GE(fx2.stats.bufferStalls.load(), 1u);
 }
+
+TEST(FileEntry, AStoreOutOfRoomMeansNoSignatureNotAPrivateOne) {
+  // The store hands over a shared footprint so that a file opened twice
+  // accumulates into one. When its table is full it hands over NOTHING, and
+  // its contract is that such a file records no signature at all -- because a
+  // signature that stopped growing would be a confident wrong answer.
+  //
+  // The entry used to quietly fall back to its own private footprint, which
+  // has the entry's lifetime rather than the process's. An application that
+  // opens each file twice (ROOT does) then produced two half-footprints and
+  // emitted both as confident signatures: precisely the answer the cap exists
+  // to avoid, with the two headers each describing a different behaviour.
+  Fixture fx;
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->useSharedFootprint(nullptr); // the store declining
+  e->noteRead(0, 4096);
+  e->noteRead(8192, 4096);
+  EXPECT_TRUE(e->footprint().poisoned());
+  EXPECT_TRUE(e->footprint().sig(fx.src.size()).empty())
+      << "declining to track a file must mean no evidence, not partial evidence";
+  EXPECT_EQ(e->footprint().count(fx.src.size()), 0u);
+}
+
+TEST(FileEntry, AnEntryGivenARealFootprintStillRecordsNormally) {
+  // The control for the leg above: the fallback is poisoned only when the
+  // store declines. Wiring the poison unconditionally would silence every
+  // signature and still pass a test that only checks the declining case.
+  Fixture fx;
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  ucache::ReadFootprint shared;
+  e->useSharedFootprint(&shared);
+  e->noteRead(0, 4096);
+  EXPECT_FALSE(e->footprint().poisoned());
+  EXPECT_FALSE(e->footprint().sig(fx.src.size()).empty());
+  EXPECT_EQ(shared.count(fx.src.size()), 1u) << "and it went to the shared one";
+}

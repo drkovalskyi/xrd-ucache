@@ -107,3 +107,43 @@ TEST(ReadFootprint, AnAbsurdOffsetIsRefusedWithoutAllocating) {
   f.note(4096, 4096); // and the object still works afterwards
   EXPECT_EQ(f.count(1 << 20), 1u);
 }
+
+TEST(ReadFootprint, PoisonMakesAFileSayNothingRatherThanSayHalf) {
+  // The failure this exists for: a footprint outlives the handle that filled
+  // it, so one process can read a file by a route whose offsets cannot be
+  // translated (a replica with no map, which contributes nothing) and then by
+  // one that can. What survives is a real, non-empty footprint describing PART
+  // of the work -- and a partial signature is compared and silently disagrees,
+  // where an empty one is correctly read as no evidence.
+  ucache::ReadFootprint f;
+  f.note(0, 4096);
+  f.note(8ull << 20, 4096);
+  ASSERT_EQ(f.count(16 << 20), 2u);
+  ASSERT_FALSE(f.sig(16 << 20).empty());
+
+  f.poison();
+  EXPECT_TRUE(f.poisoned());
+  EXPECT_TRUE(f.sig(16 << 20).empty()) << "no signature at all, not a shorter one";
+  EXPECT_EQ(f.count(16 << 20), 0u) << "and no bucket count to contradict it";
+}
+
+TEST(ReadFootprint, PoisonIsStickyAgainstLaterReads) {
+  // Sticky in the direction that matters: the untranslatable read usually
+  // comes FIRST, and everything recorded afterwards is still only part of the
+  // work. A flag that later reads could clear would restore exactly the
+  // confident partial answer it was set to prevent.
+  ucache::ReadFootprint f;
+  f.poison();
+  f.note(0, 4096);
+  f.note(1 << 20, 4096);
+  EXPECT_TRUE(f.poisoned());
+  EXPECT_TRUE(f.sig(16 << 20).empty());
+  EXPECT_EQ(f.count(16 << 20), 0u);
+}
+
+TEST(ReadFootprint, PoisoningTwiceIsStillPoisoned) {
+  ucache::ReadFootprint f;
+  f.poison();
+  f.poison();
+  EXPECT_TRUE(f.poisoned());
+}

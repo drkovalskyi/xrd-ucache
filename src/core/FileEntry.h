@@ -190,10 +190,23 @@ class FileEntry {
   // route already addresses the origin's layout.
   void noteRead(uint64_t off, uint64_t len) { footprint().note(off, len); }
   // The store hands over a footprint that outlives this entry, so a file
-  // opened twice accumulates instead of recording two halves. The entry's own
-  // is the fallback for a store that has run out of room and for tests that
-  // build an entry directly.
-  void useSharedFootprint(ReadFootprint* fp) { shared_ = fp; }
+  // opened twice accumulates instead of recording two halves.
+  //
+  // A NULL pointer means the store's table is full and it is declining to
+  // track this file. The entry's own footprint then stands in, but it is
+  // POISONED first, so the file records no signature at all -- which is what
+  // the store's contract promises for that case. Letting the private one fill
+  // up instead is what made the two contracts disagree: an application that
+  // opens each file twice (ROOT does) would emit two half-footprints as two
+  // confident signatures, the exact wrong answer the cap exists to avoid.
+  //
+  // Tests that build an entry directly never call this and keep a clean
+  // private footprint.
+  void useSharedFootprint(ReadFootprint* fp) {
+    shared_ = fp;
+    if (!fp)
+      ownFootprint_.poison();
+  }
   ReadFootprint& footprint() { return shared_ ? *shared_ : ownFootprint_; }
   const ReadFootprint& footprint() const { return shared_ ? *shared_ : ownFootprint_; }
 
