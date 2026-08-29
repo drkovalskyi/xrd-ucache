@@ -176,7 +176,12 @@ TEST(Gain, MeasuredBaselineOverWarmWhenFileSetsMatch) {
 // 0.70x -- a sign flip, undetectable from records. A fill is NEVER a
 // reference: with only a fill on record the estimate refuses and says how to
 // measure a real baseline.
-TEST(Gain, AFillIsNotAReference) {
+TEST(Gain, AFillNobodyCanJudgeIsNotAReference) {
+  // A fill qualifies as a reference only when its record shows BOTH that the
+  // origin did the work and that the cache's own writing was small against the
+  // origin wait. This one carries no origin timing at all, so the second half
+  // cannot be checked and it is refused -- the same answer the old rule gave
+  // for every fill, now given for a reason.
   test::TempDir td;
   twoFileFill(td.path(), 100);
   writeRun(td.path(), "host", 200, 2000, 2050, warmCounters(kGiB),
@@ -734,4 +739,124 @@ TEST(ReadAgreement, UnknownFilesCannotDiluteADisagreement) {
   writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
            warm);
   EXPECT_FALSE(gainOfWarm(d.path()).valid);
+}
+
+// ---- a reference need not be a special run -------------------------------
+//
+// The rule is "the cache did not appreciably help this run", not "somebody
+// remembered to set UCACHE_DISABLE". A first pass over data the cache does not
+// have yet meets it, and so does a run that was a MIXTURE -- some files
+// relayed straight through, some fetched from the origin, some partly each.
+// Deciding per file, all or nothing, made a run that was half cache look
+// entirely direct.
+
+TEST(Baseline, AQuietFillIsUsedAsTheReference) {
+  test::TempDir d;
+  // A cold pass: every byte came from the origin, and the cache's own writing
+  // cost 5% of the time spent waiting on the origin -- inside the cold-pass
+  // budget the product already promises.
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0),
+           {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+  writeRun(d.path(), "h", 2, 2000, 2100, warmCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 2100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  const ucache::Run* warm = nullptr;
+  for (const auto& r : runs)
+    if (!r.disabled && r.warm())
+      warm = &r;
+  ASSERT_TRUE(warm);
+  const auto g = estimateGain(*warm, runs);
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_NEAR(g.gain, 2.0, 0.05) << "200 s of origin against a 100 s warm pass";
+}
+
+TEST(Baseline, ALoudFillIsStillRefused) {
+  // Same shape, but the cache spent 60% of the origin wait on its own writes.
+  // Its wall is its own cost, so dividing by it would overstate the gain.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":600000000" + originHist(1000.0),
+           {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+  writeRun(d.path(), "h", 2, 2000, 2100, warmCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 2100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  const ucache::Run* warm = nullptr;
+  for (const auto& r : runs)
+    if (!r.disabled && r.warm())
+      warm = &r;
+  ASSERT_TRUE(warm);
+  EXPECT_FALSE(estimateGain(*warm, runs).valid);
+}
+
+TEST(Baseline, OriginShareCountsBytesNotFiles) {
+  test::TempDir d;
+  // Two files, each delivered half from the origin and half from the cache.
+  // That is a run the cache did half the work for, and it must read as 50% --
+  // not as 100% because "most of each file" came off the wire.
+  writeRun(d.path(), "h", 1, 1000, 1100, warmCounters(kGiB),
+           {{"root://o//a", kGiB, 0, kGiB / 2, 0, 0, "cached", kGiB},
+            {"root://o//b", kGiB, 0, kGiB / 2, 0, 0, "cached", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NEAR(runs[0].originShare(), 0.50, 0.01);
+  EXPECT_FALSE(runs[0].baselineQualified()) << "half the work came from the cache";
+}
+
+TEST(Baseline, AMixtureOfRelayedAndFilledFilesQualifies) {
+  test::TempDir d;
+  // The shape a real first run has: some files the cache declined and relayed
+  // straight through, the rest fetched from the origin and kept. Nothing was
+  // served from cache, so the origin did all of the work whatever the mix.
+  std::vector<FileLine> f;
+  for (size_t i = 0; i < 10; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    const bool relayed = i % 2 == 0;
+    f.push_back(relayed ? FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, "aa11")
+                        : FileLine(key, kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0), f);
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NEAR(runs[0].originShare(), 1.00, 0.01) << "relayed and filled are both the origin";
+  EXPECT_TRUE(runs[0].baselineQualified());
+}
+
+TEST(Baseline, ARunTooThinToJudgeDoesNotQualify) {
+  // No origin timing in the record, so the cache's write cost cannot be put
+  // against anything. Qualifying here would be qualifying on an absence of
+  // evidence, which is how the guard was silently passing everything.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1200, fillCounters(kGiB) + ",\"buffer_stall_us\":50000000",
+           {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NEAR(runs[0].originShare(), 1.00, 0.01);
+  EXPECT_FALSE(runs[0].overheadKnown());
+  EXPECT_FALSE(runs[0].baselineQualified());
+}
+
+TEST(Baseline, ASwitchedOffRunBeatsANearerFill) {
+  // Both qualify, and the fill is much nearer in time. The switched-off run
+  // must still win: it carries none of the cache's own writing in its wall,
+  // and admitting fills must not quietly revise a number that was already
+  // reported from a clean baseline.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1200, baselineCounters(kGiB),
+           {{"root://o//a", 0, 0, kGiB, 1200, 0, "relay", kGiB, "aa11"}});
+  writeRun(d.path(), "h", 2, 5000, 5200,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0),
+           {{"root://o//a", kGiB, 0, kGiB, 5200, 0, "fill", kGiB, "aa11"}});
+  writeRun(d.path(), "h", 3, 6000, 6100, warmCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 6100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  const ucache::Run* warm = nullptr;
+  for (const auto& r : runs)
+    if (r.warm())
+      warm = &r;
+  ASSERT_TRUE(warm);
+  const auto g = estimateGain(*warm, runs);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_EQ(g.referenceStartS, 1000u) << "the switched-off run, not the nearer fill";
 }

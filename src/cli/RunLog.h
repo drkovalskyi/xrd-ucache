@@ -128,7 +128,7 @@ struct Run {
   double fillCost() const;
   static constexpr double kMinOriginShare = 0.95;
   bool baselineQualified() const {
-    return originShare() >= kMinOriginShare && overhead() <= kMaxOverhead;
+    return originShare() >= kMinOriginShare && overheadKnown() && overhead() <= kMaxOverhead;
   }
   // Average cores executing over the run: CPU time divided by wall. Absolute
   // on purpose -- a SHARE needs a denominator, and threads_high_water counts
@@ -170,6 +170,12 @@ struct Run {
     const double o = originWaitS();
     return o > 0.0 ? writeWaitS() / o : 0.0;
   }
+  // Cache-write time only means something against the origin wait it had to
+  // hide behind, so a run with no origin timing cannot be judged at all.
+  // Without this, a record too old or too thin to carry the histogram reports
+  // overhead 0 and qualifies on an ABSENCE of evidence -- the opposite of what
+  // every other guard here does.
+  bool overheadKnown() const { return originWaitS() > 0.0; }
   // A fill is usable as a baseline when the cache added little to it. The
   // bound is the product's own cold-pass target -- no more than 1.1x the
   // direct read -- so the two say the same thing in the same units.

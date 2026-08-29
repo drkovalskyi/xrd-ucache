@@ -333,7 +333,12 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   size_t readSigMismatch = 0;
   double bestAgree = -1.0; // closest agreement seen, for the refusal text
   for (const auto& r : all) {
-    if (r.stem == run.stem || !r.disabled)
+    // A reference is a run the cache did not appreciably help: one with the
+    // cache switched off, or one that QUALIFIES -- the origin did nearly all
+    // the work and the cache's own writing cost little. The second kind is
+    // what an ordinary first run over new data looks like, so a measurement
+    // arrives without anyone having to know to record a special run.
+    if (r.stem == run.stem || !(r.disabled || r.baselineQualified()))
       continue;
     if (r.files.empty() || r.durationS() < kMinDurationS || r.faults())
       continue;
@@ -384,7 +389,17 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     auto dist = [&](const Run& x) {
       return x.startS > run.startS ? x.startS - run.startS : run.startS - x.startS;
     };
-    if (!best || dist(r) < dist(*best)) {
+    // A run with the cache switched off beats a qualifying fill, however much
+    // nearer in time the fill is: the fill carries its own writing in its wall
+    // -- bounded, but not zero -- while the switched-off run carries none.
+    // It also keeps admitting fills from being a silent revision: a dataset
+    // that already had a clean baseline reports exactly what it reported
+    // before, and fills only ever supply an answer where there was none.
+    // Within one kind, nearest in time still wins, since origin drift is then
+    // the only thing separating the candidates.
+    const bool better = !best || (r.disabled != best->disabled ? r.disabled
+                                                              : dist(r) < dist(*best));
+    if (better) {
       best = &r;
       refC = c;
       refD = d;
@@ -418,7 +433,8 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     } else {
       g.reason = "no baseline recorded — run the same work once with "
                  "UCACHE_DISABLE=1 (cache out of the loop) to measure what the "
-                 "origin alone costs";
+                 "origin alone costs; a first run over data the cache does not "
+                 "have yet can serve as one too";
     }
     return g;
   }
@@ -572,18 +588,35 @@ std::string Run::topOriginHost() const {
 double Run::originShare() const {
   // Weighted by size AT THE ORIGIN: the replica tier serves recompressed
   // bytes, so served-byte counters are not in comparable units.
-  uint64_t fromOrigin = 0, total = 0;
+  //
+  // WITHIN each file the split is by bytes, not a verdict on the file. A real
+  // run is a mixture -- some files relayed straight through, some filled from
+  // the origin, some served warm, and single files that were partly each,
+  // because a file can be evicted, refetched, or fall back to the origin mid
+  // run. Calling a file wholly origin because most of it was made a run that
+  // was half cache read as entirely direct, which is the one error this test
+  // exists to prevent.
+  double fromOrigin = 0.0;
+  uint64_t total = 0;
   for (const auto& [k, f] : files) {
+    (void)k;
     const uint64_t w = f.originSize ? f.originSize : f.servedBytes;
     if (!w)
       continue;
+    // Bytes handed to the application for this file. A relay never increments
+    // the served counter, so a relayed file is all origin -- which is what it
+    // was; and during a fill the same bytes are both fetched and served, so
+    // the two counters agree and the file is all origin too, correctly.
+    const uint64_t delivered = std::max(f.servedBytes, f.wireBytes);
+    if (!delivered)
+      continue; // opened, nothing read: no evidence either way
     total += w;
-    if (f.mode == "relay" || f.mode == "fill" || f.wireBytes > f.servedBytes / 2)
-      fromOrigin += w;
+    fromOrigin += static_cast<double>(w) *
+                  (static_cast<double>(f.wireBytes) / static_cast<double>(delivered));
   }
   if (!total)
     return disabled ? 1.0 : 0.0; // a disabled run with no records is still direct
-  return static_cast<double>(fromOrigin) / static_cast<double>(total);
+  return fromOrigin / static_cast<double>(total);
 }
 
 namespace {
