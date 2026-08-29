@@ -1114,3 +1114,107 @@ TEST(Thresholds, WidthIsCollectedButNeverGatesAMatch) {
   EXPECT_TRUE(g.valid) << g.reason;
   EXPECT_NEAR(g.gain, 2.0, 0.05) << "200 s of origin against a 100 s warm pass";
 }
+
+// --- the refusal reason itself ------------------------------------------
+//
+// WHY a run has no gain is a decision, not a label: the summary counts each
+// class separately and each one sends the reader somewhere different -- record
+// a baseline, run for longer, read more data, or nothing at all because this
+// run IS the baseline. The reasons were derived twice before, in two places,
+// and three classes came out wrong; deciding it once is the fix, and these pin
+// that the decision is actually made. Every value was reachable with nothing
+// asserting any of it, so deleting an assignment left the suite green.
+
+TEST(RefusalReason, ABaselineSaysSoRatherThanReportingNoGain) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"disabled\":1,\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824",
+           {{"root://o//a", 0, 0, kGiB, 1200, 0, "relay", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kIsBaseline);
+}
+
+TEST(RefusalReason, AFillSaysItFilledRatherThanBlamingTheBaseline) {
+  // The distinction that was got wrong: a fill and a run under the size floor
+  // both used to report "no comparable baseline", which sends the reader off
+  // to record a baseline that would not have helped either case.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":600000000" + originHist(1000.0),
+           {filledFile("root://o//a", kGiB, 1200, "aa11")});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kFilled);
+}
+
+TEST(RefusalReason, TooLittleDataIsItsOwnAnswer) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, warmCounters(1 * kMiB),
+           {{"root://o//a", kMiB, 0, 0, 1100, 0, "cached", kMiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kTooSmall);
+}
+
+TEST(RefusalReason, TooShortToTimeIsItsOwnAnswer) {
+  // Above the size floor so the two cannot be confused: this run moved plenty
+  // of data, it just did not run long enough to divide two whole seconds by.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1005, warmCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 1005, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kTooShort);
+}
+
+TEST(RefusalReason, NoPerFileRecordsIsIncompleteNotMissingBaseline) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, warmCounters(kGiB), {});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kIncomplete);
+}
+
+TEST(RefusalReason, NothingToCompareAgainstSaysExactlyThat) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, warmCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 1100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kNoBaseline);
+  EXPECT_NE(g.reason.find("UCACHE_DISABLE=1"), std::string::npos)
+      << "the one refusal with an action attached must name it: " << g.reason;
+}
+
+TEST(RefusalReason, DifferentWorkIsNotReportedAsDifferentFiles) {
+  // Same files, different analysis. Reporting this as "covered different
+  // files" would send the reader to fix a file list that is already correct.
+  test::TempDir d;
+  writeAgreementPair(d.path(), 100, 100);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kReadDifferent);
+}
+
+TEST(RefusalReason, AMeasuredRunSaysMeasured) {
+  // The control: without it every assignment above could be replaced by the
+  // one refusal that happens to be checked, and the suite would still pass.
+  test::TempDir d;
+  writeAgreementPair(d.path(), 100, 0);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kMeasured);
+}
