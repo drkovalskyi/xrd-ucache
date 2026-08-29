@@ -113,7 +113,8 @@ cost". For a clean window, reset the counters between jobs:
 
 ```sh
 # put the cache in the state you want (warm it, reclaim it, …), then:
-ucache stats --reset      # deletes stats/*.jsonl; warns if a job looks live
+ucache stats --reset      # counters start fresh; records move to stats/history
+                          # (summary/history keep reading them). Warns if a job looks live
 <run your analysis once>
 ucache stats              # exactly that run: hits, misses, origin bytes,
                           # latency histograms

@@ -257,13 +257,30 @@ nothing needs to be running, and there is no sampling daemon to start.
 
 ```text
 $ ucache summary
-overall    : 8 run(s) recorded — 720.8 GiB served from cache, 266.1 GiB from the origin
-  saved    : 35m22s — 4 run(s) took 27m14s, and would have taken about 1h02m with
-             no cache (2.3x, vs a measured baseline)
+overall    : 12 run(s) recorded — 336.8 GB read, 86.3 GB from the origin
+  saved    : 10m43s — 4 run(s) took 4m49s, and would have taken about 15m32s with
+             no cache (3.2x, vs a measured baseline)
   health   : OK — no faults in any recorded run
-cache      : /scratch/ucache — 1456 entries, 202.8 GiB on disk, 1.3 TiB headroom
+
+by dataset
+  3fe77e    439 files      623.9 GB at origin   47 dir(s)  eospublic.cern.ch
+           4 run(s), 2 measured (71% of GB)   108.5 GB read   gain  byte 1.96x  repl 5.07x
+  34a731    255 files      630.8 GB at origin   10 dir(s)  eospublic.cern.ch
+           4 run(s), 2 measured (67% of GB)   105.8 GB read   gain  byte 3.67x  repl 4.56x
+
+cache      : /scratch/ucache — 694 entries, 202.8 GB on disk (61.4 byte + 141.4 replica),
+             1.3 TB headroom
+
+notes
+  8 of 12 runs not measured:  3 baseline(s) — they are the reference  3 filled the cache  2 under 30s
 next       : `ucache summary --detail` for the last run; `ucache history` for the trend
 ```
+
+Runs are grouped by the set of files they read, so a cache used for more than
+one analysis does not average them into a single meaningless number. The
+`notes` block accounts for every run that produced no gain, by reason — a run
+that IS the reference, one that filled the cache, one too short to time — so
+"not measured" is never left looking like "measured and disappointing".
 
 **The headline is time, and it is measured against a baseline — the same work
 run once with the cache out of the loop.** Record one by running your job with
@@ -293,14 +310,42 @@ not wall time (same test: 2.8x, same truth). A measured baseline reproduces the
 true ratio to about 1% either way. One extra run of your job is what
 truthfulness costs.
 
+**Two kinds of run can be the reference.** One with the cache switched off, and
+a first pass over data the cache does not have yet — a *fill* — provided the
+cache added little to it: the origin has to have delivered at least 95% of the
+bytes, and the cache's own writing must have cost no more than a tenth of the
+time spent waiting on the origin, which is the same bound as the product's
+cold-pass target. That second kind means an ordinary first run can supply a
+measurement without anyone having known to record one. A switched-off run still
+wins over a fill however much nearer in time the fill is, because a fill carries
+its own writing in its wall.
+
 Rules the comparison enforces, so a number is never printed where it would
-mislead: the baseline must cover ≥70% of the same files in both directions
-(matched by URL); a run that mostly *filled* the cache is never scored; runs and
-baselines under 30 s or 64 MiB are refused (too short to time at one-second
-resolution); a baseline that hit faults is not used; with several baselines the
-nearest in time wins — and recording a baseline *after* you have been running
-cached for a while works fine. When the answer cannot be sound, `summary` says
-why and what to do instead of printing a number.
+mislead:
+
+- **Same files.** The baseline must cover ≥70% of the same files in both
+  directions, matched by URL.
+- **Same work.** Covering the same files is not enough — two analyses can read
+  the same files and touch quite different parts of them. Each run records
+  which 1 MiB blocks of each file it read, in the original file's coordinates,
+  and at least **90% of the files compared must agree**. It is a share and not
+  a single hash over the whole run because the two routes genuinely differ a
+  little: a replica is a rewritten container and the reader asks it for
+  different spans, which on a measured file set left 26 files of 439 disagreeing
+  on otherwise identical work.
+- **Enough evidence to check.** A majority of the compared files must actually
+  carry that record on both sides. One agreeing file cannot vouch for four
+  hundred, and a baseline that recorded none at all is refused rather than
+  silently trusted. Records written before this existed carry none on either
+  side; those are still compared, and reported as unverified.
+- **Big enough, long enough, clean.** Runs and baselines under 30 s or 64 MiB
+  are refused (too short to time at one-second resolution), and a run that hit
+  faults is not used as one.
+- A run that mostly *filled* the cache is never given a gain of its own.
+
+Recording a baseline *after* you have been running cached for a while works
+fine — either side in time qualifies. When the answer cannot be sound,
+`summary` says why, and which of these it was, instead of printing a number.
 
 `ucache summary --detail` adds the last run underneath: tier split, delivered
 rate, per-tier read counts and sizes, replica coverage, and that run's own
@@ -314,22 +359,43 @@ over time, across versions, or after you change the cache disk.
 ```text
 $ ucache history
 8 run(s) recorded, newest first (showing 8)
-WHEN                  DUR   FILES     SERVED     ORIGIN       RATE  BYTE/REPL/RELAY  FAULTS GAIN
-ALL (8 runs)        1h24m    1456  853.9 GiB  266.1 GiB   238 MB/s  27%/58%/16%           0 2.30x
-                 4 of 8 runs measured vs baseline: took 27m14s, no cache would have
-                 taken about 1h02m — saved 35m22s
-----
-2026-08-18 09:42    3m51s    1456  164.5 GiB        0 B   764 MB/s  0%/100%/0%            0 4.06x
-2026-08-18 09:20   15m41s    1456    1.8 GiB  133.1 GiB   154 MB/s  100%/0%/0%            0 fill
-2026-08-18 09:02   15m39s    1456  133.1 GiB        0 B   145 MB/s  0%/0%/100%            0 base
+WHEN         DUR     SIG     RSIG    PEAK   RIF  FILES    READ  DIR/FILL/BYTE/REPL   RATE    INS    IPS   CPU   OVH   GAIN
+                                      cor  orig             GB  percent              GB/s   1e12    1e9   cor     %      x
+ALL 8 runs   22m40s                               1133   336.8   23/  26/  24/  28                                    3.22
+-----------  ------  ------  ------  ----  ----  -----  ------  ------------------  -----  -----  -----  ----  ----  -----
+08-29 12:48  55s     3fe77e  c59be7    32     6    439    45.9    0/   0/   0/ 100  0.835   5.02   91.2  22.4     -   5.07
+08-29 12:42  2m22s   3fe77e  c59be7    32     8    439    31.3    0/   0/ 100/   0  0.220  15.02  105.8  27.8     -   1.96
+08-29 12:37  4m34s   3fe77e  c59be7    23    31    439    37.7    0/  98/   2/   0  0.138  15.08   55.0  13.9   1.1   base
+08-29 12:32  4m39s   3fe77e  c59be7    23    29    439    31.4  100/   0/   0/   0  0.112  15.15   54.3  13.9     -   base
 ```
 
-`GAIN` reads `base` for a baseline run (cache disabled — the reference), `fill`
-for a run that populated the cache, and `-` where the comparison was refused.
-The `RATE` column is what the job consumed, from all sources combined — it is
-paced by the application, not a cache capability (that is `ucache bench`).
-`--top N` shows more rows; `--json` on either command emits the same figures
-for scripting.
+Reading it: the two `base` rows are the references — the lower one ran with the
+cache switched off, the one above it is a fill that qualified. The two rows
+above those are the same work served warm, from the byte tier and then from
+recompressed replicas, at 1.96x and 5.07x.
+
+- `SIG` is the set of files; `RSIG` is which parts of them were read. Two rows
+  sharing both did the same work, which is what makes their walls comparable —
+  and a row whose `RSIG` differs is not compared, however similar it looks.
+- `DIR/FILL/BYTE/REPL` is where the bytes came from, as percentages: straight
+  from the origin without caching, fetched and kept, served from the byte
+  cache, served from a recompressed replica.
+- `PEAK cor` is the width actually measured — CPU-seconds per wall-second on
+  the read path — not a thread count. `RIF orig` is the most reads the origin
+  was being asked for at once (`-` on records written before it existed); a
+  warm run reads 0, correctly, because nothing went to the origin.
+- `INS`/`IPS` are instructions retired and per second: the same analysis
+  executes very nearly the same instruction count however the bytes reached it,
+  so a row far off its neighbours did different work whatever the other columns
+  say. `OVH` is what the cache's own writing cost as a share of the origin wait,
+  and is what decides whether a fill can be a reference.
+- `GAIN` reads `base` for a reference run and `-` where the comparison was
+  refused; `ucache summary` says why.
+
+`RATE` is what the job consumed from all sources combined — paced by the
+application, not a cache capability (that is `ucache bench`). Rows under ten
+seconds are left out as noise. `--top N` shows more rows; `--json` on either
+command emits the same figures for scripting.
 
 Records appear when a job that used the cache **exits**; CLI invocations do not
 write them. `ucache stats --reset` starts a fresh counter window but keeps the
@@ -397,7 +463,7 @@ samples, so `origin rt -` above is the point of a warm pass, not a gap.
 
 ```sh
 ucache stats --files --top 20   # per-file records, costliest first
-ucache stats --reset            # delete the window and start a fresh measurement
+ucache stats --reset            # start a fresh measurement window (records are kept)
 ```
 
 `--reset` warns if a job looks like it is still running, since its counters
@@ -505,7 +571,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache ls [--sort age\|size]` | list cached entries (size, cached, coverage, last-used age, replica, pinned) |
 | `ucache stats`     | aggregate `stats/*.jsonl` across all processes, plus the derived **workflow picture**: opens per distinct file, bytes served per tier (RAM / disk / replica / origin / relay), disk-read count + mean size + sequential share, re-read factor, fill flush shape, and p50/p95/p99 latencies |
 | `ucache stats --files [--top N]` | per-file records (one per file per process), costliest first: which files were re-opened, re-read, served from which tier |
-| `ucache stats --reset` | delete the per-process stats files (counters, per-file records, traces): a fresh window for measuring **one** run against a specific cache state (run it between jobs — it warns if a file looks live). Counters only; the cache contents are untouched |
+| `ucache stats --reset` | start a fresh counter window for measuring **one** run against a specific cache state (run it between jobs — it warns if a file looks live). The counter and per-file records MOVE to `stats/history`, where `summary` and `history` keep reading them: deleting them would delete any measured no-cache baseline, which is the one thing later runs are compared against. Traces are deleted (bulky, per-op, no run-level meaning). The cache contents are untouched |
 | `ucache bench --threads N [PATH …] [--size SZ] [--measurement-duration S] [--block KB] [--fill writers=N,block=SZ] [--sweep] [--cache-path [--cache-sample SZ]] [--log FILE\|--no-log]` | storage self-test of the cache dir (or of candidate dirs, to pick one). Three groups: **standard** measures at pinned block sizes and queue depths 1/16/32, comparable to a datasheet; **pattern** measures at your job's concurrency — each serving tier's read shape, and random reads under writeback; and, with `--cache-path`, the same storage **through uCache's own fill and read code** rather than an imitation of it. Plus fsync, create/unlink. `--threads` is **required and never guessed** — it is what your analyses run at, not the core count. `--measurement-duration` is the window of ONE measurement (the build stage gets 3×; the plan and estimated total print up front). Appends every run, with the machine, load and block device behind the path, to `./ucache-bench.txt`. **Full guide: `docs/BENCH.md`** |
 | `ucache netbench <root://…> [--streams N,…] [--block KB] [--seconds S]` | origin random-read baseline at 1/16/64 streams: what the network side delivers, for a fair cache-vs-origin comparison |
 | `ucache evict [--older-than DUR \| --newer-than DUR \| --to-size SIZE] [--dry-run]` | reclaim space: no flags = one pass to the configured budget; `--older-than 30d` drops entries unused that long; `--newer-than 1h` drops entries used within the window (undo a polluting run); `--to-size 20g` LRU-evicts down to a total size; `--dry-run` previews |

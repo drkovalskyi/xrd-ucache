@@ -225,11 +225,18 @@ reading was re-reading, and what the cache disk was asked to do.
   same data executes very nearly the same number however the bytes reached it,
   which is what makes two runs comparable at all. Requires performance counters
   to be permitted; absent (zero) where they are not.
-- `reads_in_flight_high_water` — the most reads being SET UP at once. Read the
-  name with care: every route here dispatches and returns while a synchronous
-  caller waits above this library, so this spans the handoff, not the read, and
-  a job with thirty-two reads genuinely outstanding can report a handful. It is
-  recorded and displayed; nothing is decided from it.
+- `origin_reads_in_flight_high_water` — the most reads the ORIGIN was being
+  asked for at once. Counted where a read is issued to the origin and given
+  back at the top of its completion handler, so it spans the READ. This is the
+  width that sets the origin's delivery rate, and it is the one to use. A warm
+  run reads 0, correctly: nothing was outstanding at the origin because nothing
+  went there. It is recorded and displayed; nothing is decided from it.
+- `reads_in_flight_high_water` — SUPERSEDED by the counter above, and kept only
+  so the old name is not silently reused for the new meaning. It counted reads
+  being SET UP at once: every route dispatches and returns while a synchronous
+  caller waits above this library, so it spans the handoff, not the read, and a
+  job with thirty-two reads genuinely outstanding can report a handful. It is
+  emitted as a permanent 0. Do not read anything into it.
 - Counters are process-lifetime monotonic; successive lines from one process
   supersede earlier ones (consumers take the last line per file).
 
@@ -258,9 +265,20 @@ reading was re-reading, and what the cache disk was asked to do.
   many, in the ORIGINAL file's coordinates. The file is divided into 1 MiB
   blocks and the signature is a hash of the set that were touched; a read
   served from a replica is mapped back through the sidecar's origin map first,
-  so the answer does not depend on the route. Two runs of one analysis agree;
-  two analyses over the same files do not, which is what separates them when
-  the file list alone cannot.
+  so the two routes are expressed in the same coordinates.
+
+  That is not the same as agreeing, and MEASURED THEY DO NOT ALWAYS AGREE. A
+  replica is a rewritten container, so the reader asks it for different spans
+  than it asks the original -- not merely coalesced differently, requested
+  differently. On a recorded file set, 26 files of 439 (94.1% agreement) had a
+  whole block fall inside a gap the replica route never asks for: the byte
+  route marked it, the replica route did not. Both are honest about what was
+  read; they answer slightly different questions.
+
+  So equality is evidence of the same work, while inequality is NOT proof of
+  different work -- which is why runs are compared on the SHARE of files that
+  agree rather than on a single hash over the whole run, and why that share is
+  required to be high rather than total.
 
   An empty `read_sig` means UNKNOWN, never "nothing was read" — a replica
   written before origin maps existed cannot answer, and so says nothing rather

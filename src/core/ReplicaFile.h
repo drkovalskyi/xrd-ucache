@@ -6,7 +6,13 @@
 //   objects/<aa>/<hash>.tmeta   this sidecar (format below)
 // while the v1 .meta stays at ITS format v1, so mixed-version processes
 // sharing one cache dir coexist: a v1.0.0 reader never looks at replica
-// files (deliberate: no format-version bump, for coexistence).
+// files, and the .meta it does read never changed shape.
+//
+// That is about the .meta, and says nothing about THIS sidecar's own version,
+// which is 2 (see kFormatVersion): the origin map was added there. Coexistence
+// holds for that too -- a v1 .tmeta still parses and still serves, contributing
+// no read signature -- but it is a version that was bumped, not one that never
+// moves, and an earlier note here read as the second.
 //
 // The stitched virtual view = origin bytes, except where an extent says the
 // range comes from .tdata. Extents are sorted, non-overlapping, and may lie

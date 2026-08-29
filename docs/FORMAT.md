@@ -108,8 +108,11 @@ crc32c at offset 68 computed with that field zeroed). Version 1 wrote a
 | 80 | key, extents (virt_off,len,tdata_off u64×3), superseded (off,len u64×2), orig_map (virt_off,len,orig_off,orig_len u64×4), crc32c u32 × n_overlay_pages | extents sorted, non-overlapping; overlay page = 64 KiB. The map is sorted by virt_off; v1 images have none and the array is absent |
 
 The origin map records, for each piece the builder relocated, the range of the
-ORIGINAL file whose content it carries. Serving never consults it — `.tdata`
-stays opaque bytes and the read path is byte for byte what it was — but it is
+ORIGINAL file whose content it carries. No SERVED BYTE depends on it —
+`.tdata` stays opaque bytes and which bytes come back is exactly what it was
+without the map — but the read path does consult it, to record which part of
+the original file a read touched. (An earlier wording here said serving never
+consults it, which is not the same claim and is not true.) It is
 what lets a read served from a replica be reported in the original file's own
 coordinates, and so compared with the same read served any other way. It is not
 a linear mapping: a recompressed piece has a different length than the piece it
