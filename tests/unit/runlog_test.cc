@@ -876,3 +876,73 @@ TEST(RunLog, AMalformedHistogramIsDroppedNotSpun) {
   EXPECT_EQ(runs[0].originWaitS(), 0.0) << "an unreadable histogram counts as no evidence";
   EXPECT_EQ(runs[0].threadsHighWater, 32u) << "the rest of the line still parses";
 }
+
+// ---- the thresholds themselves ------------------------------------------
+//
+// Each of these pins a CONSTANT at its boundary, not merely the machinery that
+// reads it. A test that only exercises values far from the edge lets the
+// constant drift: moving the overhead bound from a tenth to a half broke
+// nothing in this suite, which meant the number nobody had agreed to was as
+// well defended as the one everybody had.
+
+TEST(Thresholds, OverheadBoundSitsAtOneTenth) {
+  // Just inside qualifies, just outside does not. Both runs are identical
+  // apart from the cache-write time being compared with the origin wait.
+  auto qualifies = [](double stallS) {
+    test::TempDir d;
+    const std::string w = ",\"buffer_stall_us\":" + std::to_string((uint64_t)(stallS * 1e6)) +
+                          originHist(1000.0);
+    writeRun(d.path(), "h", 1, 1000, 1200, fillCounters(kGiB) + w,
+             {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+    const auto runs = loadRuns(d.path());
+    EXPECT_EQ(runs.size(), 1u);
+    return !runs.empty() && runs[0].baselineQualified();
+  };
+  EXPECT_TRUE(qualifies(99.0)) << "9.9% of the origin wait is inside the bound";
+  EXPECT_FALSE(qualifies(101.0)) << "10.1% is outside it";
+}
+
+TEST(Thresholds, OriginShareBoundSitsAtNineteenTwentieths) {
+  // A run is a reference only when the origin did nearly all of the work.
+  // Fractions of a file, not whole files: the split is by bytes.
+  // Asserted through QUALIFICATION, not through the share itself. Checking
+  // the computed fraction against 0.95 pins the arithmetic and leaves the
+  // constant free: dropping the bound to 0.80 passed such a test untouched.
+  auto qualifies = [](uint64_t cachedBytes) {
+    test::TempDir d;
+    writeRun(d.path(), "h", 1, 1000, 1200,
+             fillCounters(kGiB) + ",\"buffer_stall_us\":1000" + originHist(1000.0),
+             {{"root://o//a", kGiB, 0, kGiB - cachedBytes, 1200, 0, "fill", kGiB, "aa11"}});
+    const auto runs = loadRuns(d.path());
+    EXPECT_EQ(runs.size(), 1u);
+    return !runs.empty() && runs[0].baselineQualified();
+  };
+  EXPECT_TRUE(qualifies(kGiB / 25)) << "4% from cache still qualifies";
+  EXPECT_FALSE(qualifies(kGiB / 15)) << "6.7% from cache does not";
+}
+
+TEST(Thresholds, WidthIsCollectedButNeverGatesAMatch) {
+  // A standing ruling: thread counts and read concurrency are recorded and
+  // displayed, and they must not decide whether two runs are comparable. The
+  // two runs here differ by 20x on every width we record.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           std::string("\"disabled\":1,\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824")
+               + ",\"peak_cores\":2,\"threads_high_water\":4"
+               + ",\"origin_reads_in_flight_high_water\":2",
+           {{"root://o//a", 0, 0, kGiB, 1200, 0, "relay", kGiB, "aa11"}});
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           std::string("\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824")
+               + ",\"peak_cores\":40,\"threads_high_water\":584"
+               + ",\"origin_reads_in_flight_high_water\":40",
+           {{"root://o//a", kGiB, 0, 0, 2100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  const ucache::Run* warm = nullptr;
+  for (const auto& r : runs)
+    if (!r.disabled)
+      warm = &r;
+  ASSERT_TRUE(warm);
+  const auto g = estimateGain(*warm, runs);
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_NEAR(g.gain, 2.0, 0.05) << "200 s of origin against a 100 s warm pass";
+}
