@@ -834,7 +834,11 @@ ReadFootprint& CacheStore::relayFootprint(const std::string& url) {
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
                                 uint64_t spanUs, uint64_t originSize) {
   const ReadFootprint* fp = footprintFor(url);
-  const std::string readSig = fp ? fp->sig(originSize) : std::string();
+  // No size means no way to tell content from a reader's overshoot: ROOT asks
+  // past the end routinely, and a signature that counts those bytes agrees
+  // with no other route. Unknown is the honest answer, and every reader
+  // already treats an empty signature as no evidence.
+  const std::string readSig = (fp && originSize) ? fp->sig(originSize) : std::string();
   const uint64_t readBuckets = fp ? fp->count(originSize) : 0;
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its

@@ -5,8 +5,8 @@
 // (hit/ram/replica/wire/readv) are sampled 1-in-N (`trace_sample`, default
 // 64) to bound volume; rare ops (open/flush/meta) are always recorded. Each
 // key is announced once as a legend line {"op":"key","k":..,"url":..}; data
-// lines carry only the 16-hex key hash and a `t` field: a small per-thread
-// slot id, assigned on that thread's first record. Slot ids (not OS tids) are
+// lines carry only the 16-hex key hash and a `w` field: a small per-thread
+// slot id (`t` is the timestamp), assigned on that thread's first record. Slot ids (not OS tids) are
 // what make a trace replayable — reconstructing a thread's timeline needs the
 // records grouped by worker, and the gaps between one worker's completion and
 // its next issue ARE that worker's compute.

@@ -122,18 +122,6 @@ struct Config {
   // read-class op (1 = everything). Off ("") by default — zero cost.
   std::string trace;    // UCACHE_TRACE ("io" | "off"/"")
   int traceSample = 64; // UCACHE_TRACE_SAMPLE
-  // Measurement by TIME SLICING (0 = off, the default). For one window in
-  // every cycle the cache steps aside and every newly-opened file is served
-  // straight from the origin, uncached. Because the WHOLE application is on one
-  // route for that window, the window's wall contains that route's overlap --
-  // which is the term per-file and per-read methods cannot see, and the reason
-  // they report a gain where there is a loss.
-  //
-  // The window must be several times a file's lifetime, or the population is
-  // still mixed when the window ends: a run whose files take ~25 s wants
-  // windows of minutes, and short runs cannot host this at all.
-  // Share of time spent bypassing. The cost is duty x (gain - 1) of the wall,
-  // so it is free exactly when the cache is not helping.
   std::vector<std::string> keepCgi;       // UCACHE_KEEP_CGI comma list
   std::vector<std::string> allowHosts;    // UCACHE_ALLOW glob list (empty = all)
   std::vector<std::string> denyHosts;     // UCACHE_DENY glob list

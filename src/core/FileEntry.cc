@@ -136,10 +136,17 @@ FileEntry::~FileEntry() {
 void FileEntry::noteActivity() {
   const uint64_t t = nowUsSteady();
   uint64_t expected = 0;
-  // Only the first caller sets the start; the rest just push the end forward.
-  // Monotone, so a stale racing store cannot shorten the span below truth.
+  // Only the first caller sets the start; the rest push the end forward. Both
+  // ends move one way only. The end needs the loop for the same reason the
+  // start needs the exchange: a caller preempted between reading the clock and
+  // storing it would otherwise write a stale time over a newer one and pull
+  // the span end BACKWARDS by however long it was descheduled, which under
+  // load is milliseconds. The comment here used to claim monotonicity that a
+  // plain store does not provide.
   obs_.firstUs.compare_exchange_strong(expected, t, std::memory_order_relaxed);
-  obs_.lastUs.store(t, std::memory_order_relaxed);
+  uint64_t last = obs_.lastUs.load(std::memory_order_relaxed);
+  while (t > last && !obs_.lastUs.compare_exchange_weak(last, t, std::memory_order_relaxed))
+    ;
 }
 
 void FileEntry::emitObsRecord() {

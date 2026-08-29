@@ -192,6 +192,11 @@ void loadFiles(const std::string& path, Run& r) {
     // mode is a per-key property, not per-open; if they ever disagree, the
     // origin-served mode wins, because a file half-served from cache cannot
     // measure the origin and must not join that population.
+    // A file can be reported more than once in a run -- evicted and refetched,
+    // or degraded to pass-through part way. Relay wins because it is the one
+    // mode that says the cache did NOT serve those bytes, and a file the cache
+    // stopped serving should not read as cached. Fill does not override cached
+    // for the same reason in reverse: it did serve them, eventually.
     if (!m.empty() && (f.mode.empty() || m == "relay"))
       f.mode = m;
   }

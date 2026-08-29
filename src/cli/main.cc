@@ -1287,13 +1287,17 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     // nobody experienced; seconds add up honestly and answer the question that
     // was actually asked, which is whether the work went faster.
     if (t.haveGain) {
-      const uint64_t took = static_cast<uint64_t>(t.estimatedDurationS);
+      // Rounded, not truncated, and the third figure DERIVED from the other
+      // two: printing three independently truncated numbers produced lines
+      // that visibly failed to add up, and a report whose own arithmetic is
+      // off by a second invites doubt about the arithmetic you cannot see.
+      const uint64_t took = static_cast<uint64_t>(t.estimatedDurationS + 0.5);
       const uint64_t would =
-          static_cast<uint64_t>(std::max(0.0, t.estimatedDurationS + t.savedS));
+          static_cast<uint64_t>(std::max(0.0, t.estimatedDurationS + t.savedS) + 0.5);
       if (t.savedS >= 0)
         std::printf("  saved    : %s — %zu run(s) took %s, and would have taken about %s "
                     "with no cache (%.1fx, vs a measured baseline)\n",
-                    humanDur(static_cast<uint64_t>(t.savedS)).c_str(), t.runsEstimated,
+                    humanDur(would > took ? would - took : 0).c_str(), t.runsEstimated,
                     humanDur(took).c_str(), humanDur(would).c_str(), t.gain);
       else
         std::printf("  COST     : the cache is costing you time on this workload — "
