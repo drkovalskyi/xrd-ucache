@@ -1,4 +1,4 @@
-# FORMAT.md — on-disk cache format, format_version 1
+# FORMAT.md — on-disk cache format (entry sidecars v1, replica sidecars v2)
 
 Bump `MetaData::kFormatVersion` on ANY layout change; readers reject other
 versions (entry treated as absent and rebuilt).
@@ -66,7 +66,7 @@ reach disk, in keys or file names.
   the owner detects `st_nlink == 0` before sidecar flushes and skips them so
   the entry is not resurrected.
 
-## Replica sidecars: `<hash>.tdata` + `<hash>.tmeta`, format_version 1
+## Replica sidecars: `<hash>.tdata` + `<hash>.tmeta`, format_version 2
 
 A transposed replica adds two files next to the v1
 pair — the v1 `.meta` layout above is UNCHANGED (coexistence: a pre-replica
@@ -82,16 +82,17 @@ metadata) that, stitched over the origin bytes, form the virtual view.
 > it compresses ~5–7× and dominates the overlay for tiny-hot-set files. This is
 > a `.tdata`-content change only: **readers are agnostic** — `.tdata` is opaque
 > CRC'd bytes, ROOT inflates the key on open exactly as it does the original's
-> LZMA key, `.tmeta` `format_version` stays 1, and older (raw-metadata)
+> LZMA key, the `.tmeta` version is untouched by it, and older (raw-metadata)
 > replicas keep serving unchanged in the same cache (no migration).
 
-`.tmeta` layout (little-endian, fixed 72-byte header + arrays, whole-image
-crc32c at offset 68 computed with that field zeroed):
+`.tmeta` layout (little-endian, fixed 80-byte header + arrays, whole-image
+crc32c at offset 68 computed with that field zeroed). Version 1 wrote a
+72-byte header and no origin map; it is still read, with the map empty:
 
 | off | field | notes |
 |---|---|---|
 | 0 | magic `UCTR` | |
-| 4 | format_version u32 | reject mismatches (treat as absent) |
+| 4 | format_version u32 | 2 today; 1 still accepted. Anything else is treated as absent — see the version note below |
 | 8 | flags u32 | reserved |
 | 12 | encoding u8 | 1=ZSTD-1, 2=LZ4, 3=raw (current builders write ZSTD-1) |
 | 13 | cksum_kind u8 | origin validator kind |
@@ -103,7 +104,25 @@ crc32c at offset 68 computed with that field zeroed):
 | 48 | tdata_bytes u64 | exact `.tdata` size |
 | 56 | key_len u32 · 60 n_extents u32 · 64 n_superseded u32 | |
 | 68 | tmeta_crc u32 | whole-image crc32c |
-| 72 | key, extents (virt_off,len,tdata_off u64×3), superseded (off,len u64×2), crc32c u32 × n_overlay_pages | extents sorted, non-overlapping; overlay page = 64 KiB |
+| 72 | n_orig_map u32 (v2 only) | 76..79 padding; a v1 image ends the header at 72 |
+| 80 | key, extents (virt_off,len,tdata_off u64×3), superseded (off,len u64×2), orig_map (virt_off,len,orig_off,orig_len u64×4), crc32c u32 × n_overlay_pages | extents sorted, non-overlapping; overlay page = 64 KiB. The map is sorted by virt_off; v1 images have none and the array is absent |
+
+The origin map records, for each piece the builder relocated, the range of the
+ORIGINAL file whose content it carries. Serving never consults it — `.tdata`
+stays opaque bytes and the read path is byte for byte what it was — but it is
+what lets a read served from a replica be reported in the original file's own
+coordinates, and so compared with the same read served any other way. It is not
+a linear mapping: a recompressed piece has a different length than the piece it
+replaced, so an offset inside a mapped range has no meaningful original offset
+and the RANGE is the unit. Fields 0..71 are unchanged from version 1, which is
+why the crc keeps its place and a v1 image still parses.
+
+**Version skew is a hazard worth knowing about.** A reader that predates a
+version simply cannot tell an unfamiliar sidecar from a damaged one, so it
+reports corruption and removes the replica; the newer writer then rebuilds it,
+and two versions sharing a cache directory can take turns undoing each other's
+work. Nothing is lost and no wrong bytes are served, but the transcoding is
+paid for repeatedly. Point one version at a cache directory at a time.
 
 Rules:
 

@@ -212,6 +212,24 @@ reading was re-reading, and what the cache disk was asked to do.
   the cache was out of the loop and every byte was relayed. Such a run is a
   measured NO-CACHE BASELINE; `ucache summary`/`history` compare cached runs
   against it, matched by key through the per-file records.
+- `threads_high_water` — the most threads this process had alive at once,
+  every thread it owns, not the ones doing the work. Recorded, not a width:
+  a runtime's worker pool inflates it freely.
+- `peak_cores` — the most cores busy in any one second, from CPU time sampled
+  once a second on the read path. This IS a width: CPU seconds per wall second
+  cannot exceed the cores actually executing. Sampled where reads happen, not
+  where files open, because opens all land before the work starts and would
+  report one core for a job running on thirty-two.
+- `cpu_us`, `instructions`, `cycles` — work done, as opposed to time taken.
+  Instructions are the stable one across routes: the same analysis over the
+  same data executes very nearly the same number however the bytes reached it,
+  which is what makes two runs comparable at all. Requires performance counters
+  to be permitted; absent (zero) where they are not.
+- `reads_in_flight_high_water` — the most reads being SET UP at once. Read the
+  name with care: every route here dispatches and returns while a synchronous
+  caller waits above this library, so this spans the handoff, not the read, and
+  a job with thirty-two reads genuinely outstanding can report a handful. It is
+  recorded and displayed; nothing is decided from it.
 - Counters are process-lifetime monotonic; successive lines from one process
   supersede earlier ones (consumers take the last line per file).
 
@@ -228,8 +246,31 @@ reading was re-reading, and what the cache disk was asked to do.
   ```json
   {"ts": 0, "key": "root://…", "opens": 0, "served_bytes": 0, "ram_bytes": 0,
    "replica_bytes": 0, "disk_reads": 0, "disk_seq": 0, "disk_bytes": 0,
-   "first_touch_bytes": 0, "wire_bytes": 0, "span_us": 0, "mode": "cached"}
+   "first_touch_bytes": 0, "wire_bytes": 0, "span_us": 0, "origin_size": 0,
+   "read_sig": "", "read_buckets": 0, "mode": "cached"}
   ```
+
+  `origin_size` is the file's size at the origin — the one measure of a file
+  that means the same thing whichever route served it, and therefore the only
+  sound weight when combining files.
+
+  `read_sig` and `read_buckets` say WHICH parts of the file were read, and how
+  many, in the ORIGINAL file's coordinates. The file is divided into 1 MiB
+  blocks and the signature is a hash of the set that were touched; a read
+  served from a replica is mapped back through the sidecar's origin map first,
+  so the answer does not depend on the route. Two runs of one analysis agree;
+  two analyses over the same files do not, which is what separates them when
+  the file list alone cannot.
+
+  An empty `read_sig` means UNKNOWN, never "nothing was read" — a replica
+  written before origin maps existed cannot answer, and so says nothing rather
+  than something wrong. Treat it as no evidence.
+
+  **A consumer reading these must take the record with the most
+  `read_buckets`, not the last one.** A file can be reported more than once in
+  a process, and the footprint grows for as long as the process runs, so
+  earlier records hold subsets of later ones. Taking the last record is right
+  for every other field here and wrong for this one.
 
   `span_us` is the wall this file was live and working, from open to last
   activity. Where one worker handles one file at a time that is the worker's
