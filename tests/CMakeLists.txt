@@ -32,6 +32,7 @@ add_executable(ucache-unit-tests
   unit/executor_test.cc
   unit/runlog_test.cc
   unit/readfootprint_test.cc
+  unit/origin_inflight_test.cc
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)

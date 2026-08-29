@@ -5,6 +5,7 @@
 #include "Log.h"
 #include "OpenRetry.h"
 #include "ReadRounding.h"
+#include "OriginInFlight.h"
 #include "Trace.h"
 #include "vendor/crc32c.h"
 
@@ -487,69 +488,48 @@ static void noteVectorRequest(const std::shared_ptr<HandleState>& st,
     s.reqReadBytes.add(c.length);
 }
 
-// One read outstanding at the ORIGIN, for as long as this object lives. It
-// goes INSIDE the handler that owns a wire read, because that handler is
-// constructed at the issue and destroyed exactly once -- on completion or on a
-// failed issue -- which is the same span the origin sees. Counting on entry to
-// Read and releasing on return measured the handoff instead: every route here
-// dispatches and returns while the caller waits above this library, so 32
-// threads with a read each reported a handful.
-struct OriginInFlight {
-  Stats* s = nullptr;
-  OriginInFlight() = default;
-  explicit OriginInFlight(Stats* st) : s(st) {
-    if (!s)
-      return;
-    const uint64_t n = s->originReadsInFlight.fetch_add(1, std::memory_order_relaxed) + 1;
-    uint64_t hw = s->originReadsInFlightHighWater.load(std::memory_order_relaxed);
-    while (n > hw && !s->originReadsInFlightHighWater.compare_exchange_weak(
-                         hw, n, std::memory_order_relaxed))
-      ;
-  }
-  OriginInFlight(const OriginInFlight&) = delete;
-  OriginInFlight& operator=(const OriginInFlight&) = delete;
-  OriginInFlight(OriginInFlight&& o) noexcept : s(o.s) { o.s = nullptr; }
-  OriginInFlight& operator=(OriginInFlight&& o) noexcept {
-    if (this != &o) {
-      if (s)
-        s->originReadsInFlight.fetch_sub(1, std::memory_order_relaxed);
-      s = o.s;
-      o.s = nullptr;
+
+// The one handler that hands a pass-through completion back to the caller.
+// Every fail-open route uses it. It exists as one type because it did not:
+// three routes carried their own copy of these fifteen lines, and only one of
+// the copies ever acquired the in-flight guard, so an origin read issued while
+// failing open was invisible to the counter that exists to see it.
+struct RelayHandler : XrdCl::ResponseHandler {
+  std::shared_ptr<HandleState> st;
+  XrdCl::ResponseHandler* user = nullptr;
+  OriginInFlight inflight;
+  void HandleResponseWithHosts(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r,
+                               XrdCl::HostList* h) override {
+    st->releaseInner();
+    inflight.release();
+    if (user)
+      user->HandleResponseWithHosts(s, r, h);
+    else {
+      delete s;
+      delete r;
+      delete h;
     }
-    return *this;
-  }
-  ~OriginInFlight() {
-    if (s)
-      s->originReadsInFlight.fetch_sub(1, std::memory_order_relaxed);
+    delete this;
   }
 };
+
+// Every relay is issued the same way: take the guard as the request goes out,
+// so it spans the read rather than the handler's lifetime.
+static RelayHandler* newRelay(const std::shared_ptr<HandleState>& st,
+                              XrdCl::ResponseHandler* user) {
+  auto* relay = new RelayHandler;
+  relay->st = st;
+  relay->user = user;
+  if (st->store)
+    relay->inflight = OriginInFlight(&st->store->stats());
+  return relay;
+}
 
 template <typename Issue>
 static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
                                         XrdCl::ResponseHandler* user, Issue issue) {
-  struct Relay : XrdCl::ResponseHandler {
-    std::shared_ptr<HandleState> st;
-    XrdCl::ResponseHandler* user;
-    OriginInFlight inflight; // released when this handler is destroyed
-    void HandleResponseWithHosts(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r,
-                                 XrdCl::HostList* h) override {
-      st->releaseInner();
-      if (user)
-        user->HandleResponseWithHosts(s, r, h);
-      else {
-        delete s;
-        delete r;
-        delete h;
-      }
-      delete this;
-    }
-  };
   if (XrdCl::File* f = st->acquireInner()) {
-    auto* relay = new Relay;
-    relay->st = st;
-    relay->user = user;
-    if (st->store)
-      relay->inflight = OriginInFlight(&st->store->stats());
+    auto* relay = newRelay(st, user);
     XrdCl::XRootDStatus s = issue(f, static_cast<XrdCl::ResponseHandler*>(relay));
     if (!s.IsOK()) {
       delete relay;
@@ -666,6 +646,12 @@ class MissReadHandler : public ResponseHandler {
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
     st_->releaseInner();
+    // The origin read this handler was waiting for has landed. Give the guard
+    // back HERE and not at destruction: a fail-open retry below issues a fresh
+    // origin read with its own guard, and holding this one across it would
+    // count one read as two -- while a caller that starts its next read from
+    // inside its completion handler would do the same.
+    inflight_.release();
     std::unique_ptr<XRootDStatus> s(status);
     std::unique_ptr<AnyObject> r(response);
     std::unique_ptr<HostList> h(hostList);
@@ -684,25 +670,7 @@ class MissReadHandler : public ResponseHandler {
         entry_->endFetch(wireOff_, gateLen_); // waiters refetch on their own
       st_->noteCacheError(globalConfig());
       if (XrdCl::File* f = st_->acquireInner()) {
-        struct Relay : ResponseHandler {
-          std::shared_ptr<HandleState> st;
-          ResponseHandler* user;
-          void HandleResponseWithHosts(XRootDStatus* s2, AnyObject* r2,
-                                       HostList* h2) override {
-            st->releaseInner();
-            if (user)
-              user->HandleResponseWithHosts(s2, r2, h2);
-            else {
-              delete s2;
-              delete r2;
-              delete h2;
-            }
-            delete this;
-          }
-        };
-        auto* relay = new Relay;
-        relay->st = st_;
-        relay->user = user_;
+        auto* relay = newRelay(st_, user_);
         XRootDStatus s2 = f->Read(userOff_, userLen_, userBuf_, relay, 0);
         if (s2.IsOK()) {
           delete this;
@@ -756,7 +724,7 @@ class MissReadHandler : public ResponseHandler {
   std::shared_ptr<std::vector<char>> wireBuf_;
   uint64_t t0_;
   uint64_t gateLen_;
-  OriginInFlight inflight_; // one origin read, until this handler is destroyed
+  OriginInFlight inflight_; // the origin read this handler waits for
 };
 
 // Issue the rounded wire read for a single-Read miss, honoring the test-only
@@ -846,6 +814,12 @@ class MissVReadHandler : public ResponseHandler {
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
     st_->releaseInner();
+    // The origin read this handler was waiting for has landed. Give the guard
+    // back HERE and not at destruction: a fail-open retry below issues a fresh
+    // origin read with its own guard, and holding this one across it would
+    // count one read as two -- while a caller that starts its next read from
+    // inside its completion handler would do the same.
+    inflight_.release();
     std::unique_ptr<XRootDStatus> s(status);
     std::unique_ptr<AnyObject> r(response);
     std::unique_ptr<HostList> h(hostList);
@@ -855,25 +829,7 @@ class MissVReadHandler : public ResponseHandler {
       // pure pass-through (hits included; wasteful but simple and faithful).
       st_->noteCacheError(globalConfig());
       if (XrdCl::File* f = st_->acquireInner()) {
-        struct Relay : ResponseHandler {
-          std::shared_ptr<HandleState> st;
-          ResponseHandler* user;
-          void HandleResponseWithHosts(XRootDStatus* s2, AnyObject* r2,
-                                       HostList* h2) override {
-            st->releaseInner();
-            if (user)
-              user->HandleResponseWithHosts(s2, r2, h2);
-            else {
-              delete s2;
-              delete r2;
-              delete h2;
-            }
-            delete this;
-          }
-        };
-        auto* relay = new Relay;
-        relay->st = st_;
-        relay->user = user_;
+        auto* relay = newRelay(st_, user_);
         XRootDStatus s2 = f->VectorRead(userChunks_, nullptr, relay, 0);
         if (s2.IsOK()) {
           delete this;
@@ -964,7 +920,7 @@ class MissVReadHandler : public ResponseHandler {
   std::vector<WireElem> wire_;
   ResponseHandler* user_;
   uint64_t t0_;
-  OriginInFlight inflight_; // one origin read, until this handler is destroyed
+  OriginInFlight inflight_; // the origin read this handler waits for
 };
 
 // Rounded [start,end) for a chunk; the rule and why it is not optional are in

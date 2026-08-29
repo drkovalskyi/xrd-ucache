@@ -108,8 +108,12 @@ struct Stats {
   // and 64 concurrent streams, so not even monotone. Two runs at the same
   // value put the same load on the origin; two at different values are not
   // comparable, whatever their thread counts say. Counted where a read is
-  // ISSUED to the origin and released when its handler fires, so it spans the
-  // read rather than the call that started it.
+  // ISSUED to the origin and released at the TOP of its completion handler,
+  // before the caller's own handler runs, so it spans the read rather than the
+  // call that started it. Releasing at destruction instead would hold it
+  // across the caller's handler, and a caller that starts its next read from
+  // in there -- the shape that creates real concurrency -- would be counted as
+  // two reads where it had one.
   //
   // A warm run reads 0, correctly: nothing was outstanding at the origin
   // because nothing went there.
