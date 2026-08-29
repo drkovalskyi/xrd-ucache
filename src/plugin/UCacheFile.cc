@@ -399,10 +399,17 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
       st->store->relayFootprint(st->url).note(off, len);
     return;
   }
-  if (view && view->hasOriginMap()) {
-    // A stitched read addresses the replica's layout; translate before
-    // recording. A v1 sidecar has no map and contributes nothing, which leaves
-    // the signature empty rather than wrong.
+  if (view) {
+    // A stitched read addresses the REPLICA's layout, which is not the
+    // original file's. Without a map there is no way back, so the read
+    // contributes nothing and the signature stays empty -- "unknown", which
+    // the reader treats as no evidence. Recording it untranslated would put
+    // replica offsets into a signature that claims to be in original
+    // coordinates: relocated data lands past the end of the file and is
+    // dropped, data still in place lands correctly, and the result is a
+    // confident partial answer that matches no other route.
+    if (!view->hasOriginMap())
+      return;
     std::vector<ReplicaMeta::Range> orig;
     view->originRanges(off, len, orig);
     for (const auto& r : orig)
@@ -457,12 +464,23 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
     // The file's size at the origin, which is the one figure that means the
     // same thing on both routes. force=false answers from the open response,
     // so this costs no round trip.
+    // Prefer the copy taken at open: it costs nothing and, unlike the inner
+    // file, it cannot be swapped out from under this by a retry. Asking the
+    // inner file is the fallback, and it goes through acquire/release like
+    // every other use of it -- reading `inner` raw here was a race with
+    // resetInner, and this runs from the DESTRUCTOR, where a blocking call on
+    // a dead connection stalls teardown once per relayed file.
     uint64_t originSize = 0;
-    if (st->inner && st->inner->IsOpen()) {
-      XrdCl::StatInfo* si = nullptr;
-      if (st->inner->Stat(false, si).IsOK() && si)
-        originSize = si->GetSize();
-      delete si;
+    if (st->statInfo) {
+      originSize = st->statInfo->GetSize();
+    } else if (XrdCl::File* f = st->acquireInner()) {
+      if (f->IsOpen()) {
+        XrdCl::StatInfo* si = nullptr;
+        if (f->Stat(false, si).IsOK() && si)
+          originSize = si->GetSize();
+        delete si;
+      }
+      st->releaseInner();
     }
     st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize);
   }
@@ -1789,6 +1807,13 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
   if (entry)
     noteRequestBytes(st_, size); // a stitched PgRead drives the same physical
                                  // reads as Read, so it must be sampled too
+  // A PgRead is an application read like any other. Leaving it out of the
+  // footprint meant a client that uses PgRead -- which some copy tools do by
+  // default -- signed only whatever it happened to fetch through Read, so the
+  // same work looked different depending on which call the reader chose. The
+  // in-flight count and the width sample were missing for the same reason.
+  InFlightRead inflight(st_->store ? &st_->store->stats() : nullptr);
+  noteAppRead(st_, entry, currentView(), offset, size);
   if (auto view = currentView(); entry && view) {
     if (offset + size < offset) { // overflow
       noteRelayBytes(st_, size, offset, size);

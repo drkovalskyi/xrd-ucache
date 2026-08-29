@@ -207,6 +207,23 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
 // than no speedup. A gain BELOW 1 is reported, not clamped: a cache slower
 // than the origin is a real answer and the whole point of measuring.
 struct GainEstimate {
+  // WHY a run has no gain, decided where the decision is actually made. The
+  // summary used to re-derive this from the run's own fields and got three
+  // classes wrong -- a fill and a run under the size floor both came out as
+  // "no comparable baseline", which sent the reader off to record a baseline
+  // that would not have helped. A reason and its label must come from one
+  // place or they drift.
+  enum class Why {
+    kMeasured,      // a gain was produced
+    kIsBaseline,    // this run IS the reference others are measured against
+    kFilled,        // it filled the cache rather than being served by it
+    kTooShort,      // under the duration floor
+    kTooSmall,      // too little data moved to divide
+    kIncomplete,    // no per-file records, or nothing attributable
+    kReadDifferent, // a baseline exists but the two read different work
+    kNoBaseline,    // nothing recorded that could serve as a reference
+  };
+  Why why = Why::kNoBaseline;
   bool valid = false;
   double gain = 0.0;          // (wall + saved) / wall
   double savedS = 0.0;        // seconds the origin would have cost beyond the cache
@@ -243,6 +260,10 @@ struct Totals {
 // to stop somewhere). Whatever it skips is reported in `gainCapped` rather
 // than silently dropped.
 Totals summarize(const std::vector<Run>& runs, size_t maxEstimates = 100);
+// The same ceiling, for anything else that has to estimate run by run: every
+// estimate walks every run, so an uncapped pass is quadratic in a directory
+// that only ever grows.
+inline constexpr size_t kMaxSummaryEstimates = 100;
 
 // NOTE. An estimate built from per-file spans lived here and was REMOVED. It
 // compared per-file COST between the two routes and was blind to OVERLAP --

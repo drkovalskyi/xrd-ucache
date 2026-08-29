@@ -1007,6 +1007,21 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
 
   // The aggregate goes FIRST: one run says what happened last time, the total
   // says whether the cache is worth having at all.
+  // A number that outgrows its column pushes every column after it one place
+  // right, and the row stops lining up with the header that names it. Rather
+  // than widen for a case nobody has hit, drop decimals as the value grows:
+  // 2.26 and 226 are both worth reading, 226.26 in five places is not worth
+  // breaking the table for. Values already published here reach three figures
+  // where two were budgeted, so this is not hypothetical.
+  auto fit = [](double v, int w, int maxDec) {
+    char b[64];
+    for (int d = maxDec; d >= 0; --d) {
+      std::snprintf(b, sizeof b, "%.*f", d, v);
+      if (static_cast<int>(std::strlen(b)) <= w)
+        return std::string(b);
+    }
+    return std::string(static_cast<size_t>(w), '*'); // off scale: say so, stay aligned
+  };
   // Widths follow the DATA, not the labels -- that is what stacking the header
   // buys. Every column is as narrow as its widest value, and one format string
   // drives the two header rows, the aggregate and every run, so they cannot
@@ -1046,13 +1061,16 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   pct(t.originBytes, allTotal), pct(t.hitBytes, allTotal),
                   pct(t.replicaBytes, allTotal), pct(t.relayBytes, allTotal));
     if (t.haveGain)
-      std::snprintf(allGain, sizeof allGain, "%5.2f", t.gain);
+      std::snprintf(allGain, sizeof allGain, "%5s", fit(t.gain, 5, 2).c_str());
     else
       std::snprintf(allGain, sizeof allGain, "%5s", "-");
-    std::snprintf(allWhen, sizeof allWhen, "ALL %zu runs", t.runs);
+    // "ALL 100 runs" is one wider than a timestamp, so past 99 runs the label
+    // itself would shift the row. The count alone still reads, and the line
+    // above the table already says how many runs there are.
+    std::snprintf(allWhen, sizeof allWhen, t.runs < 100 ? "ALL %zu runs" : "ALL %zu", t.runs);
     char allFiles[16], allRead[16];
     std::snprintf(allFiles, sizeof allFiles, "%5zu", t.distinctFiles);
-    std::snprintf(allRead, sizeof allRead, "%6.1f", gb(allTotal));
+    std::snprintf(allRead, sizeof allRead, "%6s", fit(gb(allTotal), 6, 1).c_str());
     std::printf(kRowFmt, allWhen, humanDur(t.durationS).c_str(), "", "", "", "",
                 allFiles, allRead, allTiers, "", "", "", "", "", allGain);
     std::printf(kRowFmt, "-----------", "------", "------", "------", "----", "---",
@@ -1094,7 +1112,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // --detail, not in a column a reader scans.
     char gainCell[16];
     if (g.valid)
-      std::snprintf(gainCell, sizeof gainCell, "%5.2f", g.gain);
+      std::snprintf(gainCell, sizeof gainCell, "%5s", fit(g.gain, 5, 2).c_str());
     else if (r.disabled || r.baselineQualified())
       std::snprintf(gainCell, sizeof gainCell, "%5s", "base");
     else
@@ -1108,9 +1126,9 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // plus any serial phase -- and is labelled as one wherever it is explained.
     char insT[16], insRate[16], cpuSplit[16];
     if (r.instructions) {
-      std::snprintf(insT, sizeof insT, "%5.2f", r.instructions / 1e12);
-      std::snprintf(insRate, sizeof insRate, "%5.1f",
-                    r.instructions / 1e9 / static_cast<double>(r.durationS()));
+      std::snprintf(insT, sizeof insT, "%5s", fit(r.instructions / 1e12, 5, 2).c_str());
+      std::snprintf(insRate, sizeof insRate, "%5s",
+                    fit(r.instructions / 1e9 / static_cast<double>(r.durationS()), 5, 1).c_str());
     } else {
       std::snprintf(insT, sizeof insT, "%5s", "-");
       std::snprintf(insRate, sizeof insRate, "%5s", "-");
@@ -1118,7 +1136,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // CPU measured, WR measured, STL the remainder — labelled as one wherever
     // it is explained, because read waiting and any serial phase land in it.
     if (r.cpuUs)
-      std::snprintf(cpuSplit, sizeof cpuSplit, "%4.1f", r.coresBusy());
+      std::snprintf(cpuSplit, sizeof cpuSplit, "%4s", fit(r.coresBusy(), 4, 1).c_str());
     else
       std::snprintf(cpuSplit, sizeof cpuSplit, "%4s", "-");
     // What caching ADDED, as a fraction of the direct read this run performed.
@@ -1126,7 +1144,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // than a zero that would read as "no overhead".
     char wrCell[16];
     if (r.originWaitS() > 0.0)
-      std::snprintf(wrCell, sizeof wrCell, "%4.1f", 100.0 * r.overhead());
+      std::snprintf(wrCell, sizeof wrCell, "%4s", fit(100.0 * r.overhead(), 4, 1).c_str());
     else
       std::snprintf(wrCell, sizeof wrCell, "%4s", "-");
     char rif[24];
@@ -1141,8 +1159,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       std::snprintf(thr, sizeof thr, "%4s", "-");
     char cFiles[16], cRead[16], cRate[16], cDur[16];
     std::snprintf(cFiles, sizeof cFiles, "%5zu", r.files.size());
-    std::snprintf(cRead, sizeof cRead, "%6.1f", gb(rowTotal));
-    std::snprintf(cRate, sizeof cRate, "%5.3f", gbPerS(rowTotal, r.durationS()));
+    std::snprintf(cRead, sizeof cRead, "%6s", fit(gb(rowTotal), 6, 1).c_str());
+    std::snprintf(cRate, sizeof cRate, "%5s", fit(gbPerS(rowTotal, r.durationS()), 5, 3).c_str());
     std::snprintf(cDur, sizeof cDur, "%-6s", humanDur(r.durationS()).c_str());
     std::printf(kRowFmt, stampShort(r.startS).c_str(), cDur,
                 r.sig.empty() ? "-" : r.sig.c_str(),
@@ -1279,32 +1297,46 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
         // Enumerate by REASON. "8 of 12 could not be measured" reads as the
         // tool failing until you see that half of them are the baselines the
         // other half were measured against.
-        size_t bases = 0, tooShort = 0, noBase = 0, other = 0;
+        // Ask the estimate why, rather than guessing from the run's fields:
+        // guessing put fills and undersized runs in the "no comparable
+        // baseline" bucket, which told the reader to go record a baseline that
+        // would have changed nothing.
+        size_t bases = 0, tooShort = 0, tooSmall = 0, filled = 0, readDiff = 0, noBase = 0,
+               other = 0;
+        // Each estimate walks every run, so this is quadratic and stops where
+        // the headline's own count stops.
+        size_t examined = 0;
         for (const auto& r : runs) {
-          if (estimateGain(r, runs).valid)
-            continue;
-          if (r.disabled || r.baselineQualified())
-            ++bases;
-          else if (r.durationS() < 30)
-            ++tooShort;
-          else if (r.readSig.empty() || r.sig.empty())
-            ++other;
-          else
-            ++noBase;
+          if (examined >= ucache::kMaxSummaryEstimates)
+            break;
+          ++examined;
+          switch (estimateGain(r, runs).why) {
+            case ucache::GainEstimate::Why::kMeasured: continue;
+            case ucache::GainEstimate::Why::kIsBaseline: ++bases; break;
+            case ucache::GainEstimate::Why::kFilled: ++filled; break;
+            case ucache::GainEstimate::Why::kTooShort: ++tooShort; break;
+            case ucache::GainEstimate::Why::kTooSmall: ++tooSmall; break;
+            case ucache::GainEstimate::Why::kIncomplete: ++other; break;
+            case ucache::GainEstimate::Why::kReadDifferent: ++readDiff; break;
+            case ucache::GainEstimate::Why::kNoBaseline: ++noBase; break;
+          }
         }
-        char buf[256];
+        char buf[320];
         int n = std::snprintf(buf, sizeof buf, "%zu of %zu runs not measured:",
                               t.runs - t.runsEstimated, t.runs);
-        if (bases)
-          n += std::snprintf(buf + n, sizeof buf - n,
-                             "  %zu baseline(s) — they are the reference", bases);
-        if (tooShort)
-          n += std::snprintf(buf + n, sizeof buf - n, "  %zu under 30s", tooShort);
-        if (noBase)
-          n += std::snprintf(buf + n, sizeof buf - n,
-                             "  %zu with no comparable baseline", noBase);
-        if (other)
-          std::snprintf(buf + n, sizeof buf - n, "  %zu incomplete", other);
+        auto add = [&](size_t c, const char* what) {
+          if (c)
+            n += std::snprintf(buf + n, sizeof buf - n, "  %zu %s", c, what);
+        };
+        add(bases, "baseline(s) — they are the reference");
+        add(filled, "filled the cache");
+        add(tooShort, "under 30s");
+        add(tooSmall, "moved too little data");
+        add(readDiff, "read different work than the baseline");
+        add(noBase, "with no comparable baseline");
+        add(other, "incomplete");
+        if (examined < runs.size())
+          std::snprintf(buf + n, sizeof buf - n, "  (reasons for the newest %zu)", examined);
         caveats.push_back(buf);
       }
     } else {

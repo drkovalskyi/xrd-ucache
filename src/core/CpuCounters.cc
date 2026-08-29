@@ -19,7 +19,17 @@ namespace ucache {
 
 #if defined(__linux__)
 namespace {
-int openCounter(uint64_t config) {
+// `inherit` follows the whole task tree, and a task tree includes anything the
+// process SPAWNS. This one spawns a recompression helper that decodes and
+// re-encodes gigabytes, so its instructions landed in the run's own count --
+// and the same work with recompression off then looked like different work,
+// which is the one comparison these counters exist to support. Asking the
+// kernel to drop the event when a task execs removes the helper without
+// touching the threads that do the analysis, since those never exec.
+//
+// Kernels before 5.13 have no such bit and reject the attribute outright, so
+// the open is retried without it rather than losing the counters entirely.
+int openCounter(uint64_t config, bool dropOnExec) {
   struct perf_event_attr attr;
   ::memset(&attr, 0, sizeof attr);
   attr.type = PERF_TYPE_HARDWARE;
@@ -29,9 +39,21 @@ int openCounter(uint64_t config) {
   attr.exclude_kernel = 1;
   attr.exclude_hv = 1;
   attr.inherit = 1; // count every thread this process spawns
-  const int fd = static_cast<int>(
-      ::syscall(SYS_perf_event_open, &attr, /*pid=*/0, /*cpu=*/-1, /*group=*/-1, /*flags=*/0));
+#if defined(PERF_ATTR_SIZE_VER7)
+  if (dropOnExec)
+    attr.remove_on_exec = 1;
+#else
+  (void)dropOnExec;
+#endif
+  // CLOEXEC as well: the helper has no use for the descriptor either.
+  const int fd = static_cast<int>(::syscall(SYS_perf_event_open, &attr, /*pid=*/0, /*cpu=*/-1,
+                                            /*group=*/-1, PERF_FLAG_FD_CLOEXEC));
   return fd; // < 0 simply means "not permitted here"
+}
+
+int openCounter(uint64_t config) {
+  const int fd = openCounter(config, /*dropOnExec=*/true);
+  return fd >= 0 ? fd : openCounter(config, /*dropOnExec=*/false);
 }
 
 uint64_t readCounter(int fd) {

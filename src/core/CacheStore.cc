@@ -201,6 +201,11 @@ std::shared_ptr<FileEntry> CacheStore::open(const UrlKey& key, uint64_t originSi
                                [this](uint64_t b, bool ev) { notePersisted(b, ev); });
   if (!entry)
     return nullptr;
+  // Record reads into the store's footprint for this file, not the entry's
+  // own: the entry dies with its last handle, and a second pass over the same
+  // file would then start from nothing. Stable for the life of the process --
+  // the table holds owning pointers and never erases.
+  entry->useSharedFootprint(footprintFor(key.key));
   {
     std::lock_guard<std::mutex> g(regMu_);
     // Racing opens of the same key: keep the first registered one.
@@ -803,19 +808,34 @@ FileEntry::ScrubResult CacheStore::verify(const UrlKey& key, uint64_t originSize
   return e->verifyAll();
 }
 
-ReadFootprint& CacheStore::relayFootprint(const std::string& url) {
+ReadFootprint* CacheStore::footprintFor(const std::string& url) {
+  auto k = UrlKey::parse(url, cfg_.keepCgi);
+  const std::string& key = k ? k->key : url;
   std::lock_guard<std::mutex> g(relayFpMu_);
-  auto& p = relayFp_[url];
-  if (!p)
-    p = std::make_unique<ReadFootprint>();
-  return *p;
+  auto it = relayFp_.find(key);
+  if (it != relayFp_.end())
+    return it->second.get();
+  if (relayFp_.size() >= kMaxFootprints)
+    return nullptr;
+  auto& p = relayFp_[key];
+  p = std::make_unique<ReadFootprint>();
+  return p.get();
+}
+
+ReadFootprint& CacheStore::relayFootprint(const std::string& url) {
+  // The relay path has always had somewhere to put a read; keeping a spare
+  // here means it still does when the table is full, and the throwaway is
+  // never read back because the record is written from footprintFor.
+  static ReadFootprint sink;
+  ReadFootprint* fp = footprintFor(url);
+  return fp ? *fp : sink;
 }
 
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
                                 uint64_t spanUs, uint64_t originSize) {
-  const ReadFootprint& fp = relayFootprint(url);
-  const std::string readSig = fp.sig(originSize);
-  const uint64_t readBuckets = fp.count(originSize);
+  const ReadFootprint* fp = footprintFor(url);
+  const std::string readSig = fp ? fp->sig(originSize) : std::string();
+  const uint64_t readBuckets = fp ? fp->count(originSize) : 0;
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its
   // wall must be divided by.

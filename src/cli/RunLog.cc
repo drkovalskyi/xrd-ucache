@@ -33,9 +33,19 @@ void fieldHist(const std::string& line, const char* key, std::vector<uint64_t>& 
   p += needle.size();
   out.clear();
   while (p < line.size() && line[p] != ']') {
+    const size_t start = p;
     uint64_t v = 0;
     while (p < line.size() && line[p] >= '0' && line[p] <= '9')
       v = v * 10 + static_cast<uint64_t>(line[p++] - '0');
+    if (p == start) {
+      // Not a digit, not a separator, not the end: the field is malformed.
+      // Consuming nothing here and going round again is an infinite loop that
+      // also appends a bucket every pass, so one stray byte mid-line turns
+      // into a hang and unbounded memory. A histogram we cannot read is worth
+      // nothing, so drop it and leave the rest of the line to be parsed.
+      out.clear();
+      return;
+    }
     out.push_back(v);
     if (p < line.size() && line[p] == ',')
       ++p;
@@ -276,6 +286,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   constexpr double kMinReadAgreement = 0.90;
 
   if (run.disabled) {
+    g.why = GainEstimate::Why::kIsBaseline;
     g.reason = "this run IS a baseline (cache disabled) — it is what others are "
                "measured against";
     return g;
@@ -285,22 +296,27 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   // the cache bought anyone, and printing it under "gain" invites exactly the
   // wrong reading.
   if (run.originBytes > run.cacheBytes()) {
+    g.why = GainEstimate::Why::kFilled;
     g.reason = "this run filled the cache rather than being served by it";
     return g;
   }
   if (run.cacheBytes() == 0) {
+    g.why = GainEstimate::Why::kIncomplete;
     g.reason = "the cache served nothing in this run";
     return g;
   }
   if (run.cacheBytes() < kMinBytes) {
+    g.why = GainEstimate::Why::kTooSmall;
     g.reason = "too little data moved to measure (under 64 MiB served)";
     return g;
   }
   if (run.files.empty()) {
+    g.why = GainEstimate::Why::kIncomplete;
     g.reason = "no per-file records for this run";
     return g;
   }
   if (run.durationS() < kMinDurationS) {
+    g.why = GainEstimate::Why::kTooShort;
     g.reason = "the run was too short to time at one-second resolution (under 30 s)";
     return g;
   }
@@ -311,6 +327,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     runServedTotal += f.servedBytes;
   }
   if (runServedTotal == 0) {
+    g.why = GainEstimate::Why::kIncomplete;
     g.reason = "no served bytes attributed to files in this run";
     return g;
   }
@@ -413,6 +430,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // reaches the coverage arithmetic, so its counters look like "no baseline
     // at all" — which is the one thing this refusal must not be mistaken for.
     if (readSigMismatch) {
+      g.why = GainEstimate::Why::kReadDifferent;
       char buf[224];
       std::snprintf(buf, sizeof buf,
                     "a baseline exists for these files but the two runs read the same "
@@ -444,6 +462,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   const double originTime = refDur * refC; // what these files cost with no cache
   const double cacheTime = runDur * refD;  // what they cost from the cache now
 
+  g.why = GainEstimate::Why::kMeasured;
   g.valid = true;
   g.savedS = originTime - cacheTime;
   g.gain = (runDur + g.savedS) / runDur;

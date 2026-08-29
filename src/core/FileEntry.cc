@@ -163,8 +163,8 @@ void FileEntry::emitObsRecord() {
      // origin compressed -- so they cannot normalise a comparison between
      // routes; the file's size at the origin can.
      << ",\"origin_size\":" << meta_.fileSize
-     << ",\"read_sig\":\"" << footprint_.sig(meta_.fileSize) << "\",\"read_buckets\":"
-     << footprint_.count(meta_.fileSize)
+     << ",\"read_sig\":\"" << footprint().sig(meta_.fileSize) << "\",\"read_buckets\":"
+     << footprint().count(meta_.fileSize)
      // A file this process mostly FETCHED is a fill, whatever else it also
      // served; the distinction decides which population a measurement joins.
      << ",\"mode\":\"" << (v(obs_.wireBytes) > v(obs_.servedBytes) ? "fill" : "cached")

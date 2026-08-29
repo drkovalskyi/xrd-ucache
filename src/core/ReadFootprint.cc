@@ -10,8 +10,13 @@ void ReadFootprint::note(uint64_t off, uint64_t len) {
   const uint64_t first = off / kBucket;
   const uint64_t last = (off + len - 1) / kBucket;
   // A hostile or corrupt range must not turn into an enormous allocation:
-  // this is a diagnostic, and refusing it costs only the signature.
-  if (last < first || last > (1ull << 32))
+  // this is a diagnostic, and refusing it costs only the signature. The bound
+  // has to be a plausible FILE, not a plausible integer -- at one bucket per
+  // MiB, 2^32 buckets is four petabytes and would have allocated half a
+  // gigabyte here, under the lock, from a single absurd offset. 2^24 is
+  // sixteen terabytes, past anything this reads and cheap to refuse.
+  constexpr uint64_t kMaxBucket = 1ull << 24;
+  if (last < first || last > kMaxBucket)
     return;
   std::lock_guard<std::mutex> g(mu_);
   const size_t need = static_cast<size_t>(last / 64) + 1;

@@ -170,11 +170,22 @@ class CacheStore {
   void recordRelayObs(const std::string& url, uint64_t bytes, const char* mode = "relay",
                       uint64_t spanUs = 0, uint64_t originSize = 0);
 
-  // The read footprint of a RELAYED url, shared by every handle on it in this
-  // process. A cached file has a FileEntry to hold this; a relayed one has
-  // nothing, and an application that opens a file twice would otherwise record
-  // two half-footprints and match neither.
-  ReadFootprint& relayFootprint(const std::string& url);
+  // The read footprint of one file, shared by every handle on it for as long
+  // as this process lives. Both routes need that lifetime: a relayed file has
+  // no FileEntry to hold one, and a cached file's entry is destroyed when its
+  // last handle closes, so an application that opens each file twice -- which
+  // ROOT does -- recorded two half-footprints and kept only the larger.
+  //
+  // Keyed the way records are keyed, not by the raw url: the same file asked
+  // for with different capitalisation, an explicit default port or a per-job
+  // token in the query string is one file, and splitting it produced exactly
+  // the half-footprints this exists to prevent.
+  //
+  // Returns nullptr once the table is full. A signature that stops growing
+  // would be a confident wrong answer, so the file records none at all --
+  // "unknown", which every reader already treats as no evidence.
+  ReadFootprint* footprintFor(const std::string& url);
+  ReadFootprint& relayFootprint(const std::string& url); // legacy name, relay path
 
   // The CLI opens a store only to read/mutate; suppress the destructor's stats
   // dump so `ucache` invocations don't litter stats/ with zero-counter lines.
@@ -237,6 +248,11 @@ class CacheStore {
   CpuCounters cpu_;
   std::mutex relayFpMu_;
   std::map<std::string, std::unique_ptr<ReadFootprint>> relayFp_;
+  // One bitmap plus a key per distinct file this process touched. Small per
+  // file, but a long-lived server process touches an unbounded number of them,
+  // so it stops rather than grows for ever. The ceiling is far above any
+  // analysis job and far below anything that matters for memory.
+  static constexpr size_t kMaxFootprints = 200000;
   std::mutex regMu_;
   std::map<std::string, std::weak_ptr<FileEntry>> registry_; // hash -> entry
   // Session summaries of closed entries for the per-entry coverage dump.

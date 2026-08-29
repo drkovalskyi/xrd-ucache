@@ -860,3 +860,19 @@ TEST(Baseline, ASwitchedOffRunBeatsANearerFill) {
   ASSERT_TRUE(g.valid) << g.reason;
   EXPECT_EQ(g.referenceStartS, 1000u) << "the switched-off run, not the nearer fill";
 }
+
+TEST(RunLog, AMalformedHistogramIsDroppedNotSpun) {
+  // One unexpected byte inside a histogram used to consume nothing per pass
+  // while appending a bucket every time: the CLI hung and grew without bound.
+  // A histogram that cannot be read is worth nothing, so it is dropped and the
+  // rest of the line still parses.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100,
+           "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824,"
+           "\"hist_origin_rt_us\":[1,2,x,4],\"threads_high_water\":32",
+           {{"root://o//a", kGiB, 0, 0, 0, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path()); // must return at all
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_EQ(runs[0].originWaitS(), 0.0) << "an unreadable histogram counts as no evidence";
+  EXPECT_EQ(runs[0].threadsHighWater, 32u) << "the rest of the line still parses";
+}

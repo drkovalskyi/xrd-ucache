@@ -188,8 +188,14 @@ class FileEntry {
   // Record that [off, off+len) of the ORIGINAL file was read. Callers on the
   // replica path must translate first (ReplicaView::originRanges); every other
   // route already addresses the origin's layout.
-  void noteRead(uint64_t off, uint64_t len) { footprint_.note(off, len); }
-  const ReadFootprint& footprint() const { return footprint_; }
+  void noteRead(uint64_t off, uint64_t len) { footprint().note(off, len); }
+  // The store hands over a footprint that outlives this entry, so a file
+  // opened twice accumulates instead of recording two halves. The entry's own
+  // is the fallback for a store that has run out of room and for tests that
+  // build an entry directly.
+  void useSharedFootprint(ReadFootprint* fp) { shared_ = fp; }
+  ReadFootprint& footprint() { return shared_ ? *shared_ : ownFootprint_; }
+  const ReadFootprint& footprint() const { return shared_ ? *shared_ : ownFootprint_; }
 
  private:
   FileEntry(IOBackend& io, const Config& cfg, Stats& stats, UrlKey key)
@@ -257,7 +263,8 @@ class FileEntry {
   // sequential-share counter (as the DISK sees the stream — thread
   // interleaving deliberately counts as non-sequential).
   Obs obs_;
-  ReadFootprint footprint_;
+  ReadFootprint ownFootprint_;
+  ReadFootprint* shared_ = nullptr;
   std::shared_ptr<ObsSink> obsSink_;
   std::atomic<bool> obsEmitted_{false};
   PageBitmap servedOnce_;

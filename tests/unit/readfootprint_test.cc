@@ -95,3 +95,15 @@ TEST(ReadFootprint, ASmallGapBetweenTwoReadsDoesNotChangeTheAnswer) {
   split.note(kB / 4, kB / 4);
   EXPECT_EQ(merged.sig(), split.sig());
 }
+
+TEST(ReadFootprint, AnAbsurdOffsetIsRefusedWithoutAllocating) {
+  // The guard is about a plausible FILE, not a plausible integer. One read at
+  // a petabyte offset used to size the bitmap for it -- half a gigabyte, held
+  // under the lock for the life of the process, from a single bad request or
+  // one corrupt mapping in a sidecar.
+  ReadFootprint f;
+  f.note(1ull << 52, 1);
+  EXPECT_TRUE(f.empty()) << "an offset no file can reach must record nothing";
+  f.note(4096, 4096); // and the object still works afterwards
+  EXPECT_EQ(f.count(1 << 20), 1u);
+}

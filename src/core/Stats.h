@@ -101,12 +101,22 @@ struct Stats {
   // only interpretable against the width it ran at, and CPU time divided by
   // wall x this is the share of the machine that was actually computing.
   std::atomic<uint64_t> threadsHighWater{0};
-  // Reads the application had outstanding at once, and the most it ever had.
-  // This is the concurrency the ORIGIN sees, which is what sets its delivery
-  // rate -- measured on eoscms at 147/1868/632 IOPS for 1/16/64 streams, so
-  // not even monotone. Threads alive and cores busy say nothing about it.
-  // Counts threads blocked inside a read call, so a caller using XrdCl
-  // asynchronously would not be seen; ROOT reads synchronously.
+  // Reads being HANDED OFF at once, and the most there ever were.
+  //
+  // READ THE NEXT SENTENCE BEFORE USING THIS. It is not the number of reads
+  // outstanding at the origin, which is what would set the origin's delivery
+  // rate. Every route here dispatches and returns -- the hit path posts to the
+  // executor, the miss and relay paths issue an asynchronous request -- and a
+  // synchronous caller then blocks ABOVE this library, in the client's own
+  // wait, long after the call below has returned. So this spans the handoff,
+  // not the read, and a job with thirty-two reads genuinely in flight can
+  // report a handful.
+  //
+  // Measuring the real thing means counting down in the completion handlers
+  // rather than on return, on every route, which is a change to the read path
+  // and not to a counter. Until then, read this as "how many reads were being
+  // set up at once" and nothing more. It is recorded and displayed; nothing
+  // is decided from it.
   std::atomic<uint64_t> readsInFlight{0};
   std::atomic<uint64_t> readsInFlightHighWater{0};
   Histogram hitReadUs;
