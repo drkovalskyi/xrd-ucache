@@ -35,11 +35,23 @@ class ReadFootprint {
   // gap between them, while a replica read maps back to the pages alone and
   // never names the gap. At 64 KiB those gaps landed in buckets one route
   // marked and the other did not, and four routes over one analysis produced
-  // three different answers; from 256 KiB up they agree, and 1 MiB is taken
-  // for margin against a workload that coalesces harder than the ones
-  // measured. Discrimination survives it: two analyses reading different
-  // columns of the same files share 17% of their buckets at this size, so a
-  // different analysis still reads as different work.
+  // three different answers; from 256 KiB up they agreed on the sets measured
+  // then, and 1 MiB is taken for margin. Discrimination survives it: two
+  // analyses reading different columns of the same files share 17% of their
+  // buckets at this size, so a different analysis still reads as different
+  // work.
+  //
+  // IT IS MARGIN, NOT A GUARANTEE, and the difference matters to anything
+  // that compares two runs. A replica is a rewritten container: the reader
+  // asks it for different spans than it asks the original, so the two routes
+  // do not merely coalesce differently, they request differently. On a file
+  // set where only part of each file was relocated, the reader's spans over
+  // the ORIGINAL layout crossed large unrelocated gaps that the replica never
+  // asks for, and a whole bucket fell inside such a gap on 6% of the files --
+  // the byte route marked it, the replica route did not. Both are honest
+  // about what was read; they are answers to slightly different questions.
+  // Exact equality of two signatures is therefore evidence of the same work,
+  // while inequality is not proof of different work.
   static constexpr uint64_t kBucket = 1024 * 1024;
 
   void note(uint64_t off, uint64_t len);

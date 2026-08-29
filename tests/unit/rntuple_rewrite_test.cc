@@ -217,3 +217,53 @@ TEST(RNTupleRewrite, CorruptPageIsRefusedRatherThanRecompressed) {
   ::close(fd);
   EXPECT_FALSE(rw.error.empty()) << "a corrupt page must not recompress silently";
 }
+
+TEST(RNTupleRewrite, OriginMapCoversTheWholePageIncludingItsChecksum) {
+  // A replica run is comparable with the baseline that measured it only
+  // because every stitched read maps back to the original bytes it carried.
+  // A page's on-disk object is the block PLUS the 8-byte checksum that sits
+  // past the locator's size, so a mapping that records the block alone leaves
+  // that tail with no original address: the same read reports fewer bytes
+  // touched when it is served from the replica than when it is served from
+  // the byte cache. Nothing downstream can notice — the tail is 8 bytes, and
+  // it only changes the answer when it falls in a region nothing else reads —
+  // so the invariant has to be pinned right here, at the builder.
+  auto m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  int fd = ::open(fixture().c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(fd, 0);
+  FileSource src(fd, m.fileSize);
+  auto rw = buildRNTupleRewrite(m, src, m.fileSize, 1);
+  ::close(fd);
+  ASSERT_TRUE(rw.error.empty()) << rw.error;
+  ASSERT_GT(rw.pages, 0u);
+
+  size_t checksummed = 0, pages = 0;
+  for (const auto& range : m.ranges) {
+    for (const auto& pg : range.pages) {
+      const uint64_t onDisk = (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0);
+      if (pg.hasChecksum) ++checksummed;
+      ++pages;
+      const ucache::ReplicaMeta::OrigRange* found = nullptr;
+      for (const auto& r : rw.origMap)
+        if (r.origOff == pg.offset) found = &r;
+      ASSERT_NE(found, nullptr) << "page at " << pg.offset << " has no mapping";
+      EXPECT_EQ(found->origLen, onDisk)
+          << "page at " << pg.offset << ": mapping covers " << found->origLen
+          << " of " << onDisk << " bytes on disk";
+    }
+  }
+  EXPECT_GT(pages, 0u);
+  // If the fixture ever stops carrying checksummed pages this test still
+  // passes while proving nothing — say so rather than go quietly green.
+  EXPECT_GT(checksummed, 0u) << "fixture no longer exercises checksummed pages";
+
+  // The superseded list and the map are two views of the same bytes and must
+  // agree on how much of the file each relocated page occupied.
+  uint64_t supTotal = 0, mapTotal = 0;
+  for (const auto& r : rw.superseded) supTotal += r.len;
+  for (const auto& r : rw.origMap)
+    for (const auto& s : rw.superseded)
+      if (r.origOff == s.off) mapTotal += r.origLen;
+  EXPECT_EQ(mapTotal, supTotal);
+}

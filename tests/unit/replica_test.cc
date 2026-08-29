@@ -1,6 +1,7 @@
 // Replica store tests. Fail-open FIRST: a replica that is torn, stale,
 // corrupt, or mid-publish must never be adopted — worst case is "no
 // replica" (the v1 view), never wrong bytes.
+#include "ReadFootprint.h"
 #include "ReplicaFile.h"
 #include "vendor/crc32c.h"
 #include "ReplicaStore.h"
@@ -684,4 +685,143 @@ TEST(ReplicaCrash, TornPublishNeverServable) {
     }
     rs.drop(key());
   }
+}
+
+// ------------------------------------------------------- origin mapping --
+//
+// Mapping a stitched read back to the bytes it carried is what makes a run
+// served from a replica comparable with the run that measured the baseline.
+// The mapping is not linear -- a recompressed page has a different length
+// than the page it replaced -- so the RANGE is the unit: touching any of it
+// means the whole original range was read.
+
+namespace {
+
+// One relocated page whose ORIGINAL bytes end just past a 1 MiB boundary,
+// plus an uncovered tail standing in for the overlay's own bookkeeping.
+constexpr uint64_t kOrigSize = 4 * ReadFootprint::kBucket;
+constexpr uint64_t kPageOff = 2 * ReadFootprint::kBucket - 4096;
+constexpr uint64_t kPageOnDisk = 4096 + 8; // block + checksum: straddles 2 MiB
+constexpr uint64_t kStoredLen = 2048;      // its recompressed copy
+constexpr uint64_t kTailLen = 512;         // alignment, no original address
+
+ReplicaMeta mappedMeta() {
+  ReplicaMeta m;
+  m.encoding = ReplicaMeta::kZstd1;
+  m.encoderVersion = 10506;
+  m.originSize = kOrigSize;
+  m.virtualSize = kOrigSize + kStoredLen + kTailLen;
+  m.extents.push_back({kOrigSize, kStoredLen + kTailLen, 0});
+  m.superseded.push_back({kPageOff, kPageOnDisk});
+  m.origMap.push_back({kOrigSize, kStoredLen, kPageOff, kPageOnDisk});
+  return m;
+}
+
+} // namespace
+
+TEST(ReplicaStore, OriginRangesReturnTheWholeRelocatedRange) {
+  Fixture f;
+  auto overlay = test::randomBytes(kStoredLen + kTailLen, 21);
+  ASSERT_EQ(f.rs->publish(key(), mappedMeta(), overlay.data(), overlay.size()), 0);
+  auto v = f.rs->openView(key(), kOrigSize);
+  ASSERT_TRUE(v);
+  ASSERT_TRUE(v->hasOriginMap());
+
+  // Any part of the relocated copy means the whole original page was read --
+  // including the checksum that sits past the locator's size. A mapping that
+  // stopped at the block would report 4096 here and silently disagree with
+  // every other route about the bucket the tail falls in.
+  std::vector<ReplicaMeta::Range> out;
+  v->originRanges(kOrigSize + 10, 4, out);
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_EQ(out[0].off, kPageOff);
+  EXPECT_EQ(out[0].len, kPageOnDisk);
+
+  // Reading the whole copy says the same thing, once.
+  out.clear();
+  v->originRanges(kOrigSize, kStoredLen, out);
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_EQ(out[0].len, kPageOnDisk);
+
+  // A zero-length read carries nothing.
+  out.clear();
+  v->originRanges(kOrigSize, 0, out);
+  EXPECT_TRUE(out.empty());
+}
+
+TEST(ReplicaStore, OriginRangesPassOriginBytesThroughAndStopAtTheOriginEof) {
+  Fixture f;
+  auto overlay = test::randomBytes(kStoredLen + kTailLen, 22);
+  ASSERT_EQ(f.rs->publish(key(), mappedMeta(), overlay.data(), overlay.size()), 0);
+  auto v = f.rs->openView(key(), kOrigSize);
+  ASSERT_TRUE(v);
+
+  // Bytes the overlay does not cover are origin bytes already.
+  std::vector<ReplicaMeta::Range> out;
+  v->originRanges(0, 4096, out);
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_EQ(out[0].off, 0u);
+  EXPECT_EQ(out[0].len, 4096u);
+
+  // A read that crosses the origin's EOF into the extension: the pass-through
+  // half stops at the EOF, and the extension half maps back.
+  out.clear();
+  v->originRanges(kOrigSize - 100, 200, out);
+  ASSERT_EQ(out.size(), 2u);
+  EXPECT_EQ(out[0].off, kOrigSize - 100);
+  EXPECT_EQ(out[0].len, 100u);
+  EXPECT_EQ(out[1].off, kPageOff);
+  EXPECT_EQ(out[1].len, kPageOnDisk);
+
+  // The extension's uncovered tail is overlay bookkeeping. It has no original
+  // address, and inventing one past the origin's EOF would make the same work
+  // look different depending on the tier that served it.
+  out.clear();
+  v->originRanges(kOrigSize + kStoredLen, kTailLen, out);
+  EXPECT_TRUE(out.empty());
+}
+
+TEST(ReplicaStore, OriginRangesAreEmptyForASidecarWithoutAMap) {
+  // A sidecar written before the map existed cannot answer the question. The
+  // caller must read that as "unknown" and sign nothing -- never as "nothing
+  // was read", which would be a confident wrong answer.
+  Fixture f;
+  auto overlay = test::randomBytes(2 * kP, 23);
+  ASSERT_EQ(f.rs->publish(key(), sampleMeta(1 << 20, overlay.size()), overlay.data(),
+                          overlay.size()),
+            0);
+  auto v = f.rs->openView(key(), 1 << 20);
+  ASSERT_TRUE(v);
+  EXPECT_FALSE(v->hasOriginMap());
+  std::vector<ReplicaMeta::Range> out;
+  v->originRanges(0, 4096, out);
+  EXPECT_TRUE(out.empty());
+}
+
+TEST(ReplicaStore, ReplicaAndByteRoutesSignTheSameBucketsAcrossABoundary) {
+  // THE PROPERTY THE WHOLE MAP EXISTS FOR, at the granularity that is actually
+  // recorded. The same physics read two ways must produce the same signature:
+  // straight from the byte cache, where the request already names origin
+  // bytes, and from the replica, where it is mapped back. The page here ends
+  // 8 bytes past a bucket boundary, so a mapping that drops its checksum tail
+  // marks one bucket where the byte route marks two -- which is exactly how
+  // this went wrong in the field, and why comparing byte ranges by eye would
+  // not have caught it.
+  Fixture f;
+  auto overlay = test::randomBytes(kStoredLen + kTailLen, 24);
+  ASSERT_EQ(f.rs->publish(key(), mappedMeta(), overlay.data(), overlay.size()), 0);
+  auto v = f.rs->openView(key(), kOrigSize);
+  ASSERT_TRUE(v);
+
+  ReadFootprint byteRoute;
+  byteRoute.note(kPageOff, kPageOnDisk); // the request names origin bytes
+
+  ReadFootprint replicaRoute;
+  std::vector<ReplicaMeta::Range> out;
+  v->originRanges(kOrigSize, kStoredLen, out); // ...and here it is mapped back
+  for (const auto& r : out) replicaRoute.note(r.off, r.len);
+
+  EXPECT_EQ(byteRoute.count(kOrigSize), 2u) << "the page must straddle a bucket";
+  EXPECT_EQ(replicaRoute.sig(kOrigSize), byteRoute.sig(kOrigSize));
+  EXPECT_EQ(replicaRoute.buckets(kOrigSize), byteRoute.buckets(kOrigSize));
 }

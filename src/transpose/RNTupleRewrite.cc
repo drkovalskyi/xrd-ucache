@@ -197,7 +197,14 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
         putLE(stored.data() + enc.size(), h, 8);
       }
       const uint64_t at = appendBlob(rw.extension, rw.extBase, stored, want);
-      rw.origMap.push_back({at, stored.size(), pg.offset, pg.nbytes});
+      // The ORIGINAL extent is the block PLUS its checksum, exactly what the
+      // superseded list records below. The locator's size covers the block
+      // only, so mapping `nbytes` here would leave the checksum tail with no
+      // original address: a read served from the replica would then report
+      // fewer bytes touched than the same read served from the byte cache,
+      // and only when that tail crosses a bucket boundary — which is what
+      // makes it a rare, silent disagreement rather than an obvious one.
+      rw.origMap.push_back({at, stored.size(), pg.offset, onDisk});
 
       // Repoint the locator: int32 size then uint64 offset, 4 bytes into the
       // 16-byte page record.
