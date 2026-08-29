@@ -60,6 +60,17 @@ class ReplicaView {
   // Split [off, off+len) (clamped to virtualSize) into consecutive segments.
   std::vector<Seg> map(uint64_t off, uint64_t len) const;
 
+  // The ORIGINAL-file ranges whose content a virtual read of [off, off+len)
+  // carried. Overlay pieces are looked up in origMap and yield the WHOLE
+  // original range they came from -- a recompressed basket has no meaningful
+  // sub-offset, so touching part of it means that basket was read. Pieces the
+  // overlay does not cover are origin bytes already and pass through. Empty
+  // when the sidecar predates origMap (v1), which the caller must treat as
+  // "unknown", never as "nothing".
+  void originRanges(uint64_t off, uint64_t len,
+                    std::vector<ReplicaMeta::Range>& out) const;
+  bool hasOriginMap() const { return !meta_.origMap.empty(); }
+
   // Read overlay bytes [tdataOff, +len), verifying every touched overlay
   // page's CRC. false => bad page or IO error: replica_crc_failures counted,
   // invalid() latched.

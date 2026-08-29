@@ -1008,8 +1008,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::printf("null},\"runs\":[");
   } else {
-    std::printf("%-16s %-7s %-6s %3s %6s %8s  %-18s %10s %7s %8s %6s %4s %7s\n",
-                "WHEN", "DUR", "SIG", "THR", "FILES", "READ GB",
+    std::printf("%-16s %-7s %-6s %-6s %3s %6s %8s  %-18s %10s %7s %8s %6s %4s %7s\n",
+                "WHEN", "DUR", "SIG", "RSIG", "THR", "FILES", "READ GB",
                 "ORIG/BYTE/REPL/RLY", "RATE GB/s", "INS T", "INS/s G", "CORES", "WR%",
                 "GAIN");
     char allTiers[32], allGain[16], allWhen[24];
@@ -1022,9 +1022,9 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::snprintf(allGain, sizeof allGain, "%7s", "-");
     std::snprintf(allWhen, sizeof allWhen, "ALL (%zu runs)", t.runs);
-    std::printf("%-16s %-7s %-6s %3s %6zu %8.1f  %-18s %10s %7s %8s %6s %4s %7s\n", allWhen,
-                humanDur(t.durationS).c_str(), "", "", t.distinctFiles, gb(allTotal),
-                allTiers, "", "", "", "", "", allGain);
+    std::printf("%-16s %-7s %-6s %-6s %3s %6zu %8.1f  %-18s %10s %7s %8s %6s %4s %7s\n",
+                allWhen, humanDur(t.durationS).c_str(), "", "", "", t.distinctFiles,
+                gb(allTotal), allTiers, "", "", "", "", "", allGain);
     if (t.haveGain)
       std::printf("%-16s %zu of %zu runs measured vs baseline: took %s, no cache would "
                   "have taken about %s — %s %s\n",
@@ -1036,9 +1036,10 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     if (t.gainCapped)
       std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
                   "estimate)\n", "", t.gainCapped);
-    std::printf("%-16s %-7s %-6s %3s %6s %8s  %-18s %10s %7s %8s %6s %4s %7s\n", "----",
-                "----", "----", "---", "-----", "-------", "------------------",
-                "---------", "-----", "-------", "-----", "---", "------");
+    std::printf("%-16s %-7s %-6s %-6s %3s %6s %8s  %-18s %10s %7s %8s %6s %4s %7s\n",
+                "----", "----", "----", "----", "---", "-----", "-------",
+                "------------------", "---------", "-----", "-------", "-----", "---",
+                "------");
   }
 
   for (size_t i = 0; i < shown; ++i) {
@@ -1051,7 +1052,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   "\"origin_bytes\":%llu,\"hit_bytes\":%llu,\"replica_bytes\":%llu,"
                   "\"relay_bytes\":%llu,\"faults\":%llu,\"sig\":\"%s\","
                   "\"threads\":%llu,\"cpu_us\":%llu,\"instructions\":%llu,"
-                  "\"cycles\":%llu,\"origin_share\":%.3f,\"fill_cost\":%.4f,\"gain\":",
+                  "\"cycles\":%llu,\"read_sig\":\"%s\","
+                  "\"origin_share\":%.3f,\"fill_cost\":%.4f,\"gain\":",
                   i ? "," : "", (unsigned long long)r.startS,
                   (unsigned long long)r.durationS(), r.host.c_str(),
                   (unsigned long long)r.pid, runKind(r),
@@ -1061,7 +1063,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   (unsigned long long)r.relayBytes, (unsigned long long)r.faults(),
                   r.sig.c_str(), (unsigned long long)r.threadsHighWater,
                   (unsigned long long)r.cpuUs, (unsigned long long)r.instructions,
-                  (unsigned long long)r.cycles, r.originShare(), r.fillCost());
+                  (unsigned long long)r.cycles, r.readSig.c_str(), r.originShare(),
+                  r.fillCost());
       if (g.valid)
         std::printf("%.3f,\"gain_source\":\"baseline\"}", g.gain);
       else
@@ -1108,9 +1111,11 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       std::snprintf(thr, sizeof thr, "%3llu", (unsigned long long)r.threadsHighWater);
     else
       std::snprintf(thr, sizeof thr, "%3s", "-");
-    std::printf("%-16s %-7s %-6s %3s %6zu %8.1f  %-18s %10.3f %7s %8s %6s %4s %7s\n",
+    std::printf("%-16s %-7s %-6s %-6s %3s %6zu %8.1f  %-18s %10.3f %7s %8s %6s %4s %7s\n",
                 stamp(r.startS).c_str(), humanDur(r.durationS()).c_str(),
-                r.sig.empty() ? "-" : r.sig.c_str(), thr, r.files.size(), gb(rowTotal),
+                r.sig.empty() ? "-" : r.sig.c_str(),
+                r.readSig.empty() ? "-" : r.readSig.c_str(), thr, r.files.size(),
+                gb(rowTotal),
                 tiers, gbPerS(rowTotal, r.durationS()), insT, insRate, cpuSplit, wrCell,
                 gainCell);
   }

@@ -162,6 +162,8 @@ void loadFiles(const std::string& path, Run& r) {
     f.wireBytes += fieldU64(line, "wire_bytes");
     f.spanUs += fieldU64(line, "span_us");
     f.originSize = std::max(f.originSize, fieldU64(line, "origin_size"));
+    if (f.readSig.empty())
+      f.readSig = fieldStr(line, "read_sig");
     const std::string m = fieldStr(line, "mode");
     // A re-opened entry emits a second record. Modes agree in practice (the
     // mode is a per-key property, not per-open; if they ever disagree, the
@@ -176,6 +178,7 @@ void loadFiles(const std::string& path, Run& r) {
 
 namespace {
 std::string signatureOf(const std::map<std::string, Run::FileRec>& files);
+std::string readSignatureOf(const std::map<std::string, Run::FileRec>& files);
 std::string hostOf(const std::string& url);
 } // namespace
 
@@ -216,6 +219,7 @@ std::vector<Run> loadRuns(const std::string& statsDir, const std::string& archiv
       continue; // an empty claimed name, or a store that never served anything
     // Identity: which files this run opened, and where they came from.
     r.sig = signatureOf(r.files);
+    r.readSig = readSignatureOf(r.files);
     for (const auto& [k, f] : r.files) {
       (void)f;
       const std::string h = hostOf(k);
@@ -293,11 +297,21 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   double refC = 0.0, refD = 0.0, refWireTotalD = 0.0;
   bool sawBaseline = false;
 
+  // When BOTH runs know what they read, the read signatures must agree.
+  // Matching by file set alone cannot tell one analysis from another over the
+  // same inputs, and comparing their walls would be meaningless. Where either
+  // side lacks a signature -- a replica built before the map existed -- the
+  // file-set match stands on its own rather than refusing outright.
+  size_t readSigMismatch = 0;
   for (const auto& r : all) {
     if (r.stem == run.stem || !r.disabled)
       continue;
     if (r.files.empty() || r.durationS() < kMinDurationS || r.faults())
       continue;
+    if (!run.readSig.empty() && !r.readSig.empty() && run.readSig != r.readSig) {
+      ++readSigMismatch;
+      continue;
+    }
     uint64_t refWireTotal = 0, matchedWire = 0, matchedServed = 0;
     for (const auto& [k, f] : r.files) {
       (void)k;
@@ -337,7 +351,14 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   }
 
   if (!best) {
-    if (bestC > 0.0 || bestD > 0.0) {
+    // Checked FIRST: a baseline rejected for reading different parts never
+    // reaches the coverage arithmetic, so its counters look like "no baseline
+    // at all" — which is the one thing this refusal must not be mistaken for.
+    if (readSigMismatch) {
+      g.reason = "a baseline exists for these files but it read different parts "
+                 "of them — it measured different work, so comparing the walls "
+                 "would not mean anything";
+    } else if (bestC > 0.0 || bestD > 0.0) {
       char buf[192];
       std::snprintf(buf, sizeof buf,
                     "the baseline and this run covered different files "
@@ -446,6 +467,28 @@ std::string signatureOf(const std::map<std::string, Run::FileRec>& files) {
     }
     h ^= '\n';
     h *= 1099511628211ull;
+  }
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "%06llx", static_cast<unsigned long long>(h & 0xffffffull));
+  return std::string(buf);
+}
+
+// Combine the per-file read footprints. Visited in sorted key order, so the
+// order files were opened in cannot change the answer. Returns empty if ANY
+// file lacked a footprint: a signature over part of the work would compare
+// runs that read different things, which is the failure this exists to stop.
+std::string readSignatureOf(const std::map<std::string, Run::FileRec>& files) {
+  if (files.empty())
+    return std::string();
+  uint64_t h = 1469598103934665603ull;
+  for (const auto& [k, f] : files) {
+    (void)k;
+    if (f.readSig.empty())
+      return std::string();
+    for (unsigned char c : f.readSig) {
+      h ^= c;
+      h *= 1099511628211ull;
+    }
   }
   char buf[16];
   std::snprintf(buf, sizeof buf, "%06llx", static_cast<unsigned long long>(h & 0xffffffull));

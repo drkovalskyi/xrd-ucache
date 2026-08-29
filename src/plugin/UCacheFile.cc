@@ -363,7 +363,10 @@ void HandleState::releaseInner() {
 // Bytes served by pure pass-through — the cache never touched them.
 // Counted at issue time (a failed relay overcounts a little; the counter is
 // a tier-share indicator, not an accounting invariant).
-static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n) {
+static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n,
+                           uint64_t off = 0, uint64_t len = 0) {
+  if (len)
+    st->footprint.note(off, len);
   if (st->store && n) {
     st->store->stats().relayBytes.fetch_add(n, std::memory_order_relaxed);
     st->relayedBytes.fetch_add(n, std::memory_order_relaxed);
@@ -372,6 +375,17 @@ static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n) {
     st->relayFirstUs.compare_exchange_strong(expected, t, std::memory_order_relaxed);
     st->relayLastUs.store(t, std::memory_order_relaxed);
   }
+}
+
+// Vector relay: the byte total and the footprint come from the same walk.
+static void noteRelayChunks(const std::shared_ptr<HandleState>& st,
+                            const XrdCl::ChunkList& chunks) {
+  uint64_t n = 0;
+  for (const auto& c : chunks) {
+    n += c.length;
+    st->footprint.note(c.offset, c.length);
+  }
+  noteRelayBytes(st, n);
 }
 
 // First of Close/dtor decides: a handle that relayed and never had an entry
@@ -396,7 +410,8 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
         originSize = si->GetSize();
       delete si;
     }
-    st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize);
+    st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize,
+                              st->footprint.sig());
   }
 }
 
@@ -1030,6 +1045,17 @@ void stitchedServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> e
     }
   if (st->store && localBytes)
     st->store->stats().servedBytes.fetch_add(localBytes, std::memory_order_relaxed);
+  // Name what was read in the coordinates every other route uses. A replica
+  // is a rewritten container, so its own offsets mean nothing to a baseline;
+  // origMap turns them back into origin ranges. A v1 sidecar has no map and
+  // contributes nothing, which leaves the signature empty rather than wrong.
+  if (entry && view && view->hasOriginMap()) {
+    std::vector<ReplicaMeta::Range> orig;
+    for (const auto& c : userChunks)
+      view->originRanges(c.offset, c.length, orig);
+    for (const auto& r : orig)
+      entry->noteRead(r.off, r.len);
+  }
   if (st->store && overlayBytes) {
     auto& stats = st->store->stats();
     stats.replicaBytesServed.fetch_add(overlayBytes, std::memory_order_relaxed);
@@ -1583,7 +1609,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
     // Stitched entry: serve on the executor — overlay + v1
     // cache locally, residual original sub-ranges via the miss machinery.
     if (offset + size < offset) { // overflow: not a request we can reason about
-      noteRelayBytes(st_, size);
+      noteRelayBytes(st_, size, offset, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->Read(offset, size, buffer, rh, timeout); // garbage in, origin's answer out
       });
@@ -1610,7 +1636,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
     return XRootDStatus();
   }
   if (!entry || offset + size < offset) {
-    noteRelayBytes(st_, size);
+    noteRelayBytes(st_, size, offset, size);
     return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
       return f->Read(offset, size, buffer, rh, timeout);
     });
@@ -1721,7 +1747,7 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
                                  // reads as Read, so it must be sampled too
   if (auto view = currentView(); entry && view) {
     if (offset + size < offset) { // overflow
-      noteRelayBytes(st_, size);
+      noteRelayBytes(st_, size, offset, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->PgRead(offset, size, buffer, rh, timeout);
       });
@@ -1775,7 +1801,7 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
     });
     return XRootDStatus();
   }
-  noteRelayBytes(st_, size);
+  noteRelayBytes(st_, size, offset, size);
   return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
     return f->PgRead(offset, size, buffer, rh, timeout);
   });
@@ -1784,15 +1810,9 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
-  auto chunkSum = [&chunks] {
-    uint64_t n = 0;
-    for (const auto& c : chunks)
-      n += c.length;
-    return n;
-  };
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {
-    noteRelayBytes(st_, chunkSum());
+    noteRelayChunks(st_, chunks);
     return relayToInner(st_, handler, [&](XrdCl::File* f, ResponseHandler* rh) {
       return f->VectorRead(chunks, buffer, rh, timeout);
     });
@@ -1802,7 +1822,7 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     // Stitched entry: whole vector served on the executor.
     for (const auto& c : chunks)
       if (c.length == 0 || c.offset + c.length > view->virtualSize()) {
-        noteRelayBytes(st_, chunkSum());
+        noteRelayChunks(st_, chunks);
         return relayToInner(st_, handler, [&](XrdCl::File* f, ResponseHandler* rh) {
           return f->VectorRead(chunks, buffer, rh, timeout);
         });
@@ -1819,7 +1839,7 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
 
   for (const auto& c : chunks)
     if (c.length == 0 || c.offset + c.length > entry->fileSize()) {
-      noteRelayBytes(st_, chunkSum());
+      noteRelayChunks(st_, chunks);
       return relayToInner(st_, handler, [&](XrdCl::File* f, ResponseHandler* rh) {
         return f->VectorRead(chunks, buffer, rh, timeout);
       });

@@ -51,6 +51,49 @@ std::vector<ReplicaView::Seg> ReplicaView::map(uint64_t off, uint64_t len) const
   return out;
 }
 
+void ReplicaView::originRanges(uint64_t off, uint64_t len,
+                               std::vector<ReplicaMeta::Range>& out) const {
+  if (meta_.origMap.empty() || len == 0)
+    return;
+  const uint64_t end = std::min(off + len, meta_.virtualSize);
+  if (end <= off)
+    return;
+  // First mapping whose end lies past `off` (sorted, non-overlapping).
+  auto it = std::lower_bound(meta_.origMap.begin(), meta_.origMap.end(), off,
+                             [](const ReplicaMeta::OrigRange& r, uint64_t o) {
+                               return r.virtOff + r.len <= o;
+                             });
+  // A virtual offset the overlay does not cover is an ORIGIN offset — but only
+  // below originSize. The stitched file is larger than the original, and the
+  // extension's uncovered gaps (alignment, record headers) are overlay
+  // bookkeeping with no original address at all. Emitting them would invent
+  // coordinates past the end of the origin file and make the same work look
+  // different depending on the tier that served it.
+  const auto passThrough = [&](uint64_t a, uint64_t b) {
+    const uint64_t hi = std::min(b, meta_.originSize);
+    if (hi > a)
+      out.push_back({a, hi - a});
+  };
+  uint64_t pos = off;
+  while (pos < end) {
+    if (it == meta_.origMap.end() || it->virtOff >= end) {
+      passThrough(pos, end);
+      break;
+    }
+    if (pos < it->virtOff) {
+      passThrough(pos, it->virtOff);
+      pos = it->virtOff;
+    }
+    const uint64_t segEnd = std::min(end, it->virtOff + it->len);
+    if (pos < segEnd) {
+      // The whole original range, not a slice of it.
+      out.push_back({it->origOff, it->origLen});
+      pos = segEnd;
+    }
+    ++it;
+  }
+}
+
 bool ReplicaView::read(uint64_t tdataOff, uint64_t len, void* buf) {
   if (len == 0)
     return true;

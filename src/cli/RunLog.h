@@ -58,6 +58,9 @@ struct Run {
     uint64_t originSize = 0; // the file's size AT THE ORIGIN — the one work
                              // measure that means the same on every route, and
                              // therefore the only sound weight for a share
+    std::string readSig;     // which parts of THIS file the run read, in
+                             // origin coordinates; empty when unknown (a
+                             // replica built before the map existed)
     std::string mode;        // cached | fill | relay ("" = pre-span record)
   };
   std::map<std::string, FileRec> files;
@@ -82,6 +85,12 @@ struct Run {
   // does not, which is what keeps a truncated run from being compared.
   // Computed by loadRuns; empty when the run left no per-file records.
   std::string sig;
+  // Hash of what was actually READ, not merely opened -- combined over the
+  // per-file footprints. Two runs of different analyses over the same inputs
+  // share a `sig` and differ here, which is the only thing that separates
+  // them. Empty when any file could not contribute one, because a partial
+  // answer would silently compare different work.
+  std::string readSig;
   // Origin hosts seen, by file count. A dataset can be served from several
   // sites (redirectors, distributed sets), and the mix is a property of a RUN,
   // not of the input set: a baseline drawn from one site is weak evidence for

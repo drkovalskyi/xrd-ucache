@@ -199,6 +199,11 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
   std::vector<uint8_t> blob = fm.treeBlob; // patched in place below
   std::vector<uint8_t> ext;
   const int64_t extBase = fm.fend;
+  // Where each relocated piece came from in the ORIGINAL file. Serving never
+  // consults this; it exists so a read of the replica can be named in the
+  // coordinates the origin and the byte tier use, which is what lets the same
+  // analysis over two tiers be recognised as the same work.
+  std::vector<ReplicaMeta::OrigRange> origMap;
   std::vector<ReplicaMeta::Range> superseded;
 
   for (const auto& name : hot) {
@@ -262,6 +267,7 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
       bePut<int32_t>(blob.data() + b->bytesArrayOff + 4 * i,
                      static_cast<int32_t>(rec.size()));
       superseded.push_back({off, nb});
+      origMap.push_back({static_cast<uint64_t>(newSeek), rec.size(), off, nb});
       ov.oldBytes += nb;
       ov.newBytes += rec.size();
       ++ov.baskets;
@@ -297,6 +303,9 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
     ext.insert(ext.end(), metaPayload.begin(), metaPayload.end());
     superseded.push_back({static_cast<uint64_t>(fm.treeKey.seekkey),
                           static_cast<uint64_t>(fm.treeKey.nbytes)});
+    origMap.push_back({static_cast<uint64_t>(newSeek), mkey.size() + metaPayload.size(),
+                       static_cast<uint64_t>(fm.treeKey.seekkey),
+                       static_cast<uint64_t>(fm.treeKey.nbytes)});
     // Keys-list record: repoint the live tree entry at the relocated metadata
     // key, in place (same size, same offset — see below).
     // Probe clamped at fend: in a small file the record can sit closer than
@@ -378,6 +387,15 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
         {12, static_cast<uint64_t>(hw), 0},
         {static_cast<uint64_t>(fm.keyslistSeek), klist.size(), static_cast<uint64_t>(hw)},
         {static_cast<uint64_t>(extBase), ext.size(), static_cast<uint64_t>(hw) + klist.size()}};
+    // Patched in place: these windows ARE their own original range.
+    origMap.push_back({12, static_cast<uint64_t>(hw), 12, static_cast<uint64_t>(hw)});
+    origMap.push_back({static_cast<uint64_t>(fm.keyslistSeek), klist.size(),
+                       static_cast<uint64_t>(fm.keyslistSeek), klist.size()});
+    std::sort(origMap.begin(), origMap.end(),
+              [](const ReplicaMeta::OrigRange& a, const ReplicaMeta::OrigRange& b) {
+                return a.virtOff < b.virtOff;
+              });
+    ov.meta.origMap = std::move(origMap);
     ov.meta.virtualSize = static_cast<uint64_t>(newFend);
   }
 

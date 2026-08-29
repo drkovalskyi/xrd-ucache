@@ -41,6 +41,10 @@ struct RNTupleRewrite {
   // because pages are SHARED a page kept alive by one such range must survive
   // even when another, relocated range also pointed at it.
   std::vector<ReplicaMeta::Range> superseded;
+  // Where each relocated piece came from in the ORIGINAL file, at page
+  // granularity. Serving never reads this; it is what lets a replica read be
+  // named in origin coordinates.
+  std::vector<ReplicaMeta::OrigRange> origMap;
 
   uint64_t pages = 0, storedRaw = 0;
   // Page records whose bytes were already transcoded for an earlier record —

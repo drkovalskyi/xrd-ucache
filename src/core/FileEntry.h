@@ -38,6 +38,7 @@
 #include "Config.h"
 #include "IOBackend.h"
 #include "MetaFile.h"
+#include "ReadFootprint.h"
 #include "Stats.h"
 #include "UrlKey.h"
 
@@ -184,6 +185,11 @@ class FileEntry {
   // Stamp activity onto the span. Cheap (two relaxed atomics, one CAS only on
   // the first call); called from the serve and fill paths.
   void noteActivity();
+  // Record that [off, off+len) of the ORIGINAL file was read. Callers on the
+  // replica path must translate first (ReplicaView::originRanges); every other
+  // route already addresses the origin's layout.
+  void noteRead(uint64_t off, uint64_t len) { footprint_.note(off, len); }
+  const ReadFootprint& footprint() const { return footprint_; }
 
  private:
   FileEntry(IOBackend& io, const Config& cfg, Stats& stats, UrlKey key)
@@ -251,6 +257,7 @@ class FileEntry {
   // sequential-share counter (as the DISK sees the stream — thread
   // interleaving deliberately counts as non-sequential).
   Obs obs_;
+  ReadFootprint footprint_;
   std::shared_ptr<ObsSink> obsSink_;
   std::atomic<bool> obsEmitted_{false};
   PageBitmap servedOnce_;

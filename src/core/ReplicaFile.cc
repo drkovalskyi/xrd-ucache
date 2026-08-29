@@ -11,7 +11,13 @@ namespace ucache {
 namespace {
 
 constexpr char kMagic[4] = {'U', 'C', 'T', 'R'};
-constexpr size_t kHeaderSize = 72;
+// v1 header is 72 bytes; v2 adds the origMap count (and padding) after the
+// crc field, which stays where it was so the torn-write check is unchanged.
+constexpr size_t kHeaderSizeV1 = 72;
+constexpr size_t kHeaderSize = 80;
+constexpr size_t kOrigMapCountOff = 72;
+constexpr size_t kOrigRangeBytes = 32;
+constexpr uint32_t kMaxOrigMap = 1u << 22;
 constexpr size_t kCrcFieldOff = 68;
 // Sanity bounds: reject absurd sidecars instead of allocating for them.
 constexpr uint32_t kMaxKeyLen = 64 * 1024;
@@ -37,7 +43,8 @@ std::vector<uint8_t> ReplicaFile::serialize(const ReplicaMeta& m) {
   const size_t keyOff = kHeaderSize;
   const size_t extOff = align8(keyOff + m.key.size());
   const size_t supOff = extOff + m.extents.size() * 24;
-  const size_t crcsOff = supOff + m.superseded.size() * 16;
+  const size_t omOff = supOff + m.superseded.size() * 16;
+  const size_t crcsOff = omOff + m.origMap.size() * kOrigRangeBytes;
   const size_t total = crcsOff + npages * 4;
 
   std::vector<uint8_t> buf(total, 0);
@@ -55,6 +62,7 @@ std::vector<uint8_t> ReplicaFile::serialize(const ReplicaMeta& m) {
   put<uint32_t>(buf, 56, static_cast<uint32_t>(m.key.size()));
   put<uint32_t>(buf, 60, static_cast<uint32_t>(m.extents.size()));
   put<uint32_t>(buf, 64, static_cast<uint32_t>(m.superseded.size()));
+  put<uint32_t>(buf, kOrigMapCountOff, static_cast<uint32_t>(m.origMap.size()));
   // image crc at 68 stays 0 for the digest pass
   std::memcpy(buf.data() + keyOff, m.key.data(), m.key.size());
   size_t p = extOff;
@@ -69,6 +77,13 @@ std::vector<uint8_t> ReplicaFile::serialize(const ReplicaMeta& m) {
     put<uint64_t>(buf, p + 8, r.len);
     p += 16;
   }
+  for (const auto& o : m.origMap) {
+    put<uint64_t>(buf, p, o.virtOff);
+    put<uint64_t>(buf, p + 8, o.len);
+    put<uint64_t>(buf, p + 16, o.origOff);
+    put<uint64_t>(buf, p + 24, o.origLen);
+    p += kOrigRangeBytes;
+  }
   // Defensive: copy at most what the caller supplied (missing tail stays 0
   // and will fail the overlay CRC verify => treated as absent, fail-open).
   const size_t ncrcs = std::min<size_t>(npages, m.pageCrcs.size());
@@ -79,10 +94,14 @@ std::vector<uint8_t> ReplicaFile::serialize(const ReplicaMeta& m) {
 }
 
 std::optional<ReplicaMeta> ReplicaFile::deserialize(const uint8_t* p, size_t n) {
-  if (n < kHeaderSize || std::memcmp(p, kMagic, 4) != 0)
+  if (n < kHeaderSizeV1 || std::memcmp(p, kMagic, 4) != 0)
     return std::nullopt;
-  if (get<uint32_t>(p + 4) != ReplicaMeta::kFormatVersion)
-    return std::nullopt; // reject mismatched versions (treat as absent)
+  const uint32_t ver = get<uint32_t>(p + 4);
+  if (ver != ReplicaMeta::kFormatVersion && ver != ReplicaMeta::kFormatVersionV1)
+    return std::nullopt; // reject unknown versions (treat as absent)
+  const bool v2 = ver == ReplicaMeta::kFormatVersion;
+  if (v2 && n < kHeaderSize)
+    return std::nullopt;
 
   ReplicaMeta m;
   m.flags = get<uint32_t>(p + 8);
@@ -98,14 +117,17 @@ std::optional<ReplicaMeta> ReplicaFile::deserialize(const uint8_t* p, size_t n) 
   uint32_t nExt = get<uint32_t>(p + 60);
   uint32_t nSup = get<uint32_t>(p + 64);
   uint32_t storedCrc = get<uint32_t>(p + kCrcFieldOff);
+  const uint32_t nOrigMap = v2 ? get<uint32_t>(p + kOrigMapCountOff) : 0;
 
-  if (keyLen > kMaxKeyLen || nExt > kMaxExtents || nSup > kMaxSuperseded)
+  if (keyLen > kMaxKeyLen || nExt > kMaxExtents || nSup > kMaxSuperseded ||
+      nOrigMap > kMaxOrigMap)
     return std::nullopt;
   const uint64_t npages = m.npages();
-  const size_t keyOff = kHeaderSize;
+  const size_t keyOff = v2 ? kHeaderSize : kHeaderSizeV1;
   const size_t extOff = align8(keyOff + keyLen);
   const size_t supOff = extOff + size_t(nExt) * 24;
-  const size_t crcsOff = supOff + size_t(nSup) * 16;
+  const size_t omOff = supOff + size_t(nSup) * 16;
+  const size_t crcsOff = omOff + size_t(nOrigMap) * kOrigRangeBytes;
   const size_t total = crcsOff + npages * 4;
   if (n != total)
     return std::nullopt;
@@ -130,6 +152,14 @@ std::optional<ReplicaMeta> ReplicaFile::deserialize(const uint8_t* p, size_t n) 
     r.off = get<uint64_t>(p + q);
     r.len = get<uint64_t>(p + q + 8);
     q += 16;
+  }
+  m.origMap.resize(nOrigMap);
+  for (auto& o : m.origMap) {
+    o.virtOff = get<uint64_t>(p + q);
+    o.len = get<uint64_t>(p + q + 8);
+    o.origOff = get<uint64_t>(p + q + 16);
+    o.origLen = get<uint64_t>(p + q + 24);
+    q += kOrigRangeBytes;
   }
   m.pageCrcs.resize(npages);
   if (npages)

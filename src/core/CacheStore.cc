@@ -804,7 +804,8 @@ FileEntry::ScrubResult CacheStore::verify(const UrlKey& key, uint64_t originSize
 }
 
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
-                                uint64_t spanUs, uint64_t originSize) {
+                                uint64_t spanUs, uint64_t originSize,
+                                const std::string& readSig) {
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its
   // wall must be divided by.
@@ -825,7 +826,8 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
      << ",\"opens\":1,\"served_bytes\":0,\"ram_bytes\":0,\"replica_bytes\":0"
      << ",\"disk_reads\":0,\"disk_seq\":0,\"disk_bytes\":0,\"first_touch_bytes\":0"
      << ",\"wire_bytes\":" << bytes << ",\"span_us\":" << spanUs
-     << ",\"origin_size\":" << originSize << ",\"mode\":\""
+     << ",\"origin_size\":" << originSize << ",\"read_sig\":\"" << readSig
+     << "\",\"mode\":\""
      << mode << "\"}\n";
   obsSink_->append(os.str());
 }

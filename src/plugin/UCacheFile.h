@@ -34,6 +34,8 @@
 #include <XrdCl/XrdClFile.hh>
 #include <XrdCl/XrdClPlugInInterface.hh>
 
+#include "ReadFootprint.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -64,6 +66,11 @@ struct HandleState {
   // a cached file are directly comparable.
   std::atomic<uint64_t> relayFirstUs{0};
   std::atomic<uint64_t> relayLastUs{0};
+  // What this handle read, in origin coordinates. A relayed handle has no
+  // FileEntry to hold it, and a cache-disabled run is ALL relay -- which is
+  // exactly the run everything else is measured against, so its footprint is
+  // the one that must exist.
+  ReadFootprint footprint;
 
   std::mutex mu;
   std::shared_ptr<FileEntry> entry;            // null until setup completes

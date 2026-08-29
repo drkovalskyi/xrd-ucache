@@ -197,6 +197,7 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
         putLE(stored.data() + enc.size(), h, 8);
       }
       const uint64_t at = appendBlob(rw.extension, rw.extBase, stored, want);
+      rw.origMap.push_back({at, stored.size(), pg.offset, pg.nbytes});
 
       // Repoint the locator: int32 size then uint64 offset, 4 bytes into the
       // 16-byte page record.
@@ -230,6 +231,8 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   auto plStored = encodeZstdFrames(pl.data(), pl.size(), level);
   if (plStored.empty() || plStored.size() >= pl.size()) plStored = pl;
   const uint64_t plAt = appendBlob(rw.extension, rw.extBase, plStored, pl.size());
+  if (m.pageListNbytes)
+    rw.origMap.push_back({plAt, plStored.size(), m.pageListOffset, m.pageListNbytes});
 
   // Point the footer's cluster-group link at the new page list: uncompressed
   // length, then the locator's size and offset. Three separate fields.
@@ -243,6 +246,8 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   auto ftrStored = encodeZstdFrames(ftr.data(), ftr.size(), level);
   if (ftrStored.empty() || ftrStored.size() >= ftr.size()) ftrStored = ftr;
   const uint64_t ftrAt = appendBlob(rw.extension, rw.extBase, ftrStored, ftr.size());
+  if (m.anchor.nbytesFooter)
+    rw.origMap.push_back({ftrAt, ftrStored.size(), m.anchor.seekFooter, m.anchor.nbytesFooter});
 
   // The anchor is patched where it lies: same size, so its enclosing key is
   // untouched. It is BIG-endian, and its own checksum must be recomputed or
@@ -329,6 +334,17 @@ Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw) {
     tdataAt += pc.bytes->size();
   }
   ov.meta.extents.push_back({rw.extBase, rw.extension.size(), tdataAt});
+  {
+    // Patch windows are rewritten in place, so each IS its own original range.
+    std::vector<ReplicaMeta::OrigRange> om = rw.origMap;
+    for (const auto& pc : pieces)
+      om.push_back({pc.virtOff, pc.bytes->size(), pc.virtOff, pc.bytes->size()});
+    std::sort(om.begin(), om.end(),
+              [](const ReplicaMeta::OrigRange& a, const ReplicaMeta::OrigRange& b) {
+                return a.virtOff < b.virtOff;
+              });
+    ov.meta.origMap = std::move(om);
+  }
   ov.tdata.insert(ov.tdata.end(), rw.extension.begin(), rw.extension.end());
 
   // Superseded: the pages the rewrite replaced, plus the page list and footer

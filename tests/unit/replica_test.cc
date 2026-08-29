@@ -2,6 +2,7 @@
 // corrupt, or mid-publish must never be adopted — worst case is "no
 // replica" (the v1 view), never wrong bytes.
 #include "ReplicaFile.h"
+#include "vendor/crc32c.h"
 #include "ReplicaStore.h"
 
 #include "IOBackend.h"
@@ -97,10 +98,57 @@ TEST(ReplicaFile, TornCorruptAndMismatchedAreAbsent) {
   auto bad = buf;
   bad[buf.size() / 2] ^= 0x40;
   EXPECT_FALSE(ReplicaFile::deserialize(bad.data(), bad.size()));
-  // future format version
-  auto v2 = buf;
-  v2[4] = 2; // little-endian version byte
-  EXPECT_FALSE(ReplicaFile::deserialize(v2.data(), v2.size()));
+  // A version this build does not know is treated as absent, not guessed at.
+  auto vNext = buf;
+  vNext[4] = ReplicaMeta::kFormatVersion + 1; // little-endian version byte
+  EXPECT_FALSE(ReplicaFile::deserialize(vNext.data(), vNext.size()));
+}
+
+// A replica written before origMap existed must keep serving. Rejecting it
+// would silently drop every replica already on disk -- the read signature is
+// worth having, but not at the price of a cache-wide rebuild.
+TEST(ReplicaFile, V1SidecarStillParsesAndCarriesNoOrigMap) {
+  auto m = sampleMeta(1 << 20, kP);
+  m.tdataBytes = kP;
+  m.pageCrcs = {7};
+  // Hand-build a v1 image: 72-byte header, no origMap count, no origMap
+  // section. Anything else is the v2 writer's output.
+  auto v2buf = ReplicaFile::serialize(m);
+  std::vector<uint8_t> v1;
+  v1.insert(v1.end(), v2buf.begin(), v2buf.begin() + 72);
+  v1.insert(v1.end(), v2buf.begin() + 80, v2buf.end()); // drop the 8 added bytes
+  v1[4] = ReplicaMeta::kFormatVersionV1;
+  // Recompute the image crc the same way the writer does.
+  {
+    auto copy = v1;
+    std::memset(copy.data() + 68, 0, 4);
+    const uint32_t c = crc32c(copy.data(), copy.size());
+    std::memcpy(v1.data() + 68, &c, 4);
+  }
+  const auto got = ReplicaFile::deserialize(v1.data(), v1.size());
+  ASSERT_TRUE(got) << "a v1 sidecar must still parse";
+  EXPECT_TRUE(got->origMap.empty());
+  EXPECT_EQ(got->extents.size(), m.extents.size());
+  EXPECT_EQ(got->virtualSize, m.virtualSize);
+}
+
+// The map survives a round trip and is what the read signature will consult.
+TEST(ReplicaFile, OrigMapRoundTrips) {
+  auto m = sampleMeta(1 << 20, kP);
+  m.tdataBytes = kP;
+  m.pageCrcs = {7};
+  // A recompressed basket is SHORTER than the original: len != origLen is the
+  // normal case, and is why a virtual offset cannot be mapped by arithmetic.
+  m.origMap = {{100, 40, 5000, 90}, {200, 60, 7000, 130}};
+  const auto buf = ReplicaFile::serialize(m);
+  const auto got = ReplicaFile::deserialize(buf.data(), buf.size());
+  ASSERT_TRUE(got);
+  ASSERT_EQ(got->origMap.size(), 2u);
+  EXPECT_EQ(got->origMap[0].virtOff, 100u);
+  EXPECT_EQ(got->origMap[0].len, 40u);
+  EXPECT_EQ(got->origMap[0].origOff, 5000u);
+  EXPECT_EQ(got->origMap[0].origLen, 90u);
+  EXPECT_EQ(got->origMap[1].origOff, 7000u);
 }
 
 TEST(ReplicaFile, InconsistentGeometryRejected) {

@@ -35,7 +35,15 @@
 namespace ucache {
 
 struct ReplicaMeta {
-  static constexpr uint32_t kFormatVersion = 1;
+  // v2 appends one section: origMap, which names the ORIGINAL file range each
+  // piece of overlay content came from. Serving does not use it and is byte
+  // for byte unchanged; it exists so a replica read can be expressed in the
+  // coordinates the other routes already use, which is what lets two runs of
+  // the same work over different tiers be recognised as the same work.
+  // v1 sidecars still parse and still serve -- they simply contribute no read
+  // signature, and a run that reads one says so rather than guessing.
+  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersionV1 = 1;
   static constexpr uint32_t kOverlayPageSize = 64 * 1024; // economy, not perf
   enum Encoding : uint8_t { kZstd1 = 1, kLz4 = 2, kRaw = 3 };
 
@@ -48,6 +56,17 @@ struct ReplicaMeta {
   // punch-and-clear, and the repair recipe: refetchable at origin offsets).
   struct Range {
     uint64_t off = 0, len = 0;
+  };
+
+  // Virtual range -> the ORIGINAL range whose content it carries, at the
+  // granularity the builder relocated things (one per basket or page, plus one
+  // per in-place patch window). NOT a linear map: a recompressed basket has a
+  // different length than the basket it replaced, so `len` and `origLen`
+  // differ and an offset inside the virtual range has no meaningful original
+  // offset. The range is the unit -- touching any of it means the whole
+  // original range was read.
+  struct OrigRange {
+    uint64_t virtOff = 0, len = 0, origOff = 0, origLen = 0;
   };
 
   uint32_t flags = 0;   // reserved
@@ -63,6 +82,7 @@ struct ReplicaMeta {
   std::string key;          // full normalized key, for ls/debug
   std::vector<Extent> extents;      // sorted by virtOff, non-overlapping
   std::vector<Range> superseded;    // original ranges replaced by the overlay
+  std::vector<OrigRange> origMap;   // sorted by virtOff; empty in a v1 sidecar
   std::vector<uint32_t> pageCrcs;   // crc32c per overlay page of .tdata
 
   uint64_t npages() const {

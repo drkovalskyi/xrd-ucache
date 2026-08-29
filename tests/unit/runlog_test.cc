@@ -23,13 +23,13 @@ struct FileLine {
   uint64_t served = 0, replica = 0, wire = 0, ts = 0;
   uint64_t spanUs = 0;
   uint64_t originSize = 0;
-  std::string mode;
+  std::string mode, readSig;
   // A constructor rather than an aggregate: the trailing fields arrived later
   // and every existing five-argument call site should keep compiling.
   FileLine(std::string k, uint64_t s = 0, uint64_t r = 0, uint64_t w = 0, uint64_t t = 0,
-           uint64_t sp = 0, std::string m = {}, uint64_t osz = 0)
+           uint64_t sp = 0, std::string m = {}, uint64_t osz = 0, std::string rs = {})
       : key(std::move(k)), served(s), replica(r), wire(w), ts(t), spanUs(sp),
-        originSize(osz), mode(std::move(m)) {}
+        originSize(osz), mode(std::move(m)), readSig(std::move(rs)) {}
 };
 
 // One process's pair of files, as the store would have left them.
@@ -51,6 +51,7 @@ void writeRun(const std::string& dir, const std::string& host, uint64_t pid, uin
       << ",\"replica_bytes\":" << f.replica
       << ",\"disk_reads\":1,\"disk_seq\":0,\"disk_bytes\":" << f.served
       << ",\"first_touch_bytes\":" << f.served << ",\"wire_bytes\":" << f.wire
+      << ",\"read_sig\":\"" << f.readSig << "\""
       << ",\"span_us\":" << f.spanUs << ",\"origin_size\":"
       << (f.originSize ? f.originSize : f.served) << ",\"mode\":\"" << f.mode << "\"}\n";
 }
@@ -520,4 +521,77 @@ TEST(Datasets, GroupedBySignatureAndCoverageIsByVolume) {
   }
   EXPECT_EQ(twoFile, 1u);
   EXPECT_EQ(oneFile, 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Read signatures. The input signature says which files a run opened; this
+// says which PARTS of them it read. Two analyses over one dataset share the
+// former and differ here, and only that difference stops their walls being
+// compared as though they were the same work.
+// ---------------------------------------------------------------------------
+
+TEST(ReadSignature, SameWorkOnDifferentTiersAgrees) {
+  test::TempDir d;
+  // A baseline that relayed, and a warm run served entirely from the replica
+  // tier. Different routes, different byte counts, same parts of the same
+  // files read -- the footprints are recorded in ORIGIN coordinates precisely
+  // so these two agree.
+  writeRun(d.path(), "h", 1, 1000, 1100,
+           "\"opens\":2,\"origin_bytes\":0,\"relay_bytes\":2147483648,\"disabled\":1",
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "relay", kGiB, "aa11"},
+            {"root://o//b", 0, 0, kGiB, 0, 0, "relay", kGiB, "bb22"}});
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           "\"opens\":2,\"origin_bytes\":0,\"replica_bytes_served\":2147483648",
+           {{"root://o//a", kGiB, kGiB, 0, 0, 0, "cached", kGiB, "aa11"},
+            {"root://o//b", kGiB, kGiB, 0, 0, 0, "cached", kGiB, "bb22"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 2u);
+  EXPECT_FALSE(runs[0].readSig.empty());
+  EXPECT_EQ(runs[0].readSig, runs[1].readSig)
+      << "the same work over two tiers must produce one read signature";
+}
+
+TEST(ReadSignature, DifferentAnalysisOverTheSameFilesDiffers) {
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, fillCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 0, 0, "cached", kGiB, "aa11"}});
+  writeRun(d.path(), "h", 2, 2000, 2100, fillCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 0, 0, "cached", kGiB, "cc33"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 2u);
+  EXPECT_EQ(runs[0].sig, runs[1].sig) << "same file set";
+  EXPECT_NE(runs[0].readSig, runs[1].readSig) << "different parts read";
+}
+
+TEST(ReadSignature, PartialKnowledgeYieldsNoSignature) {
+  test::TempDir d;
+  // One file's footprint is missing (a replica built before the map existed).
+  // Half a signature would compare different work, so there is none.
+  writeRun(d.path(), "h", 1, 1000, 1100, fillCounters(kGiB),
+           {{"root://o//a", kGiB, 0, 0, 0, 0, "cached", kGiB, "aa11"},
+            {"root://o//b", kGiB, 0, 0, 0, 0, "cached", kGiB, ""}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_TRUE(runs[0].readSig.empty());
+}
+
+TEST(Gain, RefusesABaselineThatReadDifferentParts) {
+  test::TempDir d;
+  // Same files, same sizes, same durations -- but the baseline ran a different
+  // analysis. Matching on the file set alone would happily report a speedup.
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1",
+           {{"root://o//a", 0, 0, kGiB, 1200, 0, "relay", kGiB, "zz99"}});
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
+           {{"root://o//a", kGiB, 0, 0, 2100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  const ucache::Run* warm = nullptr;
+  for (const auto& r : runs)
+    if (!r.disabled)
+      warm = &r;
+  ASSERT_TRUE(warm);
+  const auto g = estimateGain(*warm, runs);
+  EXPECT_FALSE(g.valid) << "gain " << g.gain;
+  EXPECT_NE(g.reason.find("different parts"), std::string::npos) << g.reason;
 }
