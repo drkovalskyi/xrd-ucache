@@ -258,6 +258,22 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   constexpr uint64_t kMinBytes = 64ull << 20;
   constexpr uint64_t kMinDurationS = 30;
   constexpr double kMinOverlap = 0.70;
+  // Two runs of the same work must have read the same parts of the same
+  // files, and that is settled PER FILE rather than by one signature for the
+  // whole run. The reason is that the two sides do not always ask for their
+  // bytes the same way: a replica is a rewritten container, so where only part
+  // of a file was relocated, a read over the original layout can cross a
+  // stretch the replica is never asked for, and one whole bucket lands inside
+  // that stretch on a few percent of files. Requiring every file to agree
+  // turned that into a refused measurement for the entire run.
+  //
+  // The threshold has room because the two populations are nowhere near each
+  // other: the same work over two routes agreed on 94% of files, while two
+  // DIFFERENT analyses over the same inputs share only about a sixth of their
+  // buckets and so agree on essentially none. Anything from a half to nine
+  // tenths separates them; nine tenths is taken because the honest
+  // disagreement measured is a few percent, not tens.
+  constexpr double kMinReadAgreement = 0.90;
 
   if (run.disabled) {
     g.reason = "this run IS a baseline (cache disabled) — it is what others are "
@@ -310,22 +326,19 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   double refC = 0.0, refD = 0.0, refWireTotalD = 0.0;
   bool sawBaseline = false;
 
-  // When BOTH runs know what they read, the read signatures must agree.
-  // Matching by file set alone cannot tell one analysis from another over the
-  // same inputs, and comparing their walls would be meaningless. Where either
-  // side lacks a signature -- a replica built before the map existed -- the
+  // Files both runs read, and how many of them they read the same way. Where
+  // either side has no footprint for a file -- a replica built before the map
+  // existed -- that file is UNKNOWN and counts for neither side, so the
   // file-set match stands on its own rather than refusing outright.
   size_t readSigMismatch = 0;
+  double bestAgree = -1.0; // closest agreement seen, for the refusal text
   for (const auto& r : all) {
     if (r.stem == run.stem || !r.disabled)
       continue;
     if (r.files.empty() || r.durationS() < kMinDurationS || r.faults())
       continue;
-    if (!run.readSig.empty() && !r.readSig.empty() && run.readSig != r.readSig) {
-      ++readSigMismatch;
-      continue;
-    }
     uint64_t refWireTotal = 0, matchedWire = 0, matchedServed = 0;
+    size_t sigPairs = 0, sigAgree = 0;
     for (const auto& [k, f] : r.files) {
       (void)k;
       refWireTotal += f.wireBytes;
@@ -339,9 +352,26 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
         continue;
       matchedWire += it->second.wireBytes;
       matchedServed += f.servedBytes;
+      if (!f.readSig.empty() && !it->second.readSig.empty()) {
+        ++sigPairs;
+        if (f.readSig == it->second.readSig)
+          ++sigAgree;
+      }
     }
     if (matchedWire == 0)
       continue;
+    // Checked before the coverage arithmetic so that "it read different work"
+    // is never reported as "it covered different files": they are different
+    // problems with different remedies.
+    if (sigPairs) {
+      const double agree = static_cast<double>(sigAgree) / static_cast<double>(sigPairs);
+      if (agree < kMinReadAgreement) {
+        ++readSigMismatch;
+        if (agree > bestAgree)
+          bestAgree = agree;
+        continue;
+      }
+    }
     const double c = static_cast<double>(matchedWire) / static_cast<double>(refWireTotal);
     const double d = static_cast<double>(matchedServed) / static_cast<double>(runServedTotal);
     if (c < kMinOverlap || d < kMinOverlap) {
@@ -368,9 +398,13 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // reaches the coverage arithmetic, so its counters look like "no baseline
     // at all" — which is the one thing this refusal must not be mistaken for.
     if (readSigMismatch) {
-      g.reason = "a baseline exists for these files but it read different parts "
-                 "of them — it measured different work, so comparing the walls "
-                 "would not mean anything";
+      char buf[224];
+      std::snprintf(buf, sizeof buf,
+                    "a baseline exists for these files but the two runs read the same "
+                    "parts of only %.0f%% of them (%.0f%% required) — it measured "
+                    "different work, so comparing the walls would not mean anything",
+                    (bestAgree < 0.0 ? 0.0 : bestAgree) * 100.0, kMinReadAgreement * 100.0);
+      g.reason = buf;
     } else if (bestC > 0.0 || bestD > 0.0) {
       char buf[192];
       std::snprintf(buf, sizeof buf,
@@ -486,10 +520,13 @@ std::string signatureOf(const std::map<std::string, Run::FileRec>& files) {
   return std::string(buf);
 }
 
-// Combine the per-file read footprints. Visited in sorted key order, so the
-// order files were opened in cannot change the answer. Returns empty if ANY
-// file lacked a footprint: a signature over part of the work would compare
-// runs that read different things, which is the failure this exists to stop.
+// Combine the per-file read footprints into one identity for the run, shown
+// in `history` so two runs can be told apart at a glance. Visited in sorted
+// key order, so the order files were opened in cannot change the answer, and
+// empty if ANY file lacked a footprint, so a partial answer is never mistaken
+// for a whole one. NOT what decides whether two runs may be compared -- that
+// is settled per file, because one odd file out of hundreds should not veto a
+// measurement (see estimateGain).
 std::string readSignatureOf(const std::map<std::string, Run::FileRec>& files) {
   if (files.empty())
     return std::string();

@@ -604,5 +604,134 @@ TEST(Gain, RefusesABaselineThatReadDifferentParts) {
   ASSERT_TRUE(warm);
   const auto g = estimateGain(*warm, runs);
   EXPECT_FALSE(g.valid) << "gain " << g.gain;
-  EXPECT_NE(g.reason.find("different parts"), std::string::npos) << g.reason;
+  EXPECT_NE(g.reason.find("read the same parts of only"), std::string::npos) << g.reason;
+  EXPECT_NE(g.reason.find("different work"), std::string::npos) << g.reason;
+}
+
+// ---- reading the same parts, file by file --------------------------------
+//
+// A replica is a rewritten container, so the reader asks it for different
+// spans than it asks the original. Where only part of a file was relocated, a
+// read over the original layout can cross a stretch the replica is never asked
+// for, and a whole bucket lands inside that stretch on a few percent of files.
+// That is an honest disagreement about a file, not evidence of different work
+// -- so agreement is counted per file, and a run is comparable when nearly all
+// of them agree.
+
+namespace {
+
+// n files, the first `differ` of which the baseline read differently.
+void writeAgreementPair(const std::string& dir, size_t n, size_t differ) {
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < n; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    char sig[16];
+    std::snprintf(sig, sizeof sig, "s%04zu", i);
+    const std::string same(sig);
+    const std::string other = "x" + same.substr(1);
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, i < differ ? other : same));
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, same));
+  }
+  writeRun(dir, "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
+  writeRun(dir, "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
+           warm);
+}
+
+ucache::GainEstimate gainOfWarm(const std::string& dir) {
+  const auto runs = loadRuns(dir);
+  const ucache::Run* warm = nullptr;
+  for (const auto& r : runs)
+    if (!r.disabled)
+      warm = &r;
+  EXPECT_TRUE(warm);
+  return warm ? estimateGain(*warm, runs) : ucache::GainEstimate{};
+}
+
+} // namespace
+
+TEST(ReadAgreement, AFewFilesReadDifferentlyDoNotVetoTheRun) {
+  // The measured case: 26 files of 439 disagreed between the byte tier and the
+  // replica, i.e. 94% agreement. Under a whole-run signature that refused the
+  // entire measurement.
+  test::TempDir d;
+  writeAgreementPair(d.path(), 100, 6);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_TRUE(g.valid) << g.reason;
+}
+
+TEST(ReadAgreement, ADifferentAnalysisIsStillRefused) {
+  // Two analyses over the same inputs read different columns and so disagree
+  // on essentially every file -- nowhere near the threshold.
+  test::TempDir d;
+  writeAgreementPair(d.path(), 100, 100);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_FALSE(g.valid) << "gain " << g.gain;
+  EXPECT_NE(g.reason.find("read the same parts of only"), std::string::npos) << g.reason;
+  EXPECT_NE(g.reason.find("0%"), std::string::npos) << g.reason;
+}
+
+TEST(ReadAgreement, TheThresholdHoldsOnBothSides) {
+  {
+    test::TempDir d;
+    writeAgreementPair(d.path(), 100, 10); // exactly 90% -- comparable
+    EXPECT_TRUE(gainOfWarm(d.path()).valid);
+  }
+  {
+    test::TempDir d;
+    writeAgreementPair(d.path(), 100, 11); // 89% -- not
+    const auto g = gainOfWarm(d.path());
+    EXPECT_FALSE(g.valid);
+    EXPECT_NE(g.reason.find("89%"), std::string::npos) << g.reason;
+  }
+}
+
+TEST(ReadAgreement, ASingleFileStillHasToMatchExactly) {
+  // With one comparable file the fraction can only be 0 or 1, so the rule is
+  // as strict as it ever was. Nothing is loosened for small runs.
+  test::TempDir d;
+  writeAgreementPair(d.path(), 1, 1);
+  EXPECT_FALSE(gainOfWarm(d.path()).valid);
+}
+
+TEST(ReadAgreement, FilesWithoutAFootprintCountForNeitherSide) {
+  // A replica built before the map existed contributes no signature. Those
+  // files are UNKNOWN: not agreement (which would admit a different analysis)
+  // and not disagreement (which would refuse over no evidence). With every
+  // file unknown the file-set match stands on its own, as it did before
+  // signatures existed.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < 10; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, ""));
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, ""));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
+  writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
+           warm);
+  EXPECT_TRUE(gainOfWarm(d.path()).valid);
+}
+
+TEST(ReadAgreement, UnknownFilesCannotDiluteADisagreement) {
+  // ONE file has signatures and they disagree; nineteen carry none. Counting
+  // the unknown ones as agreement would read 95% and admit the comparison on
+  // the strength of files nobody has any evidence about -- while the only file
+  // that CAN be checked says the work differed. Excluded, this reads 0%.
+  // The ratio is chosen to land on the far side of the threshold: a test where
+  // both readings refuse anyway would pin nothing.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < 20; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    const bool known = i < 1;
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, known ? "aaaa" : ""));
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, known ? "bbbb" : ""));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
+  writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
+           warm);
+  EXPECT_FALSE(gainOfWarm(d.path()).valid);
 }

@@ -101,7 +101,10 @@ struct Run {
   // per-file footprints. Two runs of different analyses over the same inputs
   // share a `sig` and differ here, which is the only thing that separates
   // them. Empty when any file could not contribute one, because a partial
-  // answer would silently compare different work.
+  // answer would silently compare different work. This is an IDENTITY, for
+  // display: whether two runs may be compared is decided from the per-file
+  // signatures instead, since two routes can honestly disagree about a file
+  // or two out of hundreds without having done different work.
   std::string readSig;
   // Origin hosts seen, by file count. A dataset can be served from several
   // sites (redirectors, distributed sets), and the mix is a property of a RUN,
