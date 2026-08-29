@@ -630,10 +630,12 @@ void writeAgreementPair(const std::string& dir, size_t n, size_t differ) {
   std::vector<FileLine> base, warm;
   for (size_t i = 0; i < n; ++i) {
     const std::string key = "root://o//f" + std::to_string(i);
-    char sig[16];
-    std::snprintf(sig, sizeof sig, "s%04zu", i);
-    const std::string same(sig);
-    const std::string other = "x" + same.substr(1);
+    // Built, not formatted into a fixed buffer: a size_t can be twenty digits
+    // and the compiler is right to say so, whatever this loop's bound happens
+    // to be. The optimiser proves the bound in a release build and not in a
+    // debug one, so a fixed buffer here compiles in one and fails the other.
+    const std::string same = "s" + std::to_string(i);
+    const std::string other = "x" + std::to_string(i);
     base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, i < differ ? other : same));
     warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, same));
   }
