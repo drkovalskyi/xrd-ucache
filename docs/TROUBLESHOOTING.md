@@ -211,6 +211,26 @@ never served. To scrub an entry on demand: `ucache verify <url>` (it reports
 `checked`/`bad`; bad pages are quarantined, not the whole entry). To drop and
 re-fetch an entry entirely, remove it and let the next read repopulate.
 
+## `replica ... dropped: torn/corrupt sidecar` right after an upgrade
+
+If this appears for many entries at once, and the entries are ones a *newer*
+uCache recompressed, the sidecars are almost certainly fine. An older version
+reading a cache directory it shares with a newer one does not recognise the
+newer sidecar layout, and an unreadable sidecar is indistinguishable from a
+damaged one, so it reports corruption, counts `replica_invalid`, and removes
+the replica. The next recompression rebuilds it in the older layout, and the
+two versions can then take turns undoing each other's work.
+
+Nothing is lost and no wrong bytes are served — reads fall back to the byte
+cache or the origin — but the transcoding is paid for repeatedly, and with
+`recompress_reclaim = full` the byte copy was already released, so those reads
+go back to the origin.
+
+Point one version at a cache directory at a time. A cache directory is version
+coupled state, not a shared scratch area; separate directories cost only disk.
+Genuine sidecar damage looks different: it turns up on a few entries rather
+than all of them, and it does not correlate with a version change.
+
 ## Pinned data got evicted / a pin didn't take
 
 `ucache pin <url>` sets a flag in the entry's sidecar; `ucache ls` shows a `yes`
