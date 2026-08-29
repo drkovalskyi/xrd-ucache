@@ -997,6 +997,12 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
 
   // The aggregate goes FIRST: one run says what happened last time, the total
   // says whether the cache is worth having at all.
+  // Widths follow the DATA, not the labels -- that is what stacking the header
+  // buys. Every column is as narrow as its widest value, and one format string
+  // drives the two header rows, the aggregate and every run, so they cannot
+  // drift apart.
+  static const char* kRowFmt =
+      "%-16s %-6s %-6s %-6s %4s %3s %5s %6s  %-18s  %5s %5s %5s %4s %4s %5s\n";
   const Totals t = summarize(runs);
   const uint64_t tServed = t.cacheBytes() + t.relayBytes;
   auto pct = [](uint64_t part, uint64_t whole) {
@@ -1017,25 +1023,25 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // Two header rows: the name, then its unit underneath. Units in the name
     // row cost width where it is scarcest and put a "/" over columns of
     // digits, which reads as a column that failed to line up.
-    static const char* kRowFmt =
-        "%-16s %-7s %-6s %-6s %4s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n";
     std::printf(kRowFmt, "WHEN", "DUR", "SIG", "RSIG", "PEAK", "RIF", "FILES", "READ",
                 "ORIG/BYTE/REPL/RLY", "RATE", "INS", "IPS", "CPU", "OVH", "GAIN");
-    std::printf(kRowFmt, "", "", "", "", "cores", "rds", "", "GB", "percent of bytes",
-                "GB/s", "1e12", "1e9/s", "cores", "%", "x");
+    std::printf(kRowFmt, "", "", "", "", "cor", "rds", "", "GB", "percent", "GB/s",
+                "1e12", "1e9", "cor", "%", "x");
     char allTiers[32], allGain[16], allWhen[24];
     const uint64_t allTotal = tServed + t.originBytes;
     std::snprintf(allTiers, sizeof allTiers, "%4.0f/%4.0f/%4.0f/%3.0f",
                   pct(t.originBytes, allTotal), pct(t.hitBytes, allTotal),
                   pct(t.replicaBytes, allTotal), pct(t.relayBytes, allTotal));
     if (t.haveGain)
-      std::snprintf(allGain, sizeof allGain, "%6.2fx", t.gain);
+      std::snprintf(allGain, sizeof allGain, "%5.2f", t.gain);
     else
-      std::snprintf(allGain, sizeof allGain, "%7s", "-");
+      std::snprintf(allGain, sizeof allGain, "%5s", "-");
     std::snprintf(allWhen, sizeof allWhen, "ALL (%zu runs)", t.runs);
-    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6zu %8.1f  %-18s %10s %7s %8s %8s %6s %7s\n",
-                allWhen, humanDur(t.durationS).c_str(), "", "", "", "", t.distinctFiles,
-                gb(allTotal), allTiers, "", "", "", "", "", allGain);
+    char allFiles[16], allRead[16];
+    std::snprintf(allFiles, sizeof allFiles, "%5zu", t.distinctFiles);
+    std::snprintf(allRead, sizeof allRead, "%6.1f", gb(allTotal));
+    std::printf(kRowFmt, allWhen, humanDur(t.durationS).c_str(), "", "", "", "",
+                allFiles, allRead, allTiers, "", "", "", "", "", allGain);
     if (t.haveGain)
       std::printf("%-16s %zu of %zu runs measured vs baseline: took %s, no cache would "
                   "have taken about %s — %s %s\n",
@@ -1047,10 +1053,9 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     if (t.gainCapped)
       std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
                   "estimate)\n", "", t.gainCapped);
-    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n",
-                "----", "----", "----", "----", "----", "----", "-----", "-------",
-                "------------------", "---------", "-----", "-------", "-------",
-                "-----", "------");
+    std::printf(kRowFmt, "----", "----", "----", "----", "----", "---", "-----",
+                "------", "------------------", "-----", "-----", "-----", "----",
+                "----", "-----");
   }
 
   for (size_t i = 0; i < shown; ++i) {
@@ -1087,11 +1092,11 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // --detail, not in a column a reader scans.
     char gainCell[16];
     if (g.valid)
-      std::snprintf(gainCell, sizeof gainCell, "%6.2fx", g.gain);
+      std::snprintf(gainCell, sizeof gainCell, "%5.2f", g.gain);
     else if (r.disabled || r.baselineQualified())
-      std::snprintf(gainCell, sizeof gainCell, "%7s", "base");
+      std::snprintf(gainCell, sizeof gainCell, "%5s", "base");
     else
-      std::snprintf(gainCell, sizeof gainCell, "%7s", "-");
+      std::snprintf(gainCell, sizeof gainCell, "%5s", "-");
     const uint64_t rowTotal = total + r.originBytes;
     char tiers[32];
     std::snprintf(tiers, sizeof tiers, "%4.0f/%4.0f/%4.0f/%3.0f",
@@ -1101,44 +1106,46 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // plus any serial phase -- and is labelled as one wherever it is explained.
     char insT[16], insRate[16], cpuSplit[16];
     if (r.instructions) {
-      std::snprintf(insT, sizeof insT, "%7.2f", r.instructions / 1e12);
-      std::snprintf(insRate, sizeof insRate, "%8.1f",
+      std::snprintf(insT, sizeof insT, "%5.2f", r.instructions / 1e12);
+      std::snprintf(insRate, sizeof insRate, "%5.1f",
                     r.instructions / 1e9 / static_cast<double>(r.durationS()));
     } else {
-      std::snprintf(insT, sizeof insT, "%7s", "-");
-      std::snprintf(insRate, sizeof insRate, "%8s", "-");
+      std::snprintf(insT, sizeof insT, "%5s", "-");
+      std::snprintf(insRate, sizeof insRate, "%5s", "-");
     }
     // CPU measured, WR measured, STL the remainder — labelled as one wherever
     // it is explained, because read waiting and any serial phase land in it.
     if (r.cpuUs)
-      std::snprintf(cpuSplit, sizeof cpuSplit, "%8.1f", r.coresBusy());
+      std::snprintf(cpuSplit, sizeof cpuSplit, "%4.1f", r.coresBusy());
     else
-      std::snprintf(cpuSplit, sizeof cpuSplit, "%8s", "-");
+      std::snprintf(cpuSplit, sizeof cpuSplit, "%4s", "-");
     // What caching ADDED, as a fraction of the direct read this run performed.
     // Only a run that asked the origin has one; a warm run gets "-" rather
     // than a zero that would read as "no overhead".
     char wrCell[16];
     if (r.originWaitS() > 0.0)
-      std::snprintf(wrCell, sizeof wrCell, "%6.1f", 100.0 * r.overhead());
+      std::snprintf(wrCell, sizeof wrCell, "%4.1f", 100.0 * r.overhead());
     else
-      std::snprintf(wrCell, sizeof wrCell, "%6s", "-");
+      std::snprintf(wrCell, sizeof wrCell, "%4s", "-");
     char rif[24];
     if (r.readsInFlight)
-      std::snprintf(rif, sizeof rif, "%4llu", (unsigned long long)r.readsInFlight);
+      std::snprintf(rif, sizeof rif, "%3llu", (unsigned long long)r.readsInFlight);
     else
-      std::snprintf(rif, sizeof rif, "%4s", "-");
+      std::snprintf(rif, sizeof rif, "%3s", "-");
     char thr[24];
     if (r.peakCores)
       std::snprintf(thr, sizeof thr, "%4llu", (unsigned long long)r.peakCores);
     else
       std::snprintf(thr, sizeof thr, "%4s", "-");
-    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6zu %8.1f  %-18s %10.3f %7s %8s %8s %6s %7s\n",
-                stamp(r.startS).c_str(), humanDur(r.durationS()).c_str(),
+    char cFiles[16], cRead[16], cRate[16], cDur[16];
+    std::snprintf(cFiles, sizeof cFiles, "%5zu", r.files.size());
+    std::snprintf(cRead, sizeof cRead, "%6.1f", gb(rowTotal));
+    std::snprintf(cRate, sizeof cRate, "%5.3f", gbPerS(rowTotal, r.durationS()));
+    std::snprintf(cDur, sizeof cDur, "%-6s", humanDur(r.durationS()).c_str());
+    std::printf(kRowFmt, stamp(r.startS).c_str(), cDur,
                 r.sig.empty() ? "-" : r.sig.c_str(),
-                r.readSig.empty() ? "-" : r.readSig.c_str(), thr, rif, r.files.size(),
-                gb(rowTotal),
-                tiers, gbPerS(rowTotal, r.durationS()), insT, insRate, cpuSplit,
-                wrCell, gainCell);
+                r.readSig.empty() ? "-" : r.readSig.c_str(), thr, rif, cFiles, cRead,
+                tiers, cRate, insT, insRate, cpuSplit, wrCell, gainCell);
   }
   if (asJson)
     std::puts("]}");
