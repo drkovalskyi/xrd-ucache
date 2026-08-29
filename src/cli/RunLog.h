@@ -73,11 +73,27 @@ struct Run {
     uint64_t originSize = 0; // the file's size AT THE ORIGIN — the one work
                              // measure that means the same on every route, and
                              // therefore the only sound weight for a share
-    uint64_t readBuckets = 0; // how many 64 KiB pieces of the file were read
+    uint64_t readBuckets = 0; // how many 1 MiB pieces of the file were read
     std::string readSig;     // which parts of THIS file the run read, in
                              // origin coordinates; empty when unknown (a
                              // replica built before the map existed)
     std::string mode;        // cached | fill | relay ("" = pre-span record)
+
+    // The three tiers a byte can reach the application by. They are DISJOINT
+    // counters written at three different places -- the byte tier in
+    // readCached, the replica tier where stitched bytes are handed over, the
+    // origin where fetched bytes are staged -- so the work this file did is
+    // their SUM. Nothing here may be derived by comparing two of them: taking
+    // the larger of served and wire silently drops the replica tier entirely,
+    // which made a warm replica run, whose bytes are almost all replica, look
+    // like a run that had been served nothing and fetched everything.
+    //
+    // ramBytes is deliberately absent: it is a subset of servedBytes (the part
+    // of a byte-tier hit that came from a staged page rather than the disk),
+    // not a fourth tier, and adding it would count those bytes twice.
+    uint64_t deliveredBytes() const { return servedBytes + replicaBytes + wireBytes; }
+    // Of that, what the cache itself delivered.
+    uint64_t cacheDeliveredBytes() const { return servedBytes + replicaBytes; }
   };
   std::map<std::string, FileRec> files;
 

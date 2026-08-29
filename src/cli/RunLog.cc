@@ -333,14 +333,22 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     return g;
   }
 
-  uint64_t runServedTotal = 0;
+  // Work this run did, over all three tiers, and the part of it the cache
+  // itself delivered. Both are needed and they are not the same: coverage asks
+  // what fraction of the run's WORK the baseline also covers, while the rate
+  // the cache sustained may only count bytes the cache actually handed over.
+  // Neither may be built from servedBytes alone -- that is the byte tier only,
+  // so a run served from replicas would report a thousandth of its own work
+  // and be refused for having done none.
+  uint64_t runWorkTotal = 0, runCacheTotal = 0;
   for (const auto& [k, f] : run.files) {
     (void)k;
-    runServedTotal += f.servedBytes;
+    runWorkTotal += f.deliveredBytes();
+    runCacheTotal += f.cacheDeliveredBytes();
   }
-  if (runServedTotal == 0) {
+  if (runWorkTotal == 0) {
     g.why = GainEstimate::Why::kIncomplete;
-    g.reason = "no served bytes attributed to files in this run";
+    g.reason = "no bytes attributed to files in this run";
     return g;
   }
 
@@ -371,7 +379,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       continue;
     if (r.files.empty() || r.durationS() < kMinDurationS || r.faults())
       continue;
-    uint64_t refWireTotal = 0, matchedWire = 0, matchedServed = 0;
+    uint64_t refWireTotal = 0, matchedWire = 0, matchedWork = 0;
     size_t sigPairs = 0, sigAgree = 0;
     for (const auto& [k, f] : r.files) {
       (void)k;
@@ -385,7 +393,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       if (it == r.files.end() || it->second.wireBytes == 0)
         continue;
       matchedWire += it->second.wireBytes;
-      matchedServed += f.servedBytes;
+      matchedWork += f.deliveredBytes();
       if (!f.readSig.empty() && !it->second.readSig.empty()) {
         ++sigPairs;
         if (f.readSig == it->second.readSig)
@@ -407,7 +415,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       }
     }
     const double c = static_cast<double>(matchedWire) / static_cast<double>(refWireTotal);
-    const double d = static_cast<double>(matchedServed) / static_cast<double>(runServedTotal);
+    const double d = static_cast<double>(matchedWork) / static_cast<double>(runWorkTotal);
     if (c < kMinOverlap || d < kMinOverlap) {
       if (c + d > bestC + bestD) { // remember the near-miss for the refusal text
         bestC = c;
@@ -479,7 +487,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   g.savedS = originTime - cacheTime;
   g.gain = (runDur + g.savedS) / runDur;
   g.originMBs = refWireTotalD / refDur / 1e6;
-  g.cacheMBs = static_cast<double>(runServedTotal) / runDur / 1e6;
+  g.cacheMBs = static_cast<double>(runCacheTotal) / runDur / 1e6;
   g.matchedFiles = 0;
   for (const auto& [k, f] : run.files) {
     (void)f;
@@ -631,14 +639,19 @@ double Run::originShare() const {
   uint64_t total = 0;
   for (const auto& [k, f] : files) {
     (void)k;
-    const uint64_t w = f.originSize ? f.originSize : f.servedBytes;
+    const uint64_t w = f.originSize ? f.originSize : f.deliveredBytes();
     if (!w)
       continue;
-    // Bytes handed to the application for this file. A relay never increments
-    // the served counter, so a relayed file is all origin -- which is what it
-    // was; and during a fill the same bytes are both fetched and served, so
-    // the two counters agree and the file is all origin too, correctly.
-    const uint64_t delivered = std::max(f.servedBytes, f.wireBytes);
+    // Bytes handed to the application for this file, summed over the three
+    // DISJOINT tiers that can deliver one. It must be the sum and never the
+    // larger of a pair: served, replica and wire are written in three
+    // different places and a warm replica read touches only the replica
+    // counter, so comparing served against wire scores such a file as
+    // entirely origin -- and a warm replica run then qualifies as a run the
+    // cache did not help, i.e. as the no-cache baseline every other run is
+    // measured against. A true gain reported as a loss is the failure that
+    // costs the most to believe, so the arithmetic here names all three.
+    const uint64_t delivered = f.deliveredBytes();
     if (!delivered)
       continue; // opened, nothing read: no evidence either way
     total += w;

@@ -76,6 +76,23 @@ std::string fillCounters(uint64_t originBytes, uint64_t faults = 0) {
          ",\"hit_bytes\":0,\"crc_failures\":" + std::to_string(faults);
 }
 
+// A file as a COLD pass leaves it. The plugin fetches every byte from the
+// origin and hands most of them straight to the application; only re-reads of
+// pages already staged go back through the byte tier. On a full campaign that
+// was 1.3% of the wire bytes (1.9 GB served against 142.9 GB fetched), so a
+// sixty-fourth is the right order and the fixture states it rather than
+// implying it.
+//
+// Writing served == wire instead -- "during a fill the same bytes are both
+// fetched and served, so the two counters agree" -- is a false model of what
+// the plugin emits, and every fill fixture here carried it. It is the model
+// under which taking the LARGER of served and wire looks equivalent to adding
+// them, which is what let a warm replica run pass as a no-cache baseline.
+FileLine filledFile(const std::string& key, uint64_t size, uint64_t ts = 0,
+                    const std::string& sig = {}) {
+  return FileLine(key, size / 64, 0, size, ts, 0, "fill", size, sig);
+}
+
 std::string warmCounters(uint64_t hitBytes, uint64_t replicaBytes = 0) {
   return "\"opens\":2,\"files_opened\":2,\"origin_bytes\":0,\"hit_bytes\":" +
          std::to_string(hitBytes) +
@@ -759,7 +776,7 @@ TEST(Baseline, AQuietFillIsUsedAsTheReference) {
   // budget the product already promises.
   writeRun(d.path(), "h", 1, 1000, 1200,
            fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0),
-           {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+           {filledFile("root://o//a", kGiB, 1200, "aa11")});
   writeRun(d.path(), "h", 2, 2000, 2100, warmCounters(kGiB),
            {{"root://o//a", kGiB, 0, 0, 2100, 0, "cached", kGiB, "aa11"}});
   const auto runs = loadRuns(d.path());
@@ -779,7 +796,7 @@ TEST(Baseline, ALoudFillIsStillRefused) {
   test::TempDir d;
   writeRun(d.path(), "h", 1, 1000, 1200,
            fillCounters(kGiB) + ",\"buffer_stall_us\":600000000" + originHist(1000.0),
-           {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+           {filledFile("root://o//a", kGiB, 1200, "aa11")});
   writeRun(d.path(), "h", 2, 2000, 2100, warmCounters(kGiB),
            {{"root://o//a", kGiB, 0, 0, 2100, 0, "cached", kGiB, "aa11"}});
   const auto runs = loadRuns(d.path());
@@ -793,16 +810,64 @@ TEST(Baseline, ALoudFillIsStillRefused) {
 
 TEST(Baseline, OriginShareCountsBytesNotFiles) {
   test::TempDir d;
-  // Two files, each delivered half from the origin and half from the cache.
-  // That is a run the cache did half the work for, and it must read as 50% --
-  // not as 100% because "most of each file" came off the wire.
+  // Two files, each delivered half from the origin and half from the byte
+  // tier. That is a run the cache did half the work for, and it must read as
+  // 50% -- not as 100% because "most of each file" came off the wire.
+  //
+  // Half and half is written as EQUAL served and wire counts because the two
+  // are disjoint: a byte counted in one is never counted in the other, so a
+  // file delivered half each way carries the same number in both. An earlier
+  // version of this test wrote served=1 GiB against wire=0.5 GiB and called it
+  // half -- that record actually describes 1.5 GiB delivered, a third of it
+  // from the origin, and asserting 0.50 on it pinned the arithmetic to the
+  // defect rather than to the contract.
   writeRun(d.path(), "h", 1, 1000, 1100, warmCounters(kGiB),
-           {{"root://o//a", kGiB, 0, kGiB / 2, 0, 0, "cached", kGiB},
-            {"root://o//b", kGiB, 0, kGiB / 2, 0, 0, "cached", kGiB}});
+           {{"root://o//a", kGiB / 2, 0, kGiB / 2, 0, 0, "cached", kGiB},
+            {"root://o//b", kGiB / 2, 0, kGiB / 2, 0, 0, "cached", kGiB}});
   const auto runs = loadRuns(d.path());
   ASSERT_EQ(runs.size(), 1u);
   EXPECT_NEAR(runs[0].originShare(), 0.50, 0.01);
   EXPECT_FALSE(runs[0].baselineQualified()) << "half the work came from the cache";
+}
+
+TEST(Baseline, EveryTierCountsTowardsWhatWasDelivered) {
+  // The three counters are written in three different places and none of them
+  // may be dropped. A file served from the replica tier with a little origin
+  // refetch is a third of each here, so any arithmetic that ignores one tier
+  // reports a half or a whole instead.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, warmCounters(kGiB),
+           {{"root://o//a", kGiB, kGiB, kGiB, 0, 0, "cached", 3 * kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NEAR(runs[0].originShare(), 1.0 / 3.0, 0.01)
+      << "served, replica and wire are disjoint, so delivered is their sum";
+}
+
+TEST(Baseline, AWarmReplicaRunIsNotABaseline) {
+  // THE defect this arithmetic exists to prevent, in the shape the field
+  // produces it: recompressed entries serve nearly everything from the replica
+  // tier, and under reclaim=full the byte copy is punched, so the few bytes
+  // the replica does not cover come from the ORIGIN rather than from the byte
+  // tier. Comparing served against wire scores that file as entirely origin.
+  //
+  // A run scored that way qualifies as the reference every other run is
+  // measured against -- so the cache's own best result becomes the definition
+  // of "no cache", and the runs it should be beating report a LOSS. The
+  // failure direction is understatement, which is the one direction a reader
+  // has no reason to doubt.
+  test::TempDir d;
+  std::vector<FileLine> f;
+  for (size_t i = 0; i < 8; ++i)
+    f.push_back(FileLine("root://o//f" + std::to_string(i), 0, kGiB, kGiB / 8192, 0, 0,
+                         "cached", kGiB));
+  writeRun(d.path(), "h", 1, 1000, 1100,
+           warmCounters(8 * kGiB) + originHist(1.0), f);
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_LT(runs[0].originShare(), 0.01) << "the replica tier delivered essentially all of it";
+  EXPECT_FALSE(runs[0].baselineQualified())
+      << "a run served by the cache can never be the measure of running without one";
 }
 
 TEST(Baseline, AMixtureOfRelayedAndFilledFilesQualifies) {
@@ -815,13 +880,15 @@ TEST(Baseline, AMixtureOfRelayedAndFilledFilesQualifies) {
     const std::string key = "root://o//f" + std::to_string(i);
     const bool relayed = i % 2 == 0;
     f.push_back(relayed ? FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, "aa11")
-                        : FileLine(key, kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"));
+                        : filledFile(key, kGiB, 1200, "aa11"));
   }
   writeRun(d.path(), "h", 1, 1000, 1200,
            fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0), f);
   const auto runs = loadRuns(d.path());
   ASSERT_EQ(runs.size(), 1u);
-  EXPECT_NEAR(runs[0].originShare(), 1.00, 0.01) << "relayed and filled are both the origin";
+  // Both routes are the origin; the small shortfall from 1.00 is the fill's own
+  // re-reads of staged pages, which the cache really did deliver.
+  EXPECT_GT(runs[0].originShare(), 0.98) << "relayed and filled are both the origin";
   EXPECT_TRUE(runs[0].baselineQualified());
 }
 
@@ -831,10 +898,10 @@ TEST(Baseline, ARunTooThinToJudgeDoesNotQualify) {
   // evidence, which is how the guard was silently passing everything.
   test::TempDir d;
   writeRun(d.path(), "h", 1, 1000, 1200, fillCounters(kGiB) + ",\"buffer_stall_us\":50000000",
-           {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+           {filledFile("root://o//a", kGiB, 1200, "aa11")});
   const auto runs = loadRuns(d.path());
   ASSERT_EQ(runs.size(), 1u);
-  EXPECT_NEAR(runs[0].originShare(), 1.00, 0.01);
+  EXPECT_GT(runs[0].originShare(), 0.98);
   EXPECT_FALSE(runs[0].overheadKnown());
   EXPECT_FALSE(runs[0].baselineQualified());
 }
@@ -895,7 +962,7 @@ TEST(Thresholds, OverheadBoundSitsAtOneTenth) {
     const std::string w = ",\"buffer_stall_us\":" + std::to_string((uint64_t)(stallS * 1e6)) +
                           originHist(1000.0);
     writeRun(d.path(), "h", 1, 1000, 1200, fillCounters(kGiB) + w,
-             {{"root://o//a", kGiB, 0, kGiB, 1200, 0, "fill", kGiB, "aa11"}});
+             {filledFile("root://o//a", kGiB, 1200, "aa11")});
     const auto runs = loadRuns(d.path());
     EXPECT_EQ(runs.size(), 1u);
     return !runs.empty() && runs[0].baselineQualified();
@@ -906,7 +973,11 @@ TEST(Thresholds, OverheadBoundSitsAtOneTenth) {
 
 TEST(Thresholds, OriginShareBoundSitsAtNineteenTwentieths) {
   // A run is a reference only when the origin did nearly all of the work.
-  // Fractions of a file, not whole files: the split is by bytes.
+  // Fractions of a file, not whole files: the split is by bytes -- so the file
+  // record carries the cached part in the byte-tier counter and the rest in the
+  // wire counter, and the two add up to the file. They are disjoint counters;
+  // putting the whole file in BOTH describes a file read twice, not a file
+  // split between two tiers.
   // Asserted through QUALIFICATION, not through the share itself. Checking
   // the computed fraction against 0.95 pins the arithmetic and leaves the
   // constant free: dropping the bound to 0.80 passed such a test untouched.
@@ -914,7 +985,8 @@ TEST(Thresholds, OriginShareBoundSitsAtNineteenTwentieths) {
     test::TempDir d;
     writeRun(d.path(), "h", 1, 1000, 1200,
              fillCounters(kGiB) + ",\"buffer_stall_us\":1000" + originHist(1000.0),
-             {{"root://o//a", kGiB, 0, kGiB - cachedBytes, 1200, 0, "fill", kGiB, "aa11"}});
+             {{"root://o//a", cachedBytes, 0, kGiB - cachedBytes, 1200, 0, "fill", kGiB,
+               "aa11"}});
     const auto runs = loadRuns(d.path());
     EXPECT_EQ(runs.size(), 1u);
     return !runs.empty() && runs[0].baselineQualified();
