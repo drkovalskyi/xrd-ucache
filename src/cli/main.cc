@@ -1014,10 +1014,15 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::printf("null},\"runs\":[");
   } else {
-    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n",
-                "WHEN", "DUR", "SIG", "RSIG", "PEAK", "RIF", "FILES", "READ GB",
-                "ORIG/BYTE/REPL/RLY", "RATE GB/s", "INS T", "INS/s G", "CPU cor",
-                "OVH%", "GAIN");
+    // Two header rows: the name, then its unit underneath. Units in the name
+    // row cost width where it is scarcest and put a "/" over columns of
+    // digits, which reads as a column that failed to line up.
+    static const char* kRowFmt =
+        "%-16s %-7s %-6s %-6s %4s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n";
+    std::printf(kRowFmt, "WHEN", "DUR", "SIG", "RSIG", "PEAK", "RIF", "FILES", "READ",
+                "ORIG/BYTE/REPL/RLY", "RATE", "INS", "IPS", "CPU", "OVH", "GAIN");
+    std::printf(kRowFmt, "", "", "", "", "cores", "rds", "", "GB", "percent of bytes",
+                "GB/s", "1e12", "1e9/s", "cores", "%", "x");
     char allTiers[32], allGain[16], allWhen[24];
     const uint64_t allTotal = tServed + t.originBytes;
     std::snprintf(allTiers, sizeof allTiers, "%4.0f/%4.0f/%4.0f/%3.0f",
