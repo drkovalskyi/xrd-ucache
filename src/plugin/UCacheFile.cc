@@ -419,26 +419,6 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
   entry->noteRead(off, len);
 }
 
-// Counts one application read for as long as its caller is inside the call.
-// The origin's delivery rate is a function of how many reads are outstanding,
-// so this is the axis on which two runs are or are not comparable -- and it is
-// invisible in thread counts, which stay flat while concurrency changes.
-struct InFlightRead {
-  Stats* s = nullptr;
-  explicit InFlightRead(Stats* st) : s(st) {
-    if (!s)
-      return;
-    const uint64_t n = s->readsInFlight.fetch_add(1, std::memory_order_relaxed) + 1;
-    uint64_t hw = s->readsInFlightHighWater.load(std::memory_order_relaxed);
-    while (n > hw && !s->readsInFlightHighWater.compare_exchange_weak(
-                         hw, n, std::memory_order_relaxed)) {
-    }
-  }
-  ~InFlightRead() {
-    if (s)
-      s->readsInFlight.fetch_sub(1, std::memory_order_relaxed);
-  }
-};
 
 // Vector relay: the byte total and the footprint come from the same walk.
 static void noteRelayChunks(const std::shared_ptr<HandleState>& st,
@@ -507,12 +487,50 @@ static void noteVectorRequest(const std::shared_ptr<HandleState>& st,
     s.reqReadBytes.add(c.length);
 }
 
+// One read outstanding at the ORIGIN, for as long as this object lives. It
+// goes INSIDE the handler that owns a wire read, because that handler is
+// constructed at the issue and destroyed exactly once -- on completion or on a
+// failed issue -- which is the same span the origin sees. Counting on entry to
+// Read and releasing on return measured the handoff instead: every route here
+// dispatches and returns while the caller waits above this library, so 32
+// threads with a read each reported a handful.
+struct OriginInFlight {
+  Stats* s = nullptr;
+  OriginInFlight() = default;
+  explicit OriginInFlight(Stats* st) : s(st) {
+    if (!s)
+      return;
+    const uint64_t n = s->originReadsInFlight.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t hw = s->originReadsInFlightHighWater.load(std::memory_order_relaxed);
+    while (n > hw && !s->originReadsInFlightHighWater.compare_exchange_weak(
+                         hw, n, std::memory_order_relaxed))
+      ;
+  }
+  OriginInFlight(const OriginInFlight&) = delete;
+  OriginInFlight& operator=(const OriginInFlight&) = delete;
+  OriginInFlight(OriginInFlight&& o) noexcept : s(o.s) { o.s = nullptr; }
+  OriginInFlight& operator=(OriginInFlight&& o) noexcept {
+    if (this != &o) {
+      if (s)
+        s->originReadsInFlight.fetch_sub(1, std::memory_order_relaxed);
+      s = o.s;
+      o.s = nullptr;
+    }
+    return *this;
+  }
+  ~OriginInFlight() {
+    if (s)
+      s->originReadsInFlight.fetch_sub(1, std::memory_order_relaxed);
+  }
+};
+
 template <typename Issue>
 static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
                                         XrdCl::ResponseHandler* user, Issue issue) {
   struct Relay : XrdCl::ResponseHandler {
     std::shared_ptr<HandleState> st;
     XrdCl::ResponseHandler* user;
+    OriginInFlight inflight; // released when this handler is destroyed
     void HandleResponseWithHosts(XrdCl::XRootDStatus* s, XrdCl::AnyObject* r,
                                  XrdCl::HostList* h) override {
       st->releaseInner();
@@ -530,6 +548,8 @@ static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
     auto* relay = new Relay;
     relay->st = st;
     relay->user = user;
+    if (st->store)
+      relay->inflight = OriginInFlight(&st->store->stats());
     XrdCl::XRootDStatus s = issue(f, static_cast<XrdCl::ResponseHandler*>(relay));
     if (!s.IsOK()) {
       delete relay;
@@ -640,7 +660,8 @@ class MissReadHandler : public ResponseHandler {
                   uint64_t gateLen = 0)
       : st_(std::move(st)), entry_(std::move(entry)), userOff_(userOff), userLen_(userLen),
         userBuf_(userBuf), user_(user), wireOff_(wireOff), wireBuf_(std::move(wireBuf)),
-        t0_(t0), gateLen_(gateLen) {}
+        t0_(t0), gateLen_(gateLen),
+        inflight_(st_->store ? &st_->store->stats() : nullptr) {}
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
@@ -735,6 +756,7 @@ class MissReadHandler : public ResponseHandler {
   std::shared_ptr<std::vector<char>> wireBuf_;
   uint64_t t0_;
   uint64_t gateLen_;
+  OriginInFlight inflight_; // one origin read, until this handler is destroyed
 };
 
 // Issue the rounded wire read for a single-Read miss, honoring the test-only
@@ -818,7 +840,8 @@ class MissVReadHandler : public ResponseHandler {
                    ChunkList userChunks, std::vector<size_t> missIdx,
                    std::vector<WireElem> wire, ResponseHandler* user, uint64_t t0)
       : st_(std::move(st)), entry_(std::move(entry)), userChunks_(std::move(userChunks)),
-        missIdx_(std::move(missIdx)), wire_(std::move(wire)), user_(user), t0_(t0) {}
+        missIdx_(std::move(missIdx)), wire_(std::move(wire)), user_(user), t0_(t0),
+        inflight_(st_->store ? &st_->store->stats() : nullptr) {}
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
@@ -941,6 +964,7 @@ class MissVReadHandler : public ResponseHandler {
   std::vector<WireElem> wire_;
   ResponseHandler* user_;
   uint64_t t0_;
+  OriginInFlight inflight_; // one origin read, until this handler is destroyed
 };
 
 // Rounded [start,end) for a chunk; the rule and why it is not optional are in
@@ -1663,7 +1687,6 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
                                      ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
-  InFlightRead inflight(st_->store ? &st_->store->stats() : nullptr);
   if (entry)
     noteRequestBytes(st_, size);
   noteAppRead(st_, entry, currentView(), offset, size);
@@ -1812,7 +1835,6 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
   // default -- signed only whatever it happened to fetch through Read, so the
   // same work looked different depending on which call the reader chose. The
   // in-flight count and the width sample were missing for the same reason.
-  InFlightRead inflight(st_->store ? &st_->store->stats() : nullptr);
   noteAppRead(st_, entry, currentView(), offset, size);
   if (auto view = currentView(); entry && view) {
     if (offset + size < offset) { // overflow
@@ -1879,7 +1901,6 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
-  InFlightRead inflight(st_->store ? &st_->store->stats() : nullptr);
   {
     const auto view = currentView();
     for (const auto& c : chunks)

@@ -353,10 +353,10 @@ void printStats(const StatsTotals& t) {
                 (unsigned long long)t.filesOpened,
                 static_cast<double>(t.opens) / static_cast<double>(t.filesOpened));
   const uint64_t diskB = t.hitBytes > t.ramHitBytes ? t.hitBytes - t.ramHitBytes : 0;
-  std::printf("  served by tier     ram %s | disk %s | replica %s | origin %s | relay %s\n",
+  std::printf("  served by tier     direct %s | fill %s | ram %s | disk %s | replica %s\n",
+              human(t.relayBytes).c_str(), human(t.missBytes).c_str(),
               human(t.ramHitBytes).c_str(), human(diskB).c_str(),
-              human(t.replicaBytesServed).c_str(), human(t.missBytes).c_str(),
-              human(t.relayBytes).c_str());
+              human(t.replicaBytesServed).c_str());
   if (t.schemaMixed)
     std::printf("  NOTE               stats files span a version where read counters changed\n"
                 "                     meaning (per page, now per coalesced run) — per-read\n"
@@ -986,13 +986,15 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       return 2;
     }
   }
-  const auto runs = loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history");
+  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
   if (runs.empty()) {
     if (asJson)
       std::puts("{\"runs\":[]}");
     else
       std::puts("no runs recorded yet — records appear when a job that used the "
-                "cache exits (CLI invocations do not write them)");
+                "cache exits. Anything shorter than ten seconds is left out: the "
+                "store writes a line whenever it closes, so `ucache` invocations "
+                "leave one-second entries that are not runs");
     return 0;
   }
   const size_t shown = std::min(top, runs.size());
@@ -1030,7 +1032,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
   // IPS are diagnostics and live in --detail; what stays is what answers "did
   // the cache help, and can I trust the number".
   static const char* kRowFmt =
-      "%-11s  %-6s  %-6s  %-6s  %4s  %3s  %5s  %6s  %-18s  %5s  %5s  %5s  %4s  %4s  %5s\n";
+      "%-11s  %-6s  %-6s  %-6s  %4s  %4s  %5s  %6s  %-18s  %5s  %5s  %5s  %4s  %4s  %5s\n";
   const Totals t = summarize(runs);
   const uint64_t tServed = t.cacheBytes() + t.relayBytes;
   auto pct = [](uint64_t part, uint64_t whole) {
@@ -1052,14 +1054,17 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     // row cost width where it is scarcest and put a "/" over columns of
     // digits, which reads as a column that failed to line up.
     std::printf(kRowFmt, "WHEN", "DUR", "SIG", "RSIG", "PEAK", "RIF", "FILES", "READ",
-                "ORIG/BYTE/REPL/RLY", "RATE", "INS", "IPS", "CPU", "OVH", "GAIN");
-    std::printf(kRowFmt, "", "", "", "", "cor", "rds", "", "GB", "percent", "GB/s",
+                "DIR/FILL/BYTE/REPL", "RATE", "INS", "IPS", "CPU", "OVH", "GAIN");
+    // The unit line qualifies the name above it: reads in flight, AT THE
+    // ORIGIN. Without that a warm run's 0 reads as "no reads happened" rather
+    // than "none went to the origin", which is the whole point of the number.
+    std::printf(kRowFmt, "", "", "", "", "cor", "orig", "", "GB", "percent", "GB/s",
                 "1e12", "1e9", "cor", "%", "x");
     char allTiers[32], allGain[16], allWhen[24];
     const uint64_t allTotal = tServed + t.originBytes;
-    std::snprintf(allTiers, sizeof allTiers, "%4.0f/%4.0f/%4.0f/%3.0f",
-                  pct(t.originBytes, allTotal), pct(t.hitBytes, allTotal),
-                  pct(t.replicaBytes, allTotal), pct(t.relayBytes, allTotal));
+    std::snprintf(allTiers, sizeof allTiers, "%3.0f/%4.0f/%4.0f/%4.0f",
+                  pct(t.relayBytes, allTotal), pct(t.originBytes, allTotal),
+                  pct(t.hitBytes, allTotal), pct(t.replicaBytes, allTotal));
     if (t.haveGain)
       std::snprintf(allGain, sizeof allGain, "%5s", fit(t.gain, 5, 2).c_str());
     else
@@ -1073,7 +1078,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     std::snprintf(allRead, sizeof allRead, "%6s", fit(gb(allTotal), 6, 1).c_str());
     std::printf(kRowFmt, allWhen, humanDur(t.durationS).c_str(), "", "", "", "",
                 allFiles, allRead, allTiers, "", "", "", "", "", allGain);
-    std::printf(kRowFmt, "-----------", "------", "------", "------", "----", "---",
+    std::printf(kRowFmt, "-----------", "------", "------", "------", "----", "----",
                 "-----", "------", "------------------", "-----", "-----", "-----", "----",
                 "----", "-----");
   }
@@ -1119,9 +1124,15 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       std::snprintf(gainCell, sizeof gainCell, "%5s", "-");
     const uint64_t rowTotal = total + r.originBytes;
     char tiers[32];
-    std::snprintf(tiers, sizeof tiers, "%4.0f/%4.0f/%4.0f/%3.0f",
-                  pct(r.originBytes, rowTotal), pct(r.hitBytes, rowTotal),
-                  pct(r.replicaBytesServed, rowTotal), pct(r.relayBytes, rowTotal));
+    // Ordered by how much the cache did: nothing (direct), fetched and kept
+    // it (fill), served it from bytes it had, served it from a replica it
+    // built. A row then reads left to right as the work moving into the cache.
+    // "fill" rather than "origin" because both of the first two columns come
+    // FROM the origin -- what separates them is whether the cache kept what it
+    // fetched, and that is what the word has always meant everywhere else.
+    std::snprintf(tiers, sizeof tiers, "%3.0f/%4.0f/%4.0f/%4.0f",
+                  pct(r.relayBytes, rowTotal), pct(r.originBytes, rowTotal),
+                  pct(r.hitBytes, rowTotal), pct(r.replicaBytesServed, rowTotal));
     // Work done, and the split of the wall. STL is a REMAINDER -- read waiting
     // plus any serial phase -- and is labelled as one wherever it is explained.
     char insT[16], insRate[16], cpuSplit[16];
@@ -1148,10 +1159,10 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::snprintf(wrCell, sizeof wrCell, "%4s", "-");
     char rif[24];
-    if (r.readsInFlight)
-      std::snprintf(rif, sizeof rif, "%3llu", (unsigned long long)r.readsInFlight);
+    if (r.originReadsInFlight)
+      std::snprintf(rif, sizeof rif, "%4llu", (unsigned long long)r.originReadsInFlight);
     else
-      std::snprintf(rif, sizeof rif, "%3s", "-");
+      std::snprintf(rif, sizeof rif, "%4s", "-");
     char thr[24];
     if (r.peakCores)
       std::snprintf(thr, sizeof thr, "%4llu", (unsigned long long)r.peakCores);
@@ -1201,7 +1212,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     }
   }
   const auto runs =
-      loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history");
+      withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
   auto entries = store.listEntries();
   uint64_t used = 0, replicaTotal = 0, replicaN = 0;
   for (const auto& e : entries) {
@@ -1437,10 +1448,10 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
               human(last->originBytes + last->relayBytes).c_str());
   const uint64_t tiered = last->hitBytes + last->replicaBytesServed + last->relayBytes;
   if (tiered)
-    std::printf("  tiers    : byte %.1f%% | replica %.1f%% | relay %.1f%%\n",
+    std::printf("  tiers    : direct %.1f%% | byte %.1f%% | replica %.1f%%\n",
+                100.0 * static_cast<double>(last->relayBytes) / static_cast<double>(tiered),
                 100.0 * static_cast<double>(last->hitBytes) / static_cast<double>(tiered),
-                100.0 * static_cast<double>(last->replicaBytesServed) / static_cast<double>(tiered),
-                100.0 * static_cast<double>(last->relayBytes) / static_cast<double>(tiered));
+                100.0 * static_cast<double>(last->replicaBytesServed) / static_cast<double>(tiered));
   std::printf("  rate     : %.0f MB/s delivered over the run\n",
               mbPerS(tiered + last->originBytes, last->durationS()));
   if (last->hitDiskReads)

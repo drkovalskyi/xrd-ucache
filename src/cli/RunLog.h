@@ -46,7 +46,11 @@ struct Run {
   uint64_t peakCores = 0;
   // Reads the application had outstanding at once. The load the ORIGIN sees,
   // and not derivable from thread counts. Displayed, never matched on.
-  uint64_t readsInFlight = 0;
+  // Reads outstanding AT THE ORIGIN. Records written before this was measured
+  // carry only the superseded dispatch-window counter, which is a different
+  // quantity: they report nothing here rather than have the old number read as
+  // the new one.
+  uint64_t originReadsInFlight = 0;
 
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;
@@ -264,6 +268,15 @@ Totals summarize(const std::vector<Run>& runs, size_t maxEstimates = 100);
 // estimate walks every run, so an uncapped pass is quadratic in a directory
 // that only ever grows.
 inline constexpr size_t kMaxSummaryEstimates = 100;
+
+// Records nobody made. The store writes a counter line when it closes, and
+// every `ucache` invocation opens one, so a cache directory fills up with
+// one-second entries carrying no files and no bytes, sitting among the runs
+// that matter and burying them. Ten seconds is far under the floor any
+// measurement needs and far over anything a CLI call takes, so it separates
+// the two without argument.
+inline constexpr uint64_t kMinListedDurationS = 10;
+std::vector<Run> withoutTrivial(std::vector<Run> runs);
 
 // NOTE. An estimate built from per-file spans lived here and was REMOVED. It
 // compared per-file COST between the two routes and was blind to OVERLAP --

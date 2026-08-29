@@ -110,6 +110,7 @@ std::string Stats::toJsonBody() const {
   f("handles_high_water", handlesHighWater);
   f("threads_high_water", threadsHighWater);
   f("reads_in_flight_high_water", readsInFlightHighWater);
+  f("origin_reads_in_flight_high_water", originReadsInFlightHighWater);
   os << "\"hist_hit_read_us\":" << hitReadUs.toJson() << ',';
   os << "\"hist_miss_read_us\":" << missReadUs.toJson() << ',';
   os << "\"hist_origin_rt_us\":" << originRtUs.toJson() << ',';
@@ -204,6 +205,9 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.threadsHighWater = std::max(t.threadsHighWater, extractU64(last, "threads_high_water"));
     t.readsInFlightHighWater =
         std::max(t.readsInFlightHighWater, extractU64(last, "reads_in_flight_high_water"));
+    t.originReadsInFlightHighWater =
+        std::max(t.originReadsInFlightHighWater,
+                 extractU64(last, "origin_reads_in_flight_high_water"));
     extractHist(last, "hist_hit_read_us", t.histHitRead);
     extractHist(last, "hist_origin_rt_us", t.histOriginRt);
     extractHist(last, "hist_open_us", t.histOpen);

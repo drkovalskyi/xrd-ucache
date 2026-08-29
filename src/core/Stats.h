@@ -101,7 +101,22 @@ struct Stats {
   // only interpretable against the width it ran at, and CPU time divided by
   // wall x this is the share of the machine that was actually computing.
   std::atomic<uint64_t> threadsHighWater{0};
-  // Reads being HANDED OFF at once, and the most there ever were.
+  // Reads outstanding AT THE ORIGIN, and the most there ever were.
+  //
+  // This is the concurrency the origin sees, and its delivery rate is a
+  // function of it -- one measured site gives 147, 1868 and 632 IOPS at 1, 16
+  // and 64 concurrent streams, so not even monotone. Two runs at the same
+  // value put the same load on the origin; two at different values are not
+  // comparable, whatever their thread counts say. Counted where a read is
+  // ISSUED to the origin and released when its handler fires, so it spans the
+  // read rather than the call that started it.
+  //
+  // A warm run reads 0, correctly: nothing was outstanding at the origin
+  // because nothing went there.
+  std::atomic<uint64_t> originReadsInFlight{0};
+  std::atomic<uint64_t> originReadsInFlightHighWater{0};
+  // SUPERSEDED, kept only so the old name is not silently reused for the new
+  // meaning: this counted reads being HANDED OFF at once.
   //
   // READ THE NEXT SENTENCE BEFORE USING THIS. It is not the number of reads
   // outstanding at the origin, which is what would set the origin's delivery
@@ -155,7 +170,8 @@ struct StatsTotals {
            replicaOpens = 0, replicaPublished = 0, replicaInvalid = 0, replicaCrcFailures = 0,
            replicaPunchedBytes = 0, replicaOrphansSwept = 0;
   // Workflow counters:
-  uint64_t handlesHighWater = 0, threadsHighWater = 0, readsInFlightHighWater = 0;
+  uint64_t handlesHighWater = 0, threadsHighWater = 0, readsInFlightHighWater = 0,
+           originReadsInFlightHighWater = 0;
   uint64_t filesOpened = 0, ramHitBytes = 0, firstTouchBytes = 0, hitDiskReads = 0,
            hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
            replicaReadBytes = 0, relayBytes = 0,
