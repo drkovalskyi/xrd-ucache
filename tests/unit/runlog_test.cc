@@ -56,6 +56,17 @@ void writeRun(const std::string& dir, const std::string& host, uint64_t pid, uin
       << (f.originSize ? f.originSize : f.served) << ",\"mode\":\"" << f.mode << "\"}\n";
 }
 
+
+// An origin-wait histogram totalling roughly `seconds`. Bucket 20 is the log2
+// bin around one second, and RunLog takes each bucket at 1.5x its lower edge.
+std::string originHist(double seconds) {
+  const long counts = static_cast<long>(seconds / 1.572864 + 0.5);
+  std::string h = ",\"hist_origin_rt_us\":[";
+  for (int i = 0; i < 21; ++i)
+    h += (i ? "," : "") + std::string(i == 20 ? std::to_string(counts) : "0");
+  return h + "]";
+}
+
 constexpr uint64_t kGiB = 1ull << 30;
 constexpr uint64_t kMiB = 1ull << 20;
 
@@ -443,25 +454,24 @@ TEST(Baseline, OriginShareIsWeightedByOriginSize) {
   EXPECT_NEAR(runs[0].originShare(), 0.9, 0.01);
 }
 
-TEST(Baseline, FillCostIsRelativeToCpuNotToThreadCount) {
+TEST(Baseline, OverheadIsWriteTimeOverOriginTime) {
   test::TempDir d;
-  // The same fill -- same stall thread-time against the same CPU thread-time --
-  // reported at two widths. 584 is what an RNTuple job actually reports for a
-  // 32-thread job, because threads_high_water counts every thread the process
-  // owns. A width-normalised measure scales one of these 18x and passes a fill
-  // whose wall was 2.12x its own direct reference; a cpu-relative one cannot,
-  // because both terms are thread-time.
-  const std::string stall = ",\"buffer_stall_us\":1902000000,\"cpu_us\":3565000000";
+  // The same fill reported at two widths. Overhead compares cache-write time
+  // with ORIGIN-WAIT time, both measured inside this one run, so no thread
+  // count enters and the two must agree. A width-normalised measure scaled one
+  // of these by 18x and accepted a fill whose wall was 2.12x its own direct
+  // reference.
+  const std::string w = ",\"buffer_stall_us\":1230000000" + originHist(1000.0);
   writeRun(d.path(), "h", 1, 1000, 1100,
-           fillCounters(kGiB) + stall + ",\"threads_high_water\":32",
+           fillCounters(kGiB) + w + ",\"threads_high_water\":32",
            {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
   writeRun(d.path(), "h", 2, 2000, 2100,
-           fillCounters(kGiB) + stall + ",\"threads_high_water\":584",
+           fillCounters(kGiB) + w + ",\"threads_high_water\":584",
            {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
   const auto runs = loadRuns(d.path());
   ASSERT_EQ(runs.size(), 2u);
   for (const auto& r : runs) {
-    EXPECT_NEAR(r.fillCost(), 0.348, 0.01)
+    EXPECT_NEAR(r.overhead(), 1.23, 0.02)
         << "threads_high_water " << r.threadsHighWater << " must not change it";
     EXPECT_FALSE(r.baselineQualified());
   }
@@ -470,24 +480,25 @@ TEST(Baseline, FillCostIsRelativeToCpuNotToThreadCount) {
 TEST(Baseline, AQuietFillQualifiesAndALoudOneDoesNot) {
   test::TempDir d;
   // Both are ~100% origin-served, so coverage alone cannot separate them --
-  // which is why the write-side bound exists. Checked against recorded
-  // campaigns: 0.3% (wall 1.01x its direct reference) vs 17.2% (2.49x).
-  // Real numbers from three fills whose direct reference is known: 1.9% went
-  // with a 0.97x wall, 34.8% with 2.12x.
+  // which is why the write-side bound exists. Real ratios from a campaign
+  // whose direct references were known: 0.01 went with a 1.05x wall, 1.23
+  // with 2.13x. The bound is the product's own cold-pass target, 1.1x.
   writeRun(d.path(), "h", 1, 1000, 1100,
-           fillCounters(kGiB) + ",\"buffer_stall_us\":66000000,\"cpu_us\":3368000000",
+           fillCounters(kGiB) + ",\"buffer_stall_us\":10000000" + originHist(1000.0),
            {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
   writeRun(d.path(), "h", 2, 2000, 2100,
-           fillCounters(kGiB) + ",\"buffer_stall_us\":1902000000,\"cpu_us\":3565000000",
+           fillCounters(kGiB) + ",\"buffer_stall_us\":1230000000" + originHist(1000.0),
            {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
   const auto runs = loadRuns(d.path());
   ASSERT_EQ(runs.size(), 2u);
   for (const auto& r : runs) {
     EXPECT_NEAR(r.originShare(), 1.0, 0.01) << "both are origin-served";
-    if (r.pid == 1)
+    if (r.pid == 1) {
+      EXPECT_NEAR(r.overhead(), 0.01, 0.005);
       EXPECT_TRUE(r.baselineQualified());
-    else
+    } else {
       EXPECT_FALSE(r.baselineQualified());
+    }
   }
 }
 

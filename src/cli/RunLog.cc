@@ -103,6 +103,7 @@ void loadCounters(const std::string& path, Run& r) {
   r.handlesHighWater = fieldU64(last, "handles_high_water");
   r.threadsHighWater = fieldU64(last, "threads_high_water");
   r.peakCores = fieldU64(last, "peak_cores");
+  r.readsInFlight = fieldU64(last, "reads_in_flight_high_water");
   r.cpuUs = fieldU64(last, "cpu_us");
   r.instructions = fieldU64(last, "instructions");
   r.cycles = fieldU64(last, "cycles");

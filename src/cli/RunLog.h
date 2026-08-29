@@ -44,6 +44,9 @@ struct Run {
   // waiting. Two runs with very different peaks are not comparable: they had
   // different amounts of machine, and a ratio between them measures that.
   uint64_t peakCores = 0;
+  // Reads the application had outstanding at once. The load the ORIGIN sees,
+  // and not derivable from thread counts. Displayed, never matched on.
+  uint64_t readsInFlight = 0;
 
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;

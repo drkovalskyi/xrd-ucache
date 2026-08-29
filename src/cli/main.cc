@@ -1014,8 +1014,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::printf("null},\"runs\":[");
   } else {
-    std::printf("%-16s %-7s %-6s %-6s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n",
-                "WHEN", "DUR", "SIG", "RSIG", "PEAK", "FILES", "READ GB",
+    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n",
+                "WHEN", "DUR", "SIG", "RSIG", "PEAK", "RIF", "FILES", "READ GB",
                 "ORIG/BYTE/REPL/RLY", "RATE GB/s", "INS T", "INS/s G", "CPU cor",
                 "OVH%", "GAIN");
     char allTiers[32], allGain[16], allWhen[24];
@@ -1028,8 +1028,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::snprintf(allGain, sizeof allGain, "%7s", "-");
     std::snprintf(allWhen, sizeof allWhen, "ALL (%zu runs)", t.runs);
-    std::printf("%-16s %-7s %-6s %-6s %4s %6zu %8.1f  %-18s %10s %7s %8s %8s %6s %7s\n",
-                allWhen, humanDur(t.durationS).c_str(), "", "", "", t.distinctFiles,
+    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6zu %8.1f  %-18s %10s %7s %8s %8s %6s %7s\n",
+                allWhen, humanDur(t.durationS).c_str(), "", "", "", "", t.distinctFiles,
                 gb(allTotal), allTiers, "", "", "", "", "", allGain);
     if (t.haveGain)
       std::printf("%-16s %zu of %zu runs measured vs baseline: took %s, no cache would "
@@ -1042,8 +1042,8 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     if (t.gainCapped)
       std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
                   "estimate)\n", "", t.gainCapped);
-    std::printf("%-16s %-7s %-6s %-6s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n",
-                "----", "----", "----", "----", "----", "-----", "-------",
+    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6s %8s  %-18s %10s %7s %8s %8s %6s %7s\n",
+                "----", "----", "----", "----", "----", "----", "-----", "-------",
                 "------------------", "---------", "-----", "-------", "-------",
                 "-----", "------");
   }
@@ -1117,15 +1117,20 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       std::snprintf(wrCell, sizeof wrCell, "%6.1f", 100.0 * r.overhead());
     else
       std::snprintf(wrCell, sizeof wrCell, "%6s", "-");
+    char rif[24];
+    if (r.readsInFlight)
+      std::snprintf(rif, sizeof rif, "%4llu", (unsigned long long)r.readsInFlight);
+    else
+      std::snprintf(rif, sizeof rif, "%4s", "-");
     char thr[24];
     if (r.peakCores)
       std::snprintf(thr, sizeof thr, "%4llu", (unsigned long long)r.peakCores);
     else
       std::snprintf(thr, sizeof thr, "%4s", "-");
-    std::printf("%-16s %-7s %-6s %-6s %4s %6zu %8.1f  %-18s %10.3f %7s %8s %8s %6s %7s\n",
+    std::printf("%-16s %-7s %-6s %-6s %4s %4s %6zu %8.1f  %-18s %10.3f %7s %8s %8s %6s %7s\n",
                 stamp(r.startS).c_str(), humanDur(r.durationS()).c_str(),
                 r.sig.empty() ? "-" : r.sig.c_str(),
-                r.readSig.empty() ? "-" : r.readSig.c_str(), thr, r.files.size(),
+                r.readSig.empty() ? "-" : r.readSig.c_str(), thr, rif, r.files.size(),
                 gb(rowTotal),
                 tiers, gbPerS(rowTotal, r.durationS()), insT, insRate, cpuSplit,
                 wrCell, gainCell);
