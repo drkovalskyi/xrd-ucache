@@ -928,6 +928,16 @@ std::string humanDur(uint64_t s) {
   return out;
 }
 
+// "08-29 12:52" — the year is the same for every row a reader compares.
+std::string stampShort(uint64_t t) {
+  char out[32];
+  const time_t tt = static_cast<time_t>(t);
+  struct tm tmv;
+  ::localtime_r(&tt, &tmv);
+  std::strftime(out, sizeof out, "%m-%d %H:%M", &tmv);
+  return out;
+}
+
 std::string stamp(uint64_t t) {
   char out[32];
   const time_t tt = static_cast<time_t>(t);
@@ -1001,8 +1011,11 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
   // buys. Every column is as narrow as its widest value, and one format string
   // drives the two header rows, the aggregate and every run, so they cannot
   // drift apart.
+  // ~75 columns so it fits a terminal or a phone. RSIG, PEAK, RIF, INS and
+  // IPS are diagnostics and live in --detail; what stays is what answers "did
+  // the cache help, and can I trust the number".
   static const char* kRowFmt =
-      "%-16s %-6s %-6s %-6s %4s %3s %5s %6s  %-18s  %5s %5s %5s %4s %4s %5s\n";
+      "%-11s  %-6s  %-6s  %-6s  %4s  %3s  %5s  %6s  %-18s  %5s  %5s  %5s  %4s  %4s  %5s\n";
   const Totals t = summarize(runs);
   const uint64_t tServed = t.cacheBytes() + t.relayBytes;
   auto pct = [](uint64_t part, uint64_t whole) {
@@ -1036,25 +1049,14 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       std::snprintf(allGain, sizeof allGain, "%5.2f", t.gain);
     else
       std::snprintf(allGain, sizeof allGain, "%5s", "-");
-    std::snprintf(allWhen, sizeof allWhen, "ALL (%zu runs)", t.runs);
+    std::snprintf(allWhen, sizeof allWhen, "ALL %zu runs", t.runs);
     char allFiles[16], allRead[16];
     std::snprintf(allFiles, sizeof allFiles, "%5zu", t.distinctFiles);
     std::snprintf(allRead, sizeof allRead, "%6.1f", gb(allTotal));
     std::printf(kRowFmt, allWhen, humanDur(t.durationS).c_str(), "", "", "", "",
                 allFiles, allRead, allTiers, "", "", "", "", "", allGain);
-    if (t.haveGain)
-      std::printf("%-16s %zu of %zu runs measured vs baseline: took %s, no cache would "
-                  "have taken about %s — %s %s\n",
-                  "", t.runsEstimated, t.runs,
-                  humanDur((uint64_t)t.estimatedDurationS).c_str(),
-                  humanDur((uint64_t)std::max(0.0, t.estimatedDurationS + t.savedS)).c_str(),
-                  t.savedS >= 0 ? "saved" : "COST",
-                  humanDur((uint64_t)std::fabs(t.savedS)).c_str());
-    if (t.gainCapped)
-      std::printf("%-16s (%zu older run(s) not included in the gain — too many to "
-                  "estimate)\n", "", t.gainCapped);
-    std::printf(kRowFmt, "----", "----", "----", "----", "----", "---", "-----",
-                "------", "------------------", "-----", "-----", "-----", "----",
+    std::printf(kRowFmt, "-----------", "------", "------", "------", "----", "---",
+                "-----", "------", "------------------", "-----", "-----", "-----", "----",
                 "----", "-----");
   }
 
@@ -1142,11 +1144,23 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     std::snprintf(cRead, sizeof cRead, "%6.1f", gb(rowTotal));
     std::snprintf(cRate, sizeof cRate, "%5.3f", gbPerS(rowTotal, r.durationS()));
     std::snprintf(cDur, sizeof cDur, "%-6s", humanDur(r.durationS()).c_str());
-    std::printf(kRowFmt, stamp(r.startS).c_str(), cDur,
+    std::printf(kRowFmt, stampShort(r.startS).c_str(), cDur,
                 r.sig.empty() ? "-" : r.sig.c_str(),
                 r.readSig.empty() ? "-" : r.readSig.c_str(), thr, rif, cFiles, cRead,
                 tiers, cRate, insT, insRate, cpuSplit, wrCell, gainCell);
   }
+  if (!asJson && (t.haveGain || t.gainCapped))
+    std::putchar('\n'); // separate the caveats from the last row
+  if (!asJson && t.haveGain)
+    std::printf("%zu of %zu runs measured vs baseline: took %s, no cache would have "
+                "taken about %s — %s %s\n",
+                t.runsEstimated, t.runs, humanDur((uint64_t)t.estimatedDurationS).c_str(),
+                humanDur((uint64_t)std::max(0.0, t.estimatedDurationS + t.savedS)).c_str(),
+                t.savedS >= 0 ? "saved" : "COST",
+                humanDur((uint64_t)std::fabs(t.savedS)).c_str());
+  if (!asJson && t.gainCapped)
+    std::printf("%zu older run(s) not included in the gain — too many to estimate\n",
+                t.gainCapped);
   if (asJson)
     std::puts("]}");
   else if (runs.size() > shown)
@@ -1233,6 +1247,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
 
   // Overall first. The last run answers "what just happened"; the aggregate
   // answers "is this cache worth having", which is the question being asked.
+  std::vector<std::string> caveats;
   const Totals t = summarize(runs);
   if (t.runs) {
     std::printf("overall    : %zu run(s) recorded — %.1f GB read, %.1f GB from the "
@@ -1258,6 +1273,9 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                     t.runsEstimated, humanDur(took).c_str(), humanDur(would).c_str(),
                     t.gain);
       if (t.runsEstimated < t.runs) {
+        // Collected, printed at the end: a caveat between the headline and the
+        // per-dataset table pushes the numbers apart and reads as a warning
+        // about the line above it.
         // Enumerate by REASON. "8 of 12 could not be measured" reads as the
         // tool failing until you see that half of them are the baselines the
         // other half were measured against.
@@ -1274,16 +1292,20 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
           else
             ++noBase;
         }
-        std::printf("             %zu not measured:", t.runs - t.runsEstimated);
+        char buf[256];
+        int n = std::snprintf(buf, sizeof buf, "%zu of %zu runs not measured:",
+                              t.runs - t.runsEstimated, t.runs);
         if (bases)
-          std::printf("  %zu baseline(s) — they are the reference", bases);
+          n += std::snprintf(buf + n, sizeof buf - n,
+                             "  %zu baseline(s) — they are the reference", bases);
         if (tooShort)
-          std::printf("  %zu under 30s", tooShort);
+          n += std::snprintf(buf + n, sizeof buf - n, "  %zu under 30s", tooShort);
         if (noBase)
-          std::printf("  %zu with no comparable baseline", noBase);
+          n += std::snprintf(buf + n, sizeof buf - n,
+                             "  %zu with no comparable baseline", noBase);
         if (other)
-          std::printf("  %zu incomplete", other);
-        std::putchar('\n');
+          std::snprintf(buf + n, sizeof buf - n, "  %zu incomplete", other);
+        caveats.push_back(buf);
       }
     } else {
       std::printf("  saved    : not measured yet — run your work ONCE with "
@@ -1331,13 +1353,13 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                   "gain  byte %-7s repl %-7s\n",
                   d.runs, d.measured, covered, gb(d.readBytes), byteCell, replCell);
       if (!d.measured && d.baselines)
-        std::printf("         a baseline is recorded; no comparable run to measure "
-                    "against it yet\n");
+        caveats.push_back(d.sig + ": a baseline is recorded; no comparable run to "
+                                  "measure against it yet");
       else if (!d.measured && d.incomplete == d.runs)
-        std::printf("         no finished run yet\n");
+        caveats.push_back(d.sig + ": no finished run yet");
       else if (!d.measured)
-        std::printf("         no baseline — run these inputs once with UCACHE_DISABLE=1 "
-                    "and every later run on them is measured\n");
+        caveats.push_back(d.sig + ": no baseline — run these inputs once with "
+                                  "UCACHE_DISABLE=1 and every later run is measured");
     }
     std::putchar('\n');
   }
@@ -1353,6 +1375,11 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   }
   std::putchar('\n');
 
+  if (!caveats.empty()) {
+    std::puts("\nnotes");
+    for (const auto& c : caveats)
+      std::printf("  %s\n", c.c_str());
+  }
   if (!detail) {
     if (last)
       std::puts("next       : `ucache summary --detail` for the last run; "
