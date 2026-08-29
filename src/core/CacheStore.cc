@@ -819,6 +819,7 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its
   // wall must be divided by.
+  widthSampler().sample();
   {
     const uint64_t n = CpuCounters::liveThreads();
     uint64_t prev = stats_.threadsHighWater.load(std::memory_order_relaxed);
@@ -857,7 +858,8 @@ void CacheStore::dumpStats(bool finalDump) {
   // Work accounting for the run record. cpu_us covers the whole process;
   // instructions/cycles only since the cache engaged (CpuCounters.h) and are
   // absent when the kernel does not permit the counters.
-  line << ",\"cpu_us\":" << CpuCounters::processCpuUs();
+  line << ",\"cpu_us\":" << CpuCounters::processCpuUs()
+       << ",\"peak_cores\":" << widthSampler().width();
   if (cpu_.available())
     line << ",\"instructions\":" << cpu_.instructions() << ",\"cycles\":" << cpu_.cycles();
   line << ',' << stats_.toJsonBody()

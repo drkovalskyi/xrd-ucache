@@ -37,6 +37,13 @@ struct Run {
   // wall x threads is the share of the machine that was computing rather than
   // waiting, which bounds from above what any cache could still win.
   uint64_t cpuUs = 0, instructions = 0, cycles = 0, threadsHighWater = 0;
+  // The most cores this run ever had busy in one second: the ceiling its
+  // parallelism reached, measured rather than declared. Against coresBusy()
+  // (the MEAN) it says whether the run used the resources it had -- a peak of
+  // 30 with a mean of 3 is a run that could go wide and spent its life
+  // waiting. Two runs with very different peaks are not comparable: they had
+  // different amounts of machine, and a ratio between them measures that.
+  uint64_t peakCores = 0;
 
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;
@@ -49,6 +56,7 @@ struct Run {
   uint64_t pageWrites = 0, flushRuns = 0, flushRunBytes = 0;
   uint64_t bufferStalls = 0, bufferStallUs = 0;
   std::vector<uint64_t> histHitRead, histReplicaRead, histOriginRt, histOpen;
+  std::vector<uint64_t> histFlushWrite, histMetaFlush;
 
   // Per-entry records from the companion, keyed by URL.
   struct FileRec {
@@ -108,19 +116,13 @@ struct Run {
   // recompressed data and its byte count is not in the same units as the
   // origin's.
   double originShare() const;
-  // Share of this run's THREAD-TIME that went into blocking on cache writes:
-  // stall / (cpu + stall). Both terms are thread-time, so the ratio needs no
-  // thread count -- which is what makes it usable. A version normalised by
-  // threads_high_water was tried and FAILED in the field: that counter is
-  // every thread the process owns, and an RNTuple job reported 584 where the
-  // job was given 32, scaling a 35% fill down to 0.9% and passing a fill whose
-  // wall was 2.12x its own direct reference. Measured across three fills whose
-  // truth is known: 34.8% (2.12x, reject), 1.9% (0.97x) and 0.7% (1.01x).
+  // Superseded by overhead(), which measures the same thing against the right
+  // denominator: cache-write time over ORIGIN-wait time, not over CPU time.
+  // Kept because it is what the records of earlier runs support.
   double fillCost() const;
   static constexpr double kMinOriginShare = 0.95;
-  static constexpr double kMaxFillCost = 0.05;
   bool baselineQualified() const {
-    return originShare() >= kMinOriginShare && fillCost() <= kMaxFillCost;
+    return originShare() >= kMinOriginShare && overhead() <= kMaxOverhead;
   }
   // Average cores executing over the run: CPU time divided by wall. Absolute
   // on purpose -- a SHARE needs a denominator, and threads_high_water counts
@@ -129,9 +131,43 @@ struct Run {
   // user expects. Cores busy needs no such assumption: 6 cores on a 32-thread
   // job is starving, 23 is working.
   double coresBusy() const;
-  // Share of wall x threads spent on CPU. Only meaningful where the caller
-  // knows the intended width; prefer coresBusy() for display.
-  double busy() const;
+  // Mean cores blocked on cache writes. Thread-time over wall, so it does NOT
+  // convert to wall overhead -- see overhead().
+  double coresWriting() const {
+    return bufferStallUs ? (static_cast<double>(bufferStallUs) / 1e6) /
+                               static_cast<double>(durationS())
+                         : 0.0;
+  }
+
+  // Thread-time the run spent waiting on the ORIGIN, and thread-time it spent
+  // on cache writes (flush, writer stalls, sidecar stores).
+  double originWaitS() const;
+  double writeWaitS() const;
+
+  // **The wall overhead of caching, as a fraction of the direct read.** This
+  // is the one figure that answers "how much longer did this take than
+  // fetching the data would have", and it needs NO baseline: both terms are
+  // measured inside the SAME run, under the same concurrency, so whatever
+  // fraction of thread-time became wall time is common to them and cancels in
+  // the ratio.
+  //
+  // That independence is the point. A direct run cannot serve as the reference
+  // here because it fluctuates -- the same job against the same origin
+  // measured 173 s and 1025 s within one evening -- so any overhead computed
+  // ACROSS runs inherits that spread. This one cannot.
+  //
+  // Checked against three fills whose direct reference happened to be known:
+  // 0.010 and 0.012 where the true overhead was 0.05 and 0.01, and 1.227 where
+  // it was 1.13. Meaningless for a warm run, which never asks the origin: 0
+  // there means "nothing to compare", not "no overhead".
+  double overhead() const {
+    const double o = originWaitS();
+    return o > 0.0 ? writeWaitS() / o : 0.0;
+  }
+  // A fill is usable as a baseline when the cache added little to it. The
+  // bound is the product's own cold-pass target -- no more than 1.1x the
+  // direct read -- so the two say the same thing in the same units.
+  static constexpr double kMaxOverhead = 0.10;
 };
 
 // Every run in a stats directory, newest first. A missing directory yields an

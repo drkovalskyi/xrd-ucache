@@ -389,6 +389,9 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
                         uint64_t len) {
   if (!len)
     return;
+  // Reads happen for the whole run, so this is where the parallelism ceiling
+  // gets sampled; internally it is a load and a compare all but once a second.
+  widthSampler().sample();
   if (!entry) {
     // Keyed by url, not by handle: the same file opened twice must accumulate
     // into one footprint or neither open matches anything.
@@ -408,6 +411,27 @@ static void noteAppRead(const std::shared_ptr<HandleState>& st,
   }
   entry->noteRead(off, len);
 }
+
+// Counts one application read for as long as its caller is inside the call.
+// The origin's delivery rate is a function of how many reads are outstanding,
+// so this is the axis on which two runs are or are not comparable -- and it is
+// invisible in thread counts, which stay flat while concurrency changes.
+struct InFlightRead {
+  Stats* s = nullptr;
+  explicit InFlightRead(Stats* st) : s(st) {
+    if (!s)
+      return;
+    const uint64_t n = s->readsInFlight.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t hw = s->readsInFlightHighWater.load(std::memory_order_relaxed);
+    while (n > hw && !s->readsInFlightHighWater.compare_exchange_weak(
+                         hw, n, std::memory_order_relaxed)) {
+    }
+  }
+  ~InFlightRead() {
+    if (s)
+      s->readsInFlight.fetch_sub(1, std::memory_order_relaxed);
+  }
+};
 
 // Vector relay: the byte total and the footprint come from the same walk.
 static void noteRelayChunks(const std::shared_ptr<HandleState>& st,
@@ -1621,6 +1645,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
 XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffer,
                                      ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
+  InFlightRead inflight(st_->store ? &st_->store->stats() : nullptr);
   if (entry)
     noteRequestBytes(st_, size);
   noteAppRead(st_, entry, currentView(), offset, size);
@@ -1829,6 +1854,7 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
+  InFlightRead inflight(st_->store ? &st_->store->stats() : nullptr);
   {
     const auto view = currentView();
     for (const auto& c : chunks)

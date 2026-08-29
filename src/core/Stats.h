@@ -101,6 +101,14 @@ struct Stats {
   // only interpretable against the width it ran at, and CPU time divided by
   // wall x this is the share of the machine that was actually computing.
   std::atomic<uint64_t> threadsHighWater{0};
+  // Reads the application had outstanding at once, and the most it ever had.
+  // This is the concurrency the ORIGIN sees, which is what sets its delivery
+  // rate -- measured on eoscms at 147/1868/632 IOPS for 1/16/64 streams, so
+  // not even monotone. Threads alive and cores busy say nothing about it.
+  // Counts threads blocked inside a read call, so a caller using XrdCl
+  // asynchronously would not be seen; ROOT reads synchronously.
+  std::atomic<uint64_t> readsInFlight{0};
+  std::atomic<uint64_t> readsInFlightHighWater{0};
   Histogram hitReadUs;
   Histogram missReadUs;
   Histogram originRtUs;
@@ -137,7 +145,7 @@ struct StatsTotals {
            replicaOpens = 0, replicaPublished = 0, replicaInvalid = 0, replicaCrcFailures = 0,
            replicaPunchedBytes = 0, replicaOrphansSwept = 0;
   // Workflow counters:
-  uint64_t handlesHighWater = 0, threadsHighWater = 0;
+  uint64_t handlesHighWater = 0, threadsHighWater = 0, readsInFlightHighWater = 0;
   uint64_t filesOpened = 0, ramHitBytes = 0, firstTouchBytes = 0, hitDiskReads = 0,
            hitDiskBytes = 0, hitDiskSeq = 0, replicaBytesServed = 0, replicaReads = 0,
            replicaReadBytes = 0, relayBytes = 0,

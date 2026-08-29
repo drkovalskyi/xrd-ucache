@@ -102,6 +102,7 @@ void loadCounters(const std::string& path, Run& r) {
   r.disabled = fieldU64(last, "disabled") != 0;
   r.handlesHighWater = fieldU64(last, "handles_high_water");
   r.threadsHighWater = fieldU64(last, "threads_high_water");
+  r.peakCores = fieldU64(last, "peak_cores");
   r.cpuUs = fieldU64(last, "cpu_us");
   r.instructions = fieldU64(last, "instructions");
   r.cycles = fieldU64(last, "cycles");
@@ -135,6 +136,8 @@ void loadCounters(const std::string& path, Run& r) {
   fieldHist(last, "hist_hit_read_us", r.histHitRead);
   fieldHist(last, "hist_replica_read_us", r.histReplicaRead);
   fieldHist(last, "hist_origin_rt_us", r.histOriginRt);
+  fieldHist(last, "hist_flush_write_us", r.histFlushWrite);
+  fieldHist(last, "hist_meta_flush_us", r.histMetaFlush);
   fieldHist(last, "hist_open_us", r.histOpen);
 }
 
@@ -545,6 +548,25 @@ double Run::originShare() const {
   return static_cast<double>(fromOrigin) / static_cast<double>(total);
 }
 
+namespace {
+// A log2-microsecond histogram's total, taking each bucket at 1.5x its lower
+// edge (the mid-point of a log2 bin). Coarse by construction; the ratio of two
+// such totals is what is used, and the coarseness largely cancels.
+double histTotalS(const std::vector<uint64_t>& h) {
+  double us = 0.0;
+  for (size_t i = 0; i < h.size(); ++i)
+    us += static_cast<double>(h[i]) * 1.5 * static_cast<double>(1ull << i);
+  return us / 1e6;
+}
+} // namespace
+
+double Run::originWaitS() const { return histTotalS(histOriginRt); }
+
+double Run::writeWaitS() const {
+  return histTotalS(histFlushWrite) + histTotalS(histMetaFlush) +
+         static_cast<double>(bufferStallUs) / 1e6;
+}
+
 double Run::fillCost() const {
   if (!bufferStallUs)
     return 0.0;
@@ -563,13 +585,7 @@ double Run::coresBusy() const {
   return (static_cast<double>(cpuUs) / 1e6) / static_cast<double>(durationS());
 }
 
-double Run::busy() const {
-  const uint64_t threads = threadsHighWater ? threadsHighWater : 0;
-  if (!cpuUs || !threads)
-    return 0.0;
-  const double denom = static_cast<double>(durationS()) * static_cast<double>(threads);
-  return denom > 0.0 ? (static_cast<double>(cpuUs) / 1e6) / denom : 0.0;
-}
+
 
 
 std::string Dataset::topHost() const {

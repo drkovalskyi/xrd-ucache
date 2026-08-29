@@ -106,6 +106,7 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
   // costs, and a file read exactly once would otherwise have no span at all.
   // Sample the process width while the run is active: at exit the pool has
   // wound down, and the peak is what the wall must be divided by.
+  widthSampler().sample();
   {
     const uint64_t n = CpuCounters::liveThreads();
     uint64_t prev = stats.threadsHighWater.load(std::memory_order_relaxed);

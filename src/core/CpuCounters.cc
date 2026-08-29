@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <dirent.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -98,6 +100,47 @@ uint64_t CpuCounters::processCpuUs() {
   const uint64_t s = static_cast<uint64_t>(ru.ru_stime.tv_sec) * 1000000ull +
                      static_cast<uint64_t>(ru.ru_stime.tv_usec);
   return u + s;
+}
+
+void WidthSampler::sample() {
+  struct timespec ts;
+  if (::clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    return;
+  const uint64_t wall = static_cast<uint64_t>(ts.tv_sec) * 1000000ull +
+                        static_cast<uint64_t>(ts.tv_nsec) / 1000ull;
+  // Lock-free gate: this is called from the read path, which runs millions of
+  // times, and all but one call a second must cost a load and a compare.
+  uint64_t due = nextSampleUs_.load(std::memory_order_relaxed);
+  if (wall < due)
+    return;
+  if (!nextSampleUs_.compare_exchange_strong(due, wall + 1000000ull,
+                                             std::memory_order_relaxed))
+    return; // another thread is taking this second's sample
+  const uint64_t cpu = CpuCounters::processCpuUs();
+  std::lock_guard<std::mutex> g(mu_);
+  if (lastWallUs_ == 0) {
+    lastWallUs_ = wall;
+    lastCpuUs_ = cpu;
+    return;
+  }
+  const uint64_t dw = wall - lastWallUs_;
+  if (dw == 0)
+    return;
+  const double cores = static_cast<double>(cpu - lastCpuUs_) / static_cast<double>(dw);
+  lastWallUs_ = wall;
+  lastCpuUs_ = cpu;
+  if (cores > peakCores_)
+    peakCores_ = cores;
+}
+
+uint64_t WidthSampler::width() const {
+  std::lock_guard<std::mutex> g(mu_);
+  return static_cast<uint64_t>(peakCores_ + 0.5);
+}
+
+WidthSampler& widthSampler() {
+  static WidthSampler* s = new WidthSampler(); // never destroyed, on purpose
+  return *s;
 }
 
 } // namespace ucache
