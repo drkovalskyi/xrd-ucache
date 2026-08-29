@@ -15,6 +15,7 @@
 #include <sys/file.h>
 
 namespace ucache {
+
 namespace {
 uint64_t nowS() { return static_cast<uint64_t>(::time(nullptr)); }
 
@@ -161,7 +162,8 @@ void FileEntry::emitObsRecord() {
      // origin compressed -- so they cannot normalise a comparison between
      // routes; the file's size at the origin can.
      << ",\"origin_size\":" << meta_.fileSize
-     << ",\"read_sig\":\"" << footprint_.sig() << "\""
+     << ",\"read_sig\":\"" << footprint_.sig(meta_.fileSize) << "\",\"read_buckets\":"
+     << footprint_.count(meta_.fileSize)
      // A file this process mostly FETCHED is a fill, whatever else it also
      // served; the distinction decides which population a measurement joins.
      << ",\"mode\":\"" << (v(obs_.wireBytes) > v(obs_.servedBytes) ? "fill" : "cached")
@@ -256,7 +258,6 @@ bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint3
 
 bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
   noteActivity();
-  noteRead(off, len);
   if (len == 0)
     return true;
   if (off + len < off || off + len > meta_.fileSize) // wrap, then range
@@ -394,11 +395,6 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
 
 void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
   noteActivity();
-  // A fill READ these bytes from the origin to be able to write them, so it
-  // has the same read footprint as a warm pass over the same work. Without
-  // this a cold run and a warm run of one analysis would look like different
-  // analyses and could never be compared.
-  noteRead(off, len);
   if (cfg_.fillBufferMb <= 0) {
     writePagesDirect(off, len, buf);
     return;
@@ -441,7 +437,6 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
 
 void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
   noteActivity();
-  noteRead(off, len);
   if (len == 0)
     return;
   const uint32_t P = meta_.pageSize;

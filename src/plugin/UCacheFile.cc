@@ -365,8 +365,8 @@ void HandleState::releaseInner() {
 // a tier-share indicator, not an accounting invariant).
 static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n,
                            uint64_t off = 0, uint64_t len = 0) {
-  if (len)
-    st->footprint.note(off, len);
+  (void)off;
+  (void)len; // the footprint is recorded once, at the entry point
   if (st->store && n) {
     st->store->stats().relayBytes.fetch_add(n, std::memory_order_relaxed);
     st->relayedBytes.fetch_add(n, std::memory_order_relaxed);
@@ -377,14 +377,44 @@ static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n,
   }
 }
 
+// What the APPLICATION asked for, in origin coordinates -- recorded once, at
+// the entry point, for every route. Recording it deeper would record what each
+// route CHOSE to move instead: a fill rounds and coalesces its fetches, the
+// byte tier reads exactly the request, and a replica addresses a rewritten
+// container. Those are three different byte sets for one analysis, and hashing
+// them would say the same work was different work.
+static void noteAppRead(const std::shared_ptr<HandleState>& st,
+                        const std::shared_ptr<FileEntry>& entry,
+                        const std::shared_ptr<ReplicaView>& view, uint64_t off,
+                        uint64_t len) {
+  if (!len)
+    return;
+  if (!entry) {
+    // Keyed by url, not by handle: the same file opened twice must accumulate
+    // into one footprint or neither open matches anything.
+    if (st->store)
+      st->store->relayFootprint(st->url).note(off, len);
+    return;
+  }
+  if (view && view->hasOriginMap()) {
+    // A stitched read addresses the replica's layout; translate before
+    // recording. A v1 sidecar has no map and contributes nothing, which leaves
+    // the signature empty rather than wrong.
+    std::vector<ReplicaMeta::Range> orig;
+    view->originRanges(off, len, orig);
+    for (const auto& r : orig)
+      entry->noteRead(r.off, r.len);
+    return;
+  }
+  entry->noteRead(off, len);
+}
+
 // Vector relay: the byte total and the footprint come from the same walk.
 static void noteRelayChunks(const std::shared_ptr<HandleState>& st,
                             const XrdCl::ChunkList& chunks) {
   uint64_t n = 0;
-  for (const auto& c : chunks) {
+  for (const auto& c : chunks)
     n += c.length;
-    st->footprint.note(c.offset, c.length);
-  }
   noteRelayBytes(st, n);
 }
 
@@ -410,8 +440,7 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
         originSize = si->GetSize();
       delete si;
     }
-    st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize,
-                              st->footprint.sig());
+    st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize);
   }
 }
 
@@ -1045,17 +1074,6 @@ void stitchedServe(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> e
     }
   if (st->store && localBytes)
     st->store->stats().servedBytes.fetch_add(localBytes, std::memory_order_relaxed);
-  // Name what was read in the coordinates every other route uses. A replica
-  // is a rewritten container, so its own offsets mean nothing to a baseline;
-  // origMap turns them back into origin ranges. A v1 sidecar has no map and
-  // contributes nothing, which leaves the signature empty rather than wrong.
-  if (entry && view && view->hasOriginMap()) {
-    std::vector<ReplicaMeta::Range> orig;
-    for (const auto& c : userChunks)
-      view->originRanges(c.offset, c.length, orig);
-    for (const auto& r : orig)
-      entry->noteRead(r.off, r.len);
-  }
   if (st->store && overlayBytes) {
     auto& stats = st->store->stats();
     stats.replicaBytesServed.fetch_add(overlayBytes, std::memory_order_relaxed);
@@ -1605,6 +1623,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   auto entry = ensureEntry();
   if (entry)
     noteRequestBytes(st_, size);
+  noteAppRead(st_, entry, currentView(), offset, size);
   if (auto view = currentView(); entry && view) {
     // Stitched entry: serve on the executor — overlay + v1
     // cache locally, residual original sub-ranges via the miss machinery.
@@ -1810,6 +1829,11 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
+  {
+    const auto view = currentView();
+    for (const auto& c : chunks)
+      noteAppRead(st_, entry, view, c.offset, c.length);
+  }
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {
     noteRelayChunks(st_, chunks);

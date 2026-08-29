@@ -29,8 +29,48 @@ bool ReadFootprint::empty() const {
   return true;
 }
 
-std::string ReadFootprint::sig() const {
+namespace {
+uint64_t lastBucket(uint64_t limitBytes) {
+  return limitBytes ? (limitBytes - 1) / ReadFootprint::kBucket
+                    : ~uint64_t(0);
+}
+} // namespace
+
+uint64_t ReadFootprint::count(uint64_t limitBytes) const {
   std::lock_guard<std::mutex> g(mu_);
+  const uint64_t last = lastBucket(limitBytes);
+  uint64_t n = 0;
+  for (size_t i = 0; i < bits_.size(); ++i) {
+    uint64_t w = bits_[i];
+    while (w) {
+      const uint64_t b = i * 64 + static_cast<uint64_t>(__builtin_ctzll(w));
+      w &= w - 1;
+      if (b <= last)
+        ++n;
+    }
+  }
+  return n;
+}
+
+std::vector<uint64_t> ReadFootprint::buckets(uint64_t limitBytes) const {
+  std::lock_guard<std::mutex> g(mu_);
+  const uint64_t last = lastBucket(limitBytes);
+  std::vector<uint64_t> out;
+  for (size_t i = 0; i < bits_.size(); ++i) {
+    uint64_t w = bits_[i];
+    while (w) {
+      const uint64_t b = i * 64 + static_cast<uint64_t>(__builtin_ctzll(w));
+      w &= w - 1;
+      if (b <= last)
+        out.push_back(b);
+    }
+  }
+  return out;
+}
+
+std::string ReadFootprint::sig(uint64_t limitBytes) const {
+  std::lock_guard<std::mutex> g(mu_);
+  const uint64_t last = lastBucket(limitBytes);
   uint64_t h = 1469598103934665603ull;
   bool any = false;
   for (size_t i = 0; i < bits_.size(); ++i) {
@@ -38,6 +78,8 @@ std::string ReadFootprint::sig() const {
     while (w) {
       const uint64_t b = i * 64 + static_cast<uint64_t>(__builtin_ctzll(w));
       w &= w - 1;
+      if (b > last)
+        continue;
       any = true;
       for (int s = 0; s < 8; ++s) {
         h ^= static_cast<unsigned char>((b >> (8 * s)) & 0xff);

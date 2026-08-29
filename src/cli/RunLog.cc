@@ -162,8 +162,17 @@ void loadFiles(const std::string& path, Run& r) {
     f.wireBytes += fieldU64(line, "wire_bytes");
     f.spanUs += fieldU64(line, "span_us");
     f.originSize = std::max(f.originSize, fieldU64(line, "origin_size"));
-    if (f.readSig.empty())
-      f.readSig = fieldStr(line, "read_sig");
+    // A footprint only grows, and a file opened twice emits a record per
+    // close, so the LAST one is the complete answer -- taking the first would
+    // record half of what the run read.
+    {
+      const uint64_t rb = fieldU64(line, "read_buckets");
+      const std::string rs = fieldStr(line, "read_sig");
+      if (!rs.empty() && rb >= f.readBuckets) {
+        f.readSig = rs;
+        f.readBuckets = rb;
+      }
+    }
     const std::string m = fieldStr(line, "mode");
     // A re-opened entry emits a second record. Modes agree in practice (the
     // mode is a per-key property, not per-open; if they ever disagree, the

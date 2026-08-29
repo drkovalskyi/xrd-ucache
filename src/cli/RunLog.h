@@ -58,6 +58,7 @@ struct Run {
     uint64_t originSize = 0; // the file's size AT THE ORIGIN — the one work
                              // measure that means the same on every route, and
                              // therefore the only sound weight for a share
+    uint64_t readBuckets = 0; // how many 64 KiB pieces of the file were read
     std::string readSig;     // which parts of THIS file the run read, in
                              // origin coordinates; empty when unknown (a
                              // replica built before the map existed)

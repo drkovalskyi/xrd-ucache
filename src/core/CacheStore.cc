@@ -803,9 +803,19 @@ FileEntry::ScrubResult CacheStore::verify(const UrlKey& key, uint64_t originSize
   return e->verifyAll();
 }
 
+ReadFootprint& CacheStore::relayFootprint(const std::string& url) {
+  std::lock_guard<std::mutex> g(relayFpMu_);
+  auto& p = relayFp_[url];
+  if (!p)
+    p = std::make_unique<ReadFootprint>();
+  return *p;
+}
+
 void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const char* mode,
-                                uint64_t spanUs, uint64_t originSize,
-                                const std::string& readSig) {
+                                uint64_t spanUs, uint64_t originSize) {
+  const ReadFootprint& fp = relayFootprint(url);
+  const std::string readSig = fp.sig(originSize);
+  const uint64_t readBuckets = fp.count(originSize);
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its
   // wall must be divided by.
@@ -827,7 +837,8 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
      << ",\"disk_reads\":0,\"disk_seq\":0,\"disk_bytes\":0,\"first_touch_bytes\":0"
      << ",\"wire_bytes\":" << bytes << ",\"span_us\":" << spanUs
      << ",\"origin_size\":" << originSize << ",\"read_sig\":\"" << readSig
-     << "\",\"mode\":\""
+     << "\",\"read_buckets\":" << readBuckets;
+  os << ",\"mode\":\""
      << mode << "\"}\n";
   obsSink_->append(os.str());
 }

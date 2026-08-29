@@ -30,16 +30,32 @@ namespace ucache {
 
 class ReadFootprint {
  public:
-  // 64 KiB: coarse enough that the two routes' coalescing does not change the
-  // answer, fine enough to separate one column from another.
-  static constexpr uint64_t kBucket = 64 * 1024;
+  // 1 MiB, chosen by measurement rather than taste. The routes coalesce
+  // differently: a byte-tier request merges adjacent pages and transfers the
+  // gap between them, while a replica read maps back to the pages alone and
+  // never names the gap. At 64 KiB those gaps landed in buckets one route
+  // marked and the other did not, and four routes over one analysis produced
+  // three different answers; from 256 KiB up they agree, and 1 MiB is taken
+  // for margin against a workload that coalesces harder than the ones
+  // measured. Discrimination survives it: two analyses reading different
+  // columns of the same files share 17% of their buckets at this size, so a
+  // different analysis still reads as different work.
+  static constexpr uint64_t kBucket = 1024 * 1024;
 
   void note(uint64_t off, uint64_t len);
-  // 12 hex characters over the set of touched buckets, or empty when nothing
-  // was read. Order-independent by construction: it hashes bucket INDICES in
-  // ascending order, so the sequence reads arrived in cannot change it.
-  std::string sig() const;
+
+  // `limitBytes` is the file's size at the ORIGIN; buckets beyond it are
+  // dropped. Readers routinely ask past the end -- ROOT fetches a file's tail
+  // in fixed blocks -- and a route that serves the request verbatim would
+  // record those bytes while a route that maps them through a replica's layout
+  // would not. Past-EOF bytes are not file content, so neither should sign
+  // them. 0 means "no limit known", which only a caller with no size may pass.
+  std::string sig(uint64_t limitBytes = 0) const;
   bool empty() const;
+  uint64_t count(uint64_t limitBytes = 0) const;
+  // Touched bucket indices, ascending. For diagnosis only: comparing two
+  // signatures tells you THAT they differ, this tells you where.
+  std::vector<uint64_t> buckets(uint64_t limitBytes = 0) const;
 
  private:
   mutable std::mutex mu_;
