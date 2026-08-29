@@ -1245,10 +1245,34 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                     "(%.1fx, vs a measured baseline)\n",
                     t.runsEstimated, humanDur(took).c_str(), humanDur(would).c_str(),
                     t.gain);
-      if (t.runsEstimated < t.runs)
-        std::printf("             the other %zu run(s) could not be measured — "
-                    "`ucache history` says which\n",
-                    t.runs - t.runsEstimated);
+      if (t.runsEstimated < t.runs) {
+        // Enumerate by REASON. "8 of 12 could not be measured" reads as the
+        // tool failing until you see that half of them are the baselines the
+        // other half were measured against.
+        size_t bases = 0, tooShort = 0, noBase = 0, other = 0;
+        for (const auto& r : runs) {
+          if (estimateGain(r, runs).valid)
+            continue;
+          if (r.disabled || r.baselineQualified())
+            ++bases;
+          else if (r.durationS() < 30)
+            ++tooShort;
+          else if (r.readSig.empty() || r.sig.empty())
+            ++other;
+          else
+            ++noBase;
+        }
+        std::printf("             %zu not measured:", t.runs - t.runsEstimated);
+        if (bases)
+          std::printf("  %zu baseline(s) — they are the reference", bases);
+        if (tooShort)
+          std::printf("  %zu under 30s", tooShort);
+        if (noBase)
+          std::printf("  %zu with no comparable baseline", noBase);
+        if (other)
+          std::printf("  %zu incomplete", other);
+        std::putchar('\n');
+      }
     } else {
       std::printf("  saved    : not measured yet — run your work ONCE with "
                   "UCACHE_DISABLE=1 to record a no-cache baseline, then compare\n");
