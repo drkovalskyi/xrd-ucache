@@ -354,7 +354,7 @@ stats across 3 process file(s):
   admissions_bypassed 0
 workflow:
   files opened       787 distinct (2.0 opens/file)
-  served by tier     ram 1.2 GiB | disk 53.5 GiB | replica 0 B | origin 0 B | relay 0 B
+  served by tier     direct 0 B | fill 0 B | ram 1.2 GiB | disk 53.5 GiB | replica 0 B
   hit disk reads     2380995 (mean 41.8 KiB, 88% sequential)
   re-read factor     1.8x (first touch 30.4 GiB of 54.7 GiB byte-tier serves)
   fill flushes       4210 runs (mean 7.9 MiB)

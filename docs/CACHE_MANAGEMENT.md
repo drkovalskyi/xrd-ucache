@@ -131,7 +131,7 @@ runs can be compared without guesswork:
 ```
 workflow:
   files opened       1310 distinct (50.2 opens/file)      <- reopen loop!
-  served by tier     ram 0 B | disk 47.4 GiB | replica 0 B | origin 0 B | relay 0 B
+  served by tier     direct 0 B | fill 0 B | ram 0 B | disk 47.4 GiB | replica 0 B
   hit disk reads     12400000 (mean 4.1 KiB, 12% sequential)
   re-read factor     4.8x (first touch 9.9 GiB of 47.4 GiB byte-tier serves)
 latency p50/p95/p99:
