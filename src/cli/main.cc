@@ -1097,7 +1097,12 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   // The two columns the table shows and this did not: a
                   // scripted reader was told it gets the same figures.
                   "\"peak_cores\":%llu,\"origin_reads_in_flight_high_water\":%llu,"
-                  "\"origin_share\":%.3f,\"fill_cost\":%.4f,\"gain\":",
+                  // `overhead` is the live measure a fill is judged by;
+                  // `fill_cost` beside it is superseded and kept only so a
+                  // consumer that reads it does not lose the key. Publishing
+                  // the dead one and withholding the live one is backwards.
+                  "\"origin_share\":%.3f,\"fill_cost\":%.4f,"
+                  "\"overhead\":%.4f,\"overhead_known\":%s,\"gain\":",
                   i ? "," : "", (unsigned long long)r.startS,
                   (unsigned long long)r.durationS(), r.host.c_str(),
                   (unsigned long long)r.pid, runKind(r),
@@ -1110,7 +1115,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   (unsigned long long)r.cycles, r.readSig.c_str(),
                   (unsigned long long)r.peakCores,
                   (unsigned long long)r.originReadsInFlight, r.originShare(),
-                  r.fillCost());
+                  r.fillCost(), r.overhead(), r.overheadKnown() ? "true" : "false");
       if (g.valid)
         // Not a literal: "baseline" told a scripted reader every reference
         // was an explicit no-cache run, when the whole point of the inference
