@@ -13,6 +13,10 @@ namespace {
 // Match the exact `"<key>":<digits>` the counter writers emit. Strings and
 // arrays are skipped rather than mis-parsed, which is what keeps this tolerant
 // of fields it has never heard of.
+bool hasField(const std::string& line, const char* key) {
+  return line.find(std::string("\"") + key + "\":") != std::string::npos;
+}
+
 uint64_t fieldU64(const std::string& line, const char* key) {
   const std::string needle = std::string("\"") + key + "\":";
   auto p = line.find(needle);
@@ -114,6 +118,13 @@ void loadCounters(const std::string& path, Run& r) {
   r.threadsHighWater = fieldU64(last, "threads_high_water");
   r.peakCores = fieldU64(last, "peak_cores");
   r.originReadsInFlight = fieldU64(last, "origin_reads_in_flight_high_water");
+  // Presence, separately from value. Both of these are legitimately ZERO -- a
+  // warm run asks the origin for nothing, which is the whole point of the
+  // counter -- and rendering a measured zero the same as a record too old to
+  // carry the field made the one observation the column exists for
+  // indistinguishable from no observation at all.
+  r.havePeakCores = hasField(last, "peak_cores");
+  r.haveOriginReadsInFlight = hasField(last, "origin_reads_in_flight_high_water");
   r.cpuUs = fieldU64(last, "cpu_us");
   r.instructions = fieldU64(last, "instructions");
   r.cycles = fieldU64(last, "cycles");

@@ -51,6 +51,8 @@ struct Run {
   // quantity: they report nothing here rather than have the old number read as
   // the new one.
   uint64_t originReadsInFlight = 0;
+  // Whether the record carried these at all. Zero is a real reading for both.
+  bool havePeakCores = false, haveOriginReadsInFlight = false;
 
   // Cumulative counters, from the last complete line.
   uint64_t opens = 0, filesOpened = 0;

@@ -1167,12 +1167,12 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     else
       std::snprintf(wrCell, sizeof wrCell, "%4s", "-");
     char rif[24];
-    if (r.originReadsInFlight)
+    if (r.haveOriginReadsInFlight)
       std::snprintf(rif, sizeof rif, "%4llu", (unsigned long long)r.originReadsInFlight);
     else
       std::snprintf(rif, sizeof rif, "%4s", "-");
     char thr[24];
-    if (r.peakCores)
+    if (r.havePeakCores)
       std::snprintf(thr, sizeof thr, "%4llu", (unsigned long long)r.peakCores);
     else
       std::snprintf(thr, sizeof thr, "%4s", "-");
@@ -3898,15 +3898,20 @@ int main(int argc, char** argv) {
       return cmdStatsFiles(cfg, top);
     }
     if (argc > 2 && !std::strcmp(argv[2], "--reset")) {
-      // Reset = delete the per-process jsonl dumps: the counters are pure
-      // diagnostics, and a fresh window is how you measure ONE analysis run
-      // against a specific cache state. A process still running keeps writing
-      // to its (now unlinked) file and those numbers are lost — warn when a
-      // file was written moments ago, since that usually means a live job.
+      // Reset = start a fresh COUNTER window, which is how you measure ONE
+      // analysis run against a specific cache state. The per-process records
+      // are MOVED to stats/history, not deleted -- deleting them would delete
+      // any measured no-cache baseline with them. Traces are the exception.
+      //
+      // A process still running keeps writing to its record, which follows the
+      // rename, so its numbers are not lost -- but they land in the history
+      // rather than in the new window, so the window is not the clean
+      // measurement it was asked for. Warn when a file was written moments
+      // ago, since that usually means a live job.
       const std::string sdir = cfg.cacheDir + "/stats";
       DIR* d = ::opendir(sdir.c_str());
       if (!d) {
-        std::puts("stats reset: nothing to remove");
+        std::puts("stats reset: no records to move");
         return 0;
       }
       int removed = 0, kept = 0, live = 0;
@@ -3950,8 +3955,8 @@ int main(int argc, char** argv) {
       if (live)
         std::fprintf(stderr,
                      "warning: %d file(s) were written in the last 10 s — a job may "
-                     "still be running; its counters keep accumulating in the deleted "
-                     "file and will never be visible\n",
+                     "still be running; its counters will land in stats/history rather "
+                     "than in the fresh window\n",
                      live);
       return 0;
     }

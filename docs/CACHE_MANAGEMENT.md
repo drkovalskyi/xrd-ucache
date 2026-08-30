@@ -120,9 +120,16 @@ ucache stats              # exactly that run: hits, misses, origin bytes,
                           # latency histograms
 ```
 
-Only the diagnostic counters are removed — the cached data is untouched. Run
-the reset while nothing is reading through the cache: a live process keeps
-writing to its (now deleted) file and those numbers are lost.
+Only the counter window is reset — the cached data is untouched, and the
+records themselves MOVE to `stats/history`, where `ucache summary` and
+`ucache history` keep reading them. Deleting them would delete any measured
+no-cache baseline, which is what every later run is compared against. Traces
+are the exception: bulky, per-op, and meaningless at run level, so they go.
+
+Run the reset while nothing is reading through the cache. A live process keeps
+writing to its record, which follows the rename, so its numbers are not lost —
+but they land in the history rather than in the fresh window, which is not the
+clean measurement you asked for.
 
 ### Comparing two workflows (why is THIS analysis slow?)
 
