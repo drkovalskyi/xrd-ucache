@@ -843,8 +843,13 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
   // overshoot past the end as though it were content -- which is exactly what
   // the signature refuses to do. Gating only the signature let one record say
   // `read_sig: "" , read_buckets: 4211`: no evidence and a confident count of
-  // it, in the same line. Consumers are told to prefer the record with the
-  // most buckets, so the unusable one won.
+  // it, in the same line.
+  //
+  // The self-contradiction was real; an earlier note here went further and
+  // said the unusable record therefore WON the merge, which it did not -- the
+  // shipped consumer guards that rule on the signature being non-empty. The
+  // record was wrong, its consequence was contained, and claiming the
+  // consequence made the fix sound more urgent than the evidence supported.
   const bool sizeKnown = fp && originSize;
   const std::string readSig = sizeKnown ? fp->sig(originSize) : std::string();
   const uint64_t readBuckets = sizeKnown ? fp->count(originSize) : 0;
