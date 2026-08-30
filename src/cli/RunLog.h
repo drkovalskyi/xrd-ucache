@@ -148,8 +148,23 @@ struct Run {
   double fillCost() const;
   static constexpr double kMinOriginShare = 0.95;
   bool baselineQualified() const {
-    return originShare() >= kMinOriginShare && overheadKnown() && overhead() <= kMaxOverhead;
+    return originShare() >= kMinOriginShare && servedLessThanFetched() && overheadKnown() &&
+           overhead() <= kMaxOverhead;
   }
+  // The origin fetched at least as much as the cache served. This is a BYTE
+  // test, and it is here because originShare() is not one: that weights each
+  // file by its size AT THE ORIGIN, so a file touched for 5 MB counts the same
+  // as a file read whole from the cache. It is therefore a size-weighted count
+  // of files, and the cache's byte contribution is unbounded underneath it --
+  // 380 files read 5 MB each from the origin and 20 read whole from the cache
+  // scores exactly 0.95 while the cache delivered 97% of the bytes, and that
+  // run was accepted as the measure of running WITHOUT a cache.
+  //
+  // Same shape as the defect that made a warm replica run a baseline, through
+  // a different door: a run the cache served must never define what no cache
+  // costs, however few files it served. This is the comparison a fill is
+  // already judged by, applied to the reference as well.
+  bool servedLessThanFetched() const { return originBytes >= cacheBytes(); }
   // Average cores executing over the run: CPU time divided by wall. Absolute
   // on purpose -- a SHARE needs a denominator, and threads_high_water counts
   // every thread the process owns (TBB workers, XrdCl, ROOT), not the width
@@ -240,9 +255,8 @@ struct GainEstimate {
     kTooShort,      // under the duration floor
     kTooSmall,      // too little data moved to divide
     kIncomplete,    // no per-file records, or nothing attributable
-    kReadDifferent,  // a baseline exists but the two read different work
-    kReadUnverified, // too few of the compared files could be checked at all
-    kNoBaseline,     // nothing recorded that could serve as a reference
+    kReadDifferent, // a baseline exists but the two read different work
+    kNoBaseline,    // nothing recorded that could serve as a reference
   };
   Why why = Why::kNoBaseline;
   bool valid = false;

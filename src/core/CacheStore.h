@@ -259,11 +259,14 @@ class CacheStore {
   // long-lived server process touches an unbounded number of them, so this
   // stops rather than grows for ever.
   //
-  // The ceiling is far above any analysis job. It is NOT negligible in memory,
-  // and an earlier note here saying so was wrong: at one bucket per MiB a
-  // 2 GiB file is 256 bytes of bitmap, and with the URL key and the map node
-  // each file costs a few hundred bytes, so a full table is on the order of a
-  // hundred megabytes. It is a bound on growth, not a free one.
+  // The ceiling is far above any analysis job, and it is NOT free in memory --
+  // an earlier note here saying it was negligible was wrong, and the note that
+  // replaced it was right only at the one file size it named. The cost scales
+  // with FILE SIZE, because the bitmap is one bit per MiB: a 2 GiB file is
+  // 256 bytes, a 100 GB file is 12.5 KB, and the bitmap accepts indices up to
+  // 16 TiB (2 MB). So a full table is ~100 MB of 2 GiB files but ~2.6 GB of
+  // 100 GB ones. A count of entries is the wrong unit for a memory bound; a
+  // byte budget would be the right one, and is not what this is.
   static constexpr size_t kMaxFootprints = 200000;
   std::mutex regMu_;
   std::map<std::string, std::weak_ptr<FileEntry>> registry_; // hash -> entry

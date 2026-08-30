@@ -671,8 +671,7 @@ TEST(FileEntry, AStoreOutOfRoomMeansNoSignatureNotAPrivateOne) {
 
 TEST(FileEntry, AnEntryGivenARealFootprintStillRecordsNormally) {
   // The control for the leg above: the fallback is poisoned only when the
-  // store declines. Wiring the poison unconditionally would silence every
-  // signature and still pass a test that only checks the declining case.
+  // store declines.
   Fixture fx;
   auto e = fx.open();
   ASSERT_TRUE(e);
@@ -682,4 +681,26 @@ TEST(FileEntry, AnEntryGivenARealFootprintStillRecordsNormally) {
   EXPECT_FALSE(e->footprint().poisoned());
   EXPECT_FALSE(e->footprint().sig(fx.src.size()).empty());
   EXPECT_EQ(shared.count(fx.src.size()), 1u) << "and it went to the shared one";
+}
+
+TEST(FileEntry, AnEntryWithNoSharedFootprintOfEitherKindStillRecords) {
+  // The case that actually observes the PRIVATE footprint: an entry that was
+  // never handed a shared one. That is how every test here which builds an
+  // entry directly gets a signature, and how the entry behaves before the
+  // store hands one over.
+  //
+  // Worth being exact about what this pair does and does not catch, because
+  // the leg above used to claim more than it delivered. Poisoning the ACTIVE
+  // footprint unconditionally fails these. Poisoning the private fallback
+  // unconditionally does NOT -- and that mutation is harmless for the same
+  // reason it is invisible: when a shared footprint is present the private one
+  // is never consulted. A test cannot catch a change that changes nothing.
+  Fixture fx;
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->noteRead(0, 4096);
+  EXPECT_FALSE(e->footprint().poisoned())
+      << "nothing declined here, so nothing may be poisoned";
+  EXPECT_FALSE(e->footprint().sig(fx.src.size()).empty());
+  EXPECT_EQ(e->footprint().count(fx.src.size()), 1u);
 }

@@ -1094,6 +1094,9 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   "\"relay_bytes\":%llu,\"faults\":%llu,\"sig\":\"%s\","
                   "\"threads\":%llu,\"cpu_us\":%llu,\"instructions\":%llu,"
                   "\"cycles\":%llu,\"read_sig\":\"%s\","
+                  // The two columns the table shows and this did not: a
+                  // scripted reader was told it gets the same figures.
+                  "\"peak_cores\":%llu,\"origin_reads_in_flight_high_water\":%llu,"
                   "\"origin_share\":%.3f,\"fill_cost\":%.4f,\"gain\":",
                   i ? "," : "", (unsigned long long)r.startS,
                   (unsigned long long)r.durationS(), r.host.c_str(),
@@ -1104,10 +1107,15 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   (unsigned long long)r.relayBytes, (unsigned long long)r.faults(),
                   r.sig.c_str(), (unsigned long long)r.threadsHighWater,
                   (unsigned long long)r.cpuUs, (unsigned long long)r.instructions,
-                  (unsigned long long)r.cycles, r.readSig.c_str(), r.originShare(),
+                  (unsigned long long)r.cycles, r.readSig.c_str(),
+                  (unsigned long long)r.peakCores,
+                  (unsigned long long)r.originReadsInFlight, r.originShare(),
                   r.fillCost());
       if (g.valid)
-        std::printf("%.3f,\"gain_source\":\"baseline\"}", g.gain);
+        std::printf("%.3f,\"gain_source\":\"baseline\",\"work_verified\":%s,"
+                    "\"checked_files\":%llu,\"matched_files\":%llu}",
+                    g.gain, g.workVerified ? "true" : "false",
+                    (unsigned long long)g.sigPairs, (unsigned long long)g.matchedFiles);
       else
         std::printf("null,\"gain_source\":null}");
       continue;
@@ -1264,10 +1272,13 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     std::printf(",\"gain\":");
     if (gain.valid)
       std::printf("{\"estimate\":%.3f,\"saved_s\":%.1f,\"origin_mb_s\":%.1f,"
-                  "\"matched_files\":%llu,\"origin_equivalent_bytes\":%llu}",
+                  "\"matched_files\":%llu,\"origin_equivalent_bytes\":%llu,"
+                  "\"work_verified\":%s,\"checked_files\":%llu}",
                   gain.gain, gain.savedS, gain.originMBs,
                   (unsigned long long)gain.matchedFiles,
-                  (unsigned long long)gain.originEquivBytes);
+                  (unsigned long long)gain.originEquivBytes,
+                  gain.workVerified ? "true" : "false",
+                  (unsigned long long)gain.sigPairs);
     else
       std::printf("null");
     std::printf(",\"gain_reason\":\"%s\"}\n", gain.reason.c_str());
@@ -1317,7 +1328,7 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
         // baseline" bucket, which told the reader to go record a baseline that
         // would have changed nothing.
         size_t bases = 0, tooShort = 0, tooSmall = 0, filled = 0, readDiff = 0, noBase = 0,
-               unverified = 0, other = 0;
+               other = 0;
         // Each estimate walks every run, so this is quadratic and stops where
         // the headline's own count stops.
         size_t examined = 0;
@@ -1333,7 +1344,6 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
             case ucache::GainEstimate::Why::kTooSmall: ++tooSmall; break;
             case ucache::GainEstimate::Why::kIncomplete: ++other; break;
             case ucache::GainEstimate::Why::kReadDifferent: ++readDiff; break;
-            case ucache::GainEstimate::Why::kReadUnverified: ++unverified; break;
             case ucache::GainEstimate::Why::kNoBaseline: ++noBase; break;
           }
         }
@@ -1349,7 +1359,6 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
         add(tooShort, "under 30s");
         add(tooSmall, "moved too little data");
         add(readDiff, "read different work than the baseline");
-        add(unverified, "could not be checked against the baseline");
         add(noBase, "with no comparable baseline");
         add(other, "incomplete");
         if (examined < runs.size())
@@ -1499,6 +1508,20 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
                 stamp(gain.referenceStartS).c_str(),
                 (unsigned long long)gain.matchedFiles, (unsigned long long)gain.runFiles,
                 gain.savedS >= 0 ? "saved ~" : "cost ~", std::fabs(gain.savedS));
+    // Whether the two runs were shown to have done the SAME WORK, or merely to
+    // have covered the same files. Printing the gain without this leaves the
+    // reader to assume the stronger of the two, which is the assumption the
+    // read signatures exist to remove.
+    if (gain.workVerified)
+      std::printf("             same work: verified on %llu of %llu compared files\n",
+                  (unsigned long long)gain.sigPairs,
+                  (unsigned long long)gain.matchedFiles);
+    else
+      std::printf("             same work: NOT verified — %llu of %llu compared files "
+                  "carry a read footprint on both sides; the walls are compared on the "
+                  "file names alone\n",
+                  (unsigned long long)gain.sigPairs,
+                  (unsigned long long)gain.matchedFiles);
   } else {
     // Two ways to get a number; name the one that is closer to hand.
     std::printf("gain       : not measured — %s\n", gain.reason.c_str());

@@ -739,15 +739,14 @@ TEST(ReadAgreement, FilesWithoutAFootprintCountForNeitherSide) {
 }
 
 TEST(ReadAgreement, ABaselineThatSignsNothingIsNotSilentlyTrusted) {
-  // THE dangerous shape. The work-identity check needs a signature from BOTH
-  // runs, so if one side signs nothing there are no pairs at all -- and a rule
-  // that only runs "when there are pairs" does not run, silently, leaving the
-  // walls compared on file names alone.
+  // The work-identity check needs a signature from BOTH runs, so a baseline
+  // that signs nothing disables it entirely. It is reachable: a run with the
+  // cache switched off may fail to learn the sizes the signature is expressed
+  // in, per file, so one teardown can leave a baseline largely unsigned.
   //
-  // It is reachable on the BASELINE in particular: a run with the cache
-  // switched off never populates the file sizes the signature is expressed in,
-  // so one bad teardown can leave a whole baseline unsigned. Every later run
-  // is then measured against it with nothing checked, and reports a gain.
+  // The answer is NOT to refuse. Refusing made the result non-monotone in
+  // evidence -- see AddingOneSignatureNeverDestroysAMeasurement below. The
+  // answer is that the comparison says of itself that nothing was checked.
   test::TempDir d;
   std::vector<FileLine> base, warm;
   for (size_t i = 0; i < 20; ++i) {
@@ -760,18 +759,16 @@ TEST(ReadAgreement, ABaselineThatSignsNothingIsNotSilentlyTrusted) {
   writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
            warm);
   const auto g = gainOfWarm(d.path());
-  EXPECT_FALSE(g.valid) << "gain " << g.gain;
-  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kReadUnverified);
-  // The refusal has to name the cause, or the remedy is a guess: this is not
-  // "no baseline" and not "different files", which have different fixes.
-  EXPECT_NE(g.reason.find("could be checked"), std::string::npos) << g.reason;
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_FALSE(g.workVerified) << "no pair could be checked, so nothing was verified";
+  EXPECT_EQ(g.sigPairs, 0u);
 }
 
 TEST(ReadAgreement, OneCheckableFileCannotVouchForFourHundred) {
-  // A single agreeing pair used to admit a comparison over any number of
-  // matched files. That is the same defect the agreement rule exists to
-  // prevent, one level up: agreement measured over the one file that happens
-  // to be checkable says nothing about the other three hundred and ninety.
+  // One agreeing pair out of four hundred is not evidence about the other
+  // three hundred and ninety-nine, so the comparison must not call itself
+  // verified on the strength of it. It is still reported -- absence of
+  // evidence is not evidence of different work -- but for what it is.
   test::TempDir d;
   std::vector<FileLine> base, warm;
   for (size_t i = 0; i < 400; ++i) {
@@ -785,8 +782,49 @@ TEST(ReadAgreement, OneCheckableFileCannotVouchForFourHundred) {
   writeRun(d.path(), "h", 2, 2000, 2100, "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824",
            warm);
   const auto g = gainOfWarm(d.path());
-  EXPECT_FALSE(g.valid) << "one agreeing pair is not evidence about 400 files";
-  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kReadUnverified);
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_FALSE(g.workVerified) << "one agreeing pair cannot vouch for 400 files";
+  EXPECT_EQ(g.sigPairs, 1u);
+}
+
+TEST(ReadAgreement, AddingOneSignatureNeverDestroysAMeasurement) {
+  // MONOTONICITY, as a property. More evidence must never produce a worse
+  // answer, and the first version of the coverage rule broke exactly that: it
+  // let a directory with NO signatures anywhere be compared, and refused the
+  // same directory once a single file in it carried one. Measured on a real
+  // archive, adding one signature to one file of a thousand deleted every
+  // measurement in the directory.
+  //
+  // The pair here is identical but for one signed file on each side.
+  auto build = [](const std::string& dir, size_t signedFiles) {
+    std::vector<FileLine> base, warm;
+    for (size_t i = 0; i < 40; ++i) {
+      const std::string key = "root://o//f" + std::to_string(i);
+      const std::string sig = i < signedFiles ? "aaaa" : "";
+      base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, sig));
+      warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, sig));
+    }
+    writeRun(dir, "h", 1, 1000, 1200,
+             "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
+    writeRun(dir, "h", 2, 2000, 2100,
+             "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824", warm);
+  };
+  double none = 0.0, one = 0.0;
+  {
+    test::TempDir d;
+    build(d.path(), 0);
+    const auto g = gainOfWarm(d.path());
+    ASSERT_TRUE(g.valid) << "nothing signed is the pre-signature case: " << g.reason;
+    none = g.gain;
+  }
+  {
+    test::TempDir d;
+    build(d.path(), 1);
+    const auto g = gainOfWarm(d.path());
+    EXPECT_TRUE(g.valid) << "one signature must not delete the measurement: " << g.reason;
+    one = g.gain;
+  }
+  EXPECT_NEAR(none, one, 1e-9) << "and it must not change the answer either";
 }
 
 TEST(ReadAgreement, RecordsFromBeforeSignaturesExistedStillMeasureButSaySo) {
@@ -936,6 +974,67 @@ TEST(Baseline, EveryTierCountsTowardsWhatWasDelivered) {
   ASSERT_EQ(runs.size(), 1u);
   EXPECT_NEAR(runs[0].originShare(), 1.0 / 3.0, 0.01)
       << "served, replica and wire are disjoint, so delivered is their sum";
+}
+
+TEST(Baseline, ARunTheCacheServedMostOfIsNotABaseline) {
+  // The SECOND door into the same failure, and the one the byte-share test
+  // exists to shut. originShare weights each file by its size AT THE ORIGIN,
+  // so it is a size-weighted count of FILES, not a share of bytes: a file
+  // touched for 5 MB counts exactly as much as a file read whole from the
+  // cache. Underneath a passing 0.95 the cache's byte contribution is
+  // unbounded.
+  //
+  // Here 380 files of 4 GiB are touched for 4 MiB each from the origin and 20
+  // are read whole from the byte tier. That is 0.95 by file size and about 96%
+  // of the BYTES from the cache -- and it was accepted as the measure of
+  // running without a cache, which made the genuinely warm run over the same
+  // files report a loss.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  const uint64_t sz = 4 * kGiB;
+  for (size_t i = 0; i < 400; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    if (i < 380)
+      base.push_back(FileLine(key, 0, 0, 4 * kMiB, 1200, 0, "fill", sz, "aa11"));
+    else
+      base.push_back(FileLine(key, sz, 0, 0, 1200, 0, "cached", sz, "aa11"));
+    warm.push_back(FileLine(key, sz, 0, 0, 2100, 0, "cached", sz, "aa11"));
+  }
+  const uint64_t baseOrigin = 380 * 4 * kMiB, baseHit = 20 * sz;
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":" + std::to_string(baseOrigin) +
+               ",\"hit_bytes\":" + std::to_string(baseHit) + ",\"served_bytes\":" +
+               std::to_string(baseHit) + originHist(1000.0),
+           base);
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":" + std::to_string(400 * sz), warm);
+  const auto runs = loadRuns(d.path());
+  const ucache::Run* ref = nullptr;
+  for (const auto& r : runs)
+    if (r.startS == 1000)
+      ref = &r;
+  ASSERT_TRUE(ref);
+  EXPECT_GE(ref->originShare(), 0.95) << "by file size it looks like a no-cache run";
+  EXPECT_FALSE(ref->servedLessThanFetched())
+      << "but the cache delivered most of the bytes";
+  EXPECT_FALSE(ref->baselineQualified())
+      << "a run the cache served must never define what no cache costs";
+  EXPECT_FALSE(gainOfWarm(d.path()).valid) << "so the warm run gets no number from it";
+}
+
+TEST(Baseline, AQuietFillStillQualifiesUnderTheByteTest) {
+  // The control for the leg above: the byte test must not disqualify the fills
+  // it was never aimed at. A real cold pass fetches far more than it serves --
+  // measured at 75x on recorded campaigns -- so this has enormous margin, and
+  // a test that only proved the refusal would leave that unstated.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0),
+           {filledFile("root://o//a", kGiB, 1200, "aa11")});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_TRUE(runs[0].servedLessThanFetched());
+  EXPECT_TRUE(runs[0].baselineQualified());
 }
 
 TEST(Baseline, AWarmReplicaRunIsNotABaseline) {
@@ -1217,4 +1316,65 @@ TEST(RefusalReason, AMeasuredRunSaysMeasured) {
   const auto g = gainOfWarm(d.path());
   EXPECT_TRUE(g.valid) << g.reason;
   EXPECT_EQ(g.why, ucache::GainEstimate::Why::kMeasured);
+}
+
+TEST(Gain, AReplicaServedRunReportsItsOwnWork) {
+  // The purpose of counting all three tiers in the run-side totals, which had
+  // no test of its own: a run served ENTIRELY from recompressed replicas
+  // touches the byte-tier counter in crumbs, so totalling only that reported a
+  // thousandth of the run's work -- and the run was then refused for having
+  // done none. Every other estimateGain fixture here is byte-tier, so nothing
+  // exercised it.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < 20; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, "aa11"));
+    // served is a crumb; the replica tier did the work. This is the shape the
+    // field produces: recorded warm replica runs put the byte tier between
+    // 0.009% and 0.65% of the replica bytes.
+    warm.push_back(FileLine(key, kGiB / 8192, kGiB, 0, 2100, 0, "cached", kGiB, "aa11"));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":21474836480,\"disabled\":1", base);
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":2621440,"
+           "\"replica_bytes_served\":21474836480,\"served_bytes\":21477457920",
+           warm);
+  const auto g = gainOfWarm(d.path());
+  EXPECT_TRUE(g.valid) << g.reason;
+  EXPECT_NEAR(g.gain, 2.0, 0.05) << "200 s of origin against a 100 s replica pass";
+}
+
+TEST(RefusalReason, TheCacheServingNothingIsNamed) {
+  // RunLog.cc's "the cache served nothing in this run" branch, which the suite
+  // never executed. A run that opened files, went nowhere near the origin and
+  // was served nothing has no gain to report and a specific reason why.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100,
+           "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":0,\"replica_bytes_served\":0",
+           {{"root://o//a", 0, 0, 0, 1100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kIncomplete);
+  EXPECT_NE(g.reason.find("served nothing"), std::string::npos) << g.reason;
+}
+
+TEST(RefusalReason, RecordsThatAttributeNoBytesAreNamed) {
+  // The other branch the suite never reached, and one this work changed: the
+  // run's counters say the cache served a gigabyte, but no per-file record
+  // accounts for any of it. Refusing is right -- there is nothing to match a
+  // baseline against file by file -- and it must not be reported as "no
+  // baseline", which would send the reader to record one that cannot help.
+  test::TempDir d;
+  writeRun(d.path(), "h", 1, 1000, 1100, warmCounters(kGiB),
+           {{"root://o//a", 0, 0, 0, 1100, 0, "cached", kGiB, "aa11"}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  const auto g = estimateGain(runs[0], runs);
+  EXPECT_FALSE(g.valid);
+  EXPECT_EQ(g.why, ucache::GainEstimate::Why::kIncomplete);
+  EXPECT_NE(g.reason.find("no bytes attributed"), std::string::npos) << g.reason;
 }

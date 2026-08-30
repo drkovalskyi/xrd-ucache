@@ -147,3 +147,18 @@ TEST(ReadFootprint, PoisoningTwiceIsStillPoisoned) {
   f.poison();
   EXPECT_TRUE(f.poisoned());
 }
+
+TEST(ReadFootprint, TheBucketIsExactlyOneMebibyte) {
+  // The constant the whole comparison rests on, pinned in BOTH directions.
+  // Every other test here is written in units of kBucket and is therefore
+  // scale-invariant: changing 1 MiB to 64 KiB -- the size the header records
+  // as having made four routes over one analysis give three different answers
+  // -- left the entire suite green.
+  EXPECT_EQ(ucache::ReadFootprint::kBucket, 1024u * 1024u);
+  ucache::ReadFootprint f;
+  f.note(0, 1);
+  f.note(1024 * 1024 - 1, 1); // last byte of bucket 0
+  EXPECT_EQ(f.count(16 << 20), 1u) << "a byte short of the boundary is the same bucket";
+  f.note(1024 * 1024, 1); // first byte of bucket 1
+  EXPECT_EQ(f.count(16 << 20), 2u) << "and the boundary byte is the next one";
+}

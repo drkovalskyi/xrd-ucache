@@ -122,20 +122,21 @@ struct Stats {
   // SUPERSEDED, kept only so the old name is not silently reused for the new
   // meaning: this counted reads being HANDED OFF at once.
   //
-  // READ THE NEXT SENTENCE BEFORE USING THIS. It is not the number of reads
-  // outstanding at the origin, which is what would set the origin's delivery
-  // rate. Every route here dispatches and returns -- the hit path posts to the
-  // executor, the miss and relay paths issue an asynchronous request -- and a
-  // synchronous caller then blocks ABOVE this library, in the client's own
-  // wait, long after the call below has returned. So this spans the handoff,
-  // not the read, and a job with thirty-two reads genuinely in flight can
-  // report a handful.
+  // DEAD. Nothing increments either of these, anywhere, so both are emitted as
+  // a permanent zero. They are kept only so the old NAME is not silently
+  // reused for the new meaning, and emitted only so a consumer parsing the
+  // record does not lose a key it has always seen.
   //
-  // Measuring the real thing means counting down in the completion handlers
-  // rather than on return, on every route, which is a change to the read path
-  // and not to a counter. Until then, read this as "how many reads were being
-  // set up at once" and nothing more. It is recorded and displayed; nothing
-  // is decided from it.
+  // What it used to count was reads being SET UP at once, which is not what
+  // sets the origin's delivery rate: every route dispatches and returns while
+  // a synchronous caller blocks above this library, so it spanned the handoff
+  // rather than the read, and a job with thirty-two reads genuinely in flight
+  // could report a handful. Measuring the real thing meant counting down in
+  // the completion handlers on every route -- a change to the read path, which
+  // was then made. The counter above is that measurement; use it.
+  //
+  // An earlier version of this comment described the change as still to come,
+  // and stayed that way after it had been made.
   std::atomic<uint64_t> readsInFlight{0};
   std::atomic<uint64_t> readsInFlightHighWater{0};
   Histogram hitReadUs;

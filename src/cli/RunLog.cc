@@ -380,9 +380,8 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   // either side has no footprint for a file -- a replica built before the map
   // existed -- that file is UNKNOWN and counts for neither side, so the
   // file-set match stands on its own rather than refusing outright.
-  size_t readSigMismatch = 0, readSigUnverified = 0;
-  double bestAgree = -1.0;    // closest agreement seen, for the refusal text
-  double bestCoverage = -1.0; // ... and the closest signature coverage
+  size_t readSigMismatch = 0;
+  double bestAgree = -1.0; // closest agreement seen, for the refusal text
   for (const auto& r : all) {
     // A reference is a run the cache did not appreciably help: one with the
     // cache switched off, or one that QUALIFIES -- the origin did nearly all
@@ -431,17 +430,28 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // shape that produces it is one side signing nothing, which is what a
     // baseline whose files never populated their size looks like, and it would
     // otherwise hand every later run an unchecked reference.
-    const bool checkable = sigPairs * 2 >= matchedCount * 1; // sigPairs >= 50%
-    if (eitherSigned && !checkable) {
-      ++readSigUnverified;
-      if (matchedCount) {
-        const double cov = static_cast<double>(sigPairs) / static_cast<double>(matchedCount);
-        if (cov > bestCoverage)
-          bestCoverage = cov;
-      }
-      continue;
-    }
-    if (sigPairs) {
+    // Enough of the compared files must carry a footprint on BOTH sides before
+    // the agreement rule means anything: agreement measured over the one file
+    // that happens to be checkable says nothing about the other three hundred.
+    //
+    // Below that line the comparison is REPORTED AS UNVERIFIED, not refused.
+    // Refusing was worse than the problem: it made the answer non-monotone in
+    // evidence. With no signatures anywhere -- every record written before the
+    // footprint existed -- the comparison went ahead; adding ONE signature to
+    // ONE file of a thousand then destroyed every measurement in the directory.
+    // That is reachable without any mixed-era archive, because the emitter
+    // decides per FILE whether it knows the size a signature is expressed in.
+    // More evidence must never produce a worse answer.
+    //
+    // So absence of evidence is reported, and only EVIDENCE OF DIFFERENT WORK
+    // refuses.
+    // Expressed THROUGH the constant, not beside it: the first version
+    // hardcoded the comparison and left kMinSigCoverage used only in a message,
+    // so changing the constant changed the text and not the rule.
+    const bool checkable =
+        sigPairs > 0 &&
+        static_cast<double>(sigPairs) >= kMinSigCoverage * static_cast<double>(matchedCount);
+    if (checkable) {
       const double agree = static_cast<double>(sigAgree) / static_cast<double>(sigPairs);
       if (agree < kMinReadAgreement) {
         ++readSigMismatch;
@@ -479,9 +489,9 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       refWireTotalD = static_cast<double>(refWireTotal);
       g.originEquivBytes = matchedWire;
       g.sigPairs = sigPairs;
-      // Verified means the work-identity check actually RAN on a majority of
+      // Verified means the work-identity check actually RAN on at least half
       // the compared files, not merely that it did not refuse.
-      g.workVerified = sigPairs > 0 && sigPairs * 2 >= matchedCount;
+      g.workVerified = checkable;
     }
   }
 
@@ -489,18 +499,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // Checked FIRST: a baseline rejected for reading different parts never
     // reaches the coverage arithmetic, so its counters look like "no baseline
     // at all" — which is the one thing this refusal must not be mistaken for.
-    if (readSigUnverified && !readSigMismatch) {
-      g.why = GainEstimate::Why::kReadUnverified;
-      char buf[256];
-      std::snprintf(buf, sizeof buf,
-                    "a baseline exists for these files but only %.0f%% of them could be "
-                    "checked for having read the same parts (%.0f%% required) — one of "
-                    "the two runs recorded almost no read footprints, so there is no "
-                    "evidence the walls describe the same work",
-                    (bestCoverage < 0.0 ? 0.0 : bestCoverage) * 100.0,
-                    kMinSigCoverage * 100.0);
-      g.reason = buf;
-    } else if (readSigMismatch) {
+    if (readSigMismatch) {
       g.why = GainEstimate::Why::kReadDifferent;
       char buf[224];
       std::snprintf(buf, sizeof buf,
