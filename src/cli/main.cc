@@ -1112,9 +1112,13 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
                   (unsigned long long)r.originReadsInFlight, r.originShare(),
                   r.fillCost());
       if (g.valid)
-        std::printf("%.3f,\"gain_source\":\"baseline\",\"work_verified\":%s,"
+        // Not a literal: "baseline" told a scripted reader every reference
+        // was an explicit no-cache run, when the whole point of the inference
+        // is that most will be qualifying fills.
+        std::printf("%.3f,\"gain_source\":\"%s\",\"work_verified\":%s,"
                     "\"checked_files\":%llu,\"matched_files\":%llu}",
-                    g.gain, g.workVerified ? "true" : "false",
+                    g.gain, g.referenceDisabled ? "disabled" : "fill",
+                    g.workVerified ? "true" : "false",
                     (unsigned long long)g.sigPairs, (unsigned long long)g.matchedFiles);
       else
         std::printf("null,\"gain_source\":null}");
@@ -1273,12 +1277,15 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     if (gain.valid)
       std::printf("{\"estimate\":%.3f,\"saved_s\":%.1f,\"origin_mb_s\":%.1f,"
                   "\"matched_files\":%llu,\"origin_equivalent_bytes\":%llu,"
-                  "\"work_verified\":%s,\"checked_files\":%llu}",
+                  "\"work_verified\":%s,\"checked_files\":%llu,"
+                  "\"reference\":{\"start\":%llu,\"kind\":\"%s\"}}",
                   gain.gain, gain.savedS, gain.originMBs,
                   (unsigned long long)gain.matchedFiles,
                   (unsigned long long)gain.originEquivBytes,
                   gain.workVerified ? "true" : "false",
-                  (unsigned long long)gain.sigPairs);
+                  (unsigned long long)gain.sigPairs,
+                  (unsigned long long)gain.referenceStartS,
+                  gain.referenceDisabled ? "disabled" : "fill");
     else
       std::printf("null");
     std::printf(",\"gain_reason\":\"%s\"}\n", gain.reason.c_str());
@@ -1503,9 +1510,16 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
       std::printf("gain       : %.2fx — the cache made this run SLOWER than no cache "
                   "(measured baseline)\n",
                   gain.gain);
-    std::printf("             baseline: %s, same files with the cache disabled, "
+    // Say what the reference actually WAS. This line used to read "with the
+    // cache disabled" unconditionally, which was false whenever the reference
+    // was an inferred fill -- and the fill is the ordinary case, since most
+    // people never think to record a disabled run.
+    std::printf("             reference: %s, same files %s, "
                 "%llu of %llu files matched; %s%.0f s\n",
                 stamp(gain.referenceStartS).c_str(),
+                gain.referenceDisabled
+                    ? "with the cache disabled"
+                    : "on a first pass the cache had not yet helped (a qualifying fill)",
                 (unsigned long long)gain.matchedFiles, (unsigned long long)gain.runFiles,
                 gain.savedS >= 0 ? "saved ~" : "cost ~", std::fabs(gain.savedS));
     // Whether the two runs were shown to have done the SAME WORK, or merely to

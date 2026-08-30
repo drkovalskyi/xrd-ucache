@@ -276,6 +276,15 @@ struct GainEstimate {
   uint64_t sigPairs = 0;
   bool workVerified = false;
   uint64_t referenceStartS = 0;
+  // Which KIND of reference produced the number: a run explicitly recorded
+  // with the cache disabled, or an ordinary first pass the estimator judged
+  // effectively cache-free (a qualifying fill). The two carry different
+  // confidence -- a flag in a record cannot be wrong, an inference can -- and
+  // the output that presents the number must say which it stands on. Before
+  // this existed the human text said "with the cache disabled" and the JSON
+  // said "baseline" unconditionally, both wrong whenever the reference was a
+  // fill.
+  bool referenceDisabled = false;
   std::string reason;         // set whenever !valid; also worth printing when valid
 };
 

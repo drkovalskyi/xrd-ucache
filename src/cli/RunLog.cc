@@ -556,6 +556,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       ++g.matchedFiles;
   }
   g.referenceStartS = best->startS;
+  g.referenceDisabled = best->disabled;
   return g;
 }
 

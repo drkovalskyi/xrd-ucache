@@ -1378,3 +1378,35 @@ TEST(RefusalReason, RecordsThatAttributeNoBytesAreNamed) {
   EXPECT_EQ(g.why, ucache::GainEstimate::Why::kIncomplete);
   EXPECT_NE(g.reason.find("no bytes attributed"), std::string::npos) << g.reason;
 }
+
+TEST(Gain, TheEstimateSaysWhichKindOfReferenceProducedIt) {
+  // The two kinds carry different confidence -- a disabled run is a reference
+  // by an unambiguous flag, a fill by inference -- and the output used to say
+  // "with the cache disabled" and emit "baseline" unconditionally, both wrong
+  // whenever the reference was a fill. The fill is the ordinary case: most
+  // people never think to record a disabled run.
+  {
+    test::TempDir d;
+    writeAgreementPair(d.path(), 100, 0); // reference = a disabled run
+    const auto g = gainOfWarm(d.path());
+    ASSERT_TRUE(g.valid) << g.reason;
+    EXPECT_TRUE(g.referenceDisabled);
+  }
+  {
+    test::TempDir d; // reference = a qualifying fill, no disabled run anywhere
+    writeRun(d.path(), "h", 1, 1000, 1200,
+             fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0),
+             {filledFile("root://o//a", kGiB, 1200, "aa11")});
+    writeRun(d.path(), "h", 2, 2000, 2100, warmCounters(kGiB),
+             {{"root://o//a", kGiB, 0, 0, 2100, 0, "cached", kGiB, "aa11"}});
+    const auto runs = loadRuns(d.path());
+    const ucache::Run* warm = nullptr;
+    for (const auto& r : runs)
+      if (!r.disabled && r.warm())
+        warm = &r;
+    ASSERT_TRUE(warm);
+    const auto g = estimateGain(*warm, runs);
+    ASSERT_TRUE(g.valid) << g.reason;
+    EXPECT_FALSE(g.referenceDisabled) << "the reference was a fill and must say so";
+  }
+}
