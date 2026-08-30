@@ -410,8 +410,9 @@ rather than a number from too short a wall.
   refused; `ucache summary` says why.
 
 `RATE` is what the job consumed from all sources combined — paced by the
-application, not a cache capability (that is `ucache bench`). Rows under ten
-seconds are left out as noise. `--top N` shows more rows; `--json` on either
+application, not a cache capability (that is `ucache bench`). Runs under ten
+seconds are left out as noise — of this table and of what `summary` calls the
+last run. `--top N` shows more rows; `--json` on either
 command emits the same figures for scripting.
 
 Records appear when a job that used the cache **exits**; CLI invocations do not
