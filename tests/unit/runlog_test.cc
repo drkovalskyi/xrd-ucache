@@ -893,40 +893,14 @@ TEST(ReadAgreement, AFullySignedComparisonReportsItselfVerified) {
   EXPECT_EQ(g.sigPairs, 100u);
 }
 
-TEST(ReadAgreement, CrossingTheCoverageFloorCannotFlipTheVerdict) {
-  // The audited counter-example, pinned. Forty files compared; of them some
-  // number carry a footprint on both sides, four of which disagree.
-  //
-  // At nineteen signed pairs coverage is 47.5% and at twenty it is exactly the
-  // floor -- and the pair that takes it from nineteen to twenty AGREES. Under
-  // the previous rule the first stood as a valid measurement and the second was
-  // refused, so one more piece of evidence FOR the runs matching destroyed the
-  // answer. Both must now give the same verdict, and it must be the strict one:
-  // four files are known to have been read differently either way.
-  auto verdictWith = [](size_t signedPairs) {
-    test::TempDir d;
-    std::vector<FileLine> base, warm;
-    for (size_t i = 0; i < 40; ++i) {
-      const std::string key = "root://o//f" + std::to_string(i);
-      const bool signd = i < signedPairs;
-      const bool differs = signd && i < 4;
-      const std::string bs = signd ? "aaaa" : "";
-      const std::string ws = signd ? (differs ? "bbbb" : "aaaa") : "";
-      base.push_back(FileLine(key, 0, 0, kGiB, 1200, 0, "relay", kGiB, bs));
-      warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, ws));
-    }
-    writeRun(d.path(), "h", 1, 1000, 1200,
-             "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":1073741824,\"disabled\":1", base);
-    writeRun(d.path(), "h", 2, 2000, 2100,
-             "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":1073741824", warm);
-    return gainOfWarm(d.path()).valid;
-  };
-  const bool below = verdictWith(19); // 47.5% coverage, 15 of 19 agree
-  const bool at = verdictWith(20);    // 50.0% coverage, 16 of 20 agree
-  EXPECT_EQ(below, at) << "crossing the coverage floor by ADDING an agreeing "
-                          "signature changed the answer";
-  EXPECT_FALSE(at) << "four files read different parts: the strict verdict is the right one";
-}
+// NOT TESTED, DELIBERATELY: the coverage floor is a cliff. Adding one more
+// AGREEING pair can take coverage over the line, switch the agreement rule on,
+// and turn a valid comparison into a refusal. A test pinning the opposite was
+// written and then removed with the change it guarded, because closing the
+// cliff broke the mixed-era archive in leg 13 and refused honest comparisons at
+// this project's own measured benign disagreement rate. The reasoning is beside
+// the rule in RunLog.cc; this note exists so the absence looks deliberate
+// rather than forgotten.
 
 TEST(ReadAgreement, UnknownFilesCannotDiluteADisagreement) {
   // Half the files carry signatures; of those, 44 of 50 agree, so agreement
