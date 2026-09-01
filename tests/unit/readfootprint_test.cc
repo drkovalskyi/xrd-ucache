@@ -173,6 +173,10 @@ TEST(ReadFootprint, SigAndCountAgreeUnderAConcurrentPoison) {
   // confident signature next to a zero bucket count, and a record saying "this
   // run read these exact bytes, and it read nothing" is worse than no record.
   //
+  // NEEDS AT LEAST THREE RUNNABLE CORES to mean anything. Pinned to one CPU
+  // with taskset it detects the pre-fix shape 0 times in 20; on three or more
+  // it detects it every time. A pass on a constrained runner is not evidence.
+  //
   // Written as a race on purpose. Every other test in this file is
   // single-threaded, while the class exists to be written from an analysis
   // job's threads through a footprint shared across handles -- so the property
@@ -221,6 +225,10 @@ TEST(ReadFootprint, SigAndCountMatchesTheSingleValueAccessors) {
   ReadFootprint f;
   f.note(0, 1);
   f.note(5 * ReadFootprint::kBucket, 3 * ReadFootprint::kBucket);
+  // ABOVE the limit on purpose: without a bucket past it, dropping the limit
+  // argument entirely -- the likeliest wiring error for this signature -- still
+  // agrees with the single-value accessors and the test proves nothing.
+  f.note(40 * ReadFootprint::kBucket, 1);
   const uint64_t limit = 16 << 20;
   std::string sig;
   uint64_t n = 0;

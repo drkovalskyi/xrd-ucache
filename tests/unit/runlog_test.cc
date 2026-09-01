@@ -902,6 +902,48 @@ TEST(ReadAgreement, AFullySignedComparisonReportsItselfVerified) {
 // the rule in RunLog.cc; this note exists so the absence looks deliberate
 // rather than forgotten.
 
+TEST(ReadAgreement, TheVerifiedCountIsOverTheFilesTheRuleActuallyUsed) {
+  // Two counts exist and they are not the same. `matchedFiles` is the plain
+  // intersection of the two runs' file sets; `comparedFiles` is the subset the
+  // coverage rule runs against, which skips files the REFERENCE never fetched
+  // over the wire, because one it never fetched says nothing about what the
+  // origin cost. comparedFiles <= matchedFiles always.
+  //
+  // The readout printed sigPairs over matchedFiles, so a comparison that had
+  // cleared the half-way bar could display a ratio below it -- telling the
+  // reader the check was weaker than the tool required of itself. Two
+  // reviewers found that by reading the code, and nothing in the suite would
+  // have caught a third pass reintroducing it.
+  //
+  // Here 20 files match and the reference fetched 16 of them; all 16 sign on
+  // both sides. The rule sees 16 of 16 -- full coverage -- while the
+  // intersection is 20, so printing over it would show 16 of 20 and understate
+  // the check. The gap cannot be made wider than this: the file-overlap floor
+  // already refuses a comparison whose matched work falls below 70%, so the
+  // two counts can differ by at most that much.
+  test::TempDir d;
+  std::vector<FileLine> base, warm;
+  for (size_t i = 0; i < 20; ++i) {
+    const std::string key = "root://o//f" + std::to_string(i);
+    const bool fetched = i < 16;
+    const std::string sig = fetched ? "aaaa" : "";
+    base.push_back(FileLine(key, 0, 0, fetched ? kGiB : 0, 1200, 0, "relay",
+                            fetched ? kGiB : 0, sig));
+    warm.push_back(FileLine(key, kGiB, 0, 0, 2100, 0, "cached", kGiB, sig));
+  }
+  writeRun(d.path(), "h", 1, 1000, 1200,
+           "\"opens\":1,\"origin_bytes\":0,\"relay_bytes\":8589934592,\"disabled\":1", base);
+  writeRun(d.path(), "h", 2, 2000, 2100,
+           "\"opens\":1,\"origin_bytes\":0,\"hit_bytes\":21474836480", warm);
+  const auto g = gainOfWarm(d.path());
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_EQ(g.comparedFiles, 16u) << "the rule's denominator counts only files the reference fetched";
+  EXPECT_EQ(g.matchedFiles, 20u) << "the intersection is the larger, different count";
+  EXPECT_LT(g.comparedFiles, g.matchedFiles) << "the two counts are not interchangeable";
+  EXPECT_EQ(g.sigPairs, 16u);
+  EXPECT_TRUE(g.workVerified) << "16 of 16 is full coverage";
+}
+
 TEST(ReadAgreement, UnknownFilesCannotDiluteADisagreement) {
   // Half the files carry signatures; of those, 44 of 50 agree, so agreement
   // reads 88% and the comparison is refused. Counting the 50 unknown files as
