@@ -1182,16 +1182,24 @@ TEST(Baseline, ARunTooThinToJudgeDoesNotQualify) {
 }
 
 TEST(Baseline, ASwitchedOffRunBeatsANearerFill) {
-  // Both qualify, and the fill is much nearer in time. The switched-off run
-  // must still win: it carries none of the cache's own writing in its wall,
-  // and admitting fills must not quietly revise a number that was already
-  // reported from a clean baseline.
+  // Both qualify, and the fill is both NEARER and LATER, so it wins every
+  // tie-break the selector has. The switched-off run must still be chosen: it
+  // carries none of the cache's own writing in its wall, and admitting fills
+  // must not quietly revise a number already reported from a clean baseline.
+  //
+  // The fill has to be a REAL candidate or this test proves nothing, which is
+  // why its record comes from filledFile() rather than a hand-written row. An
+  // earlier version served as many bytes as it fetched, putting originShare()
+  // at 0.5 against a floor of 0.95: the fill never qualified, the switched-off
+  // run won by being the only candidate, and the precedence this test exists
+  // for could be dropped or inverted with the whole suite still green. The
+  // qualification check below fails loudly if that ever comes back.
   test::TempDir d;
   writeRun(d.path(), "h", 1, 1000, 1200, baselineCounters(kGiB),
            {{"root://o//a", 0, 0, kGiB, 1200, 0, "relay", kGiB, "aa11"}});
   writeRun(d.path(), "h", 2, 5000, 5200,
            fillCounters(kGiB) + ",\"buffer_stall_us\":50000000" + originHist(1000.0),
-           {{"root://o//a", kGiB, 0, kGiB, 5200, 0, "fill", kGiB, "aa11"}});
+           {filledFile("root://o//a", kGiB, 5200, "aa11")});
   writeRun(d.path(), "h", 3, 6000, 6100, warmCounters(kGiB),
            {{"root://o//a", kGiB, 0, 0, 6100, 0, "cached", kGiB, "aa11"}});
   const auto runs = loadRuns(d.path());
@@ -1200,6 +1208,14 @@ TEST(Baseline, ASwitchedOffRunBeatsANearerFill) {
     if (r.warm())
       warm = &r;
   ASSERT_TRUE(warm);
+  const ucache::Run* fill = nullptr;
+  for (const auto& r : runs)
+    if (r.startS == 5000)
+      fill = &r;
+  ASSERT_TRUE(fill);
+  ASSERT_TRUE(fill->baselineQualified())
+      << "the fill must qualify, or the switched-off run wins by default and "
+         "this test says nothing about precedence";
   const auto g = estimateGain(*warm, runs);
   ASSERT_TRUE(g.valid) << g.reason;
   EXPECT_EQ(g.referenceStartS, 1000u) << "the switched-off run, not the nearer fill";

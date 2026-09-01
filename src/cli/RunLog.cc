@@ -320,9 +320,6 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   // measurement taken before the feature -- but the estimate then says the
   // work was not verified instead of implying it was.
   constexpr double kMinSigCoverage = 0.50;
-  // How many files must disagree before a sub-threshold agreement ratio counts
-  // as evidence of different work. Paired with kMinReadAgreement so that more
-  // agreement can never produce a refusal -- see the rule below.
 
   if (run.disabled) {
     g.why = GainEstimate::Why::kIsBaseline;
@@ -465,30 +462,6 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // Expressed THROUGH the constant, not beside it: the first version
     // hardcoded the comparison and left kMinSigCoverage used only in a message,
     // so changing the constant changed the text and not the rule.
-    // Stated as a count of DISAGREEMENTS against the files compared, which is
-    // monotone by construction: adding an AGREEING signature raises sigPairs
-    // and sigAgree together, leaving sigDisagree and matchedCount untouched, so
-    // it cannot change the verdict.
-    //
-    // The previous form compared agreement WITHIN the signed pairs, and applied
-    // that comparison only once coverage cleared kMinSigCoverage. That made the
-    // floor a cliff rather than a threshold: with forty files compared and
-    // nineteen signed at 79% agreement the comparison stood, and adding one
-    // more AGREEING pair switched the rule on at exactly 50% coverage, where
-    // 80% then failed the 90% bar and destroyed the measurement. One more piece
-    // of evidence FOR the runs matching made the answer worse -- the very thing
-    // the paragraph above forbids. Moving the cliff from one-of-N to half-of-N
-    // shrank the window; it did not close it.
-    //
-    // At full coverage the two forms agree exactly (disagreements above
-    // (1 - kMinReadAgreement) of the files is the same statement as agreement
-    // below kMinReadAgreement). Below full coverage this one is the stricter,
-    // which is the safe direction: partial evidence of different work now
-    // refuses instead of being discarded along with the rest of the comparison.
-    // Enough of the compared files must carry a footprint on BOTH sides before
-    // the agreement rule means anything: agreement measured over the one file
-    // that happens to be checkable says nothing about the other three hundred.
-    // Below that line the comparison is REPORTED AS UNVERIFIED, not refused.
     //
     // KNOWN LIMITATION, measured and left in place deliberately. This floor is
     // a cliff: exhaustive search of the predicate finds cases where adding one
