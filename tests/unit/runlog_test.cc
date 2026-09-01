@@ -1199,6 +1199,28 @@ TEST(Thresholds, OverheadBoundSitsAtOneTenth) {
   EXPECT_FALSE(qualifies(101.0)) << "10.1% is outside it";
 }
 
+TEST(Thresholds, TheOverheadBoundSitsInTheGapTheEvidenceLeftEmpty) {
+  // overhead() is a COARSE estimate -- measured error 0.17x to 3.01x against
+  // nine fills whose no-cache wall was known -- so the bound cannot be derived
+  // from units. It is placed empirically, in the gap between the fills that
+  // were truly cheap and those that were truly expensive:
+  //
+  //   truly <=10% cost : reported 0.011, 0.013, 0.015
+  //   truly  >10% cost : reported 0.608, 1.055, 1.295, 1.459, 1.858, 2.227
+  //
+  // Nothing was measured between 0.015 and 0.608. This test fails if the bound
+  // is moved out of that empty band -- below it the cheap fills start being
+  // refused, above it the expensive ones start being accepted, and in neither
+  // case is there evidence to say what happens. Moving it is not forbidden; it
+  // requires new calibration fills, and this is what says so.
+  constexpr double kWorstTrulyCheap = 0.015;
+  constexpr double kBestTrulyExpensive = 0.608;
+  EXPECT_GT(Run::kMaxOverhead, kWorstTrulyCheap)
+      << "below the worst fill that was genuinely fine: usable references would be refused";
+  EXPECT_LT(Run::kMaxOverhead, kBestTrulyExpensive)
+      << "above the best fill that genuinely was not: a contaminated reference would be accepted";
+}
+
 TEST(Thresholds, OriginShareBoundSitsAtNineteenTwentieths) {
   // A run is a reference only when the origin did nearly all of the work.
   // Fractions of a file, not whole files: the split is by bytes -- so the file

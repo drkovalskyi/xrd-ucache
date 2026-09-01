@@ -187,22 +187,47 @@ struct Run {
   double originWaitS() const;
   double writeWaitS() const;
 
-  // **The wall overhead of caching, as a fraction of the direct read.** This
-  // is the one figure that answers "how much longer did this take than
-  // fetching the data would have", and it needs NO baseline: both terms are
-  // measured inside the SAME run, under the same concurrency, so whatever
-  // fraction of thread-time became wall time is common to them and cancels in
-  // the ratio.
+  // **A COARSE estimate of what caching cost this run.** Blocked thread-time
+  // spent writing to the cache, over blocked thread-time spent waiting on the
+  // origin. It needs no baseline -- both terms come from the same run -- which
+  // is why it exists: a direct run cannot serve as the reference here, because
+  // the same job against the same origin measured 173 s and 1025 s within one
+  // evening, and anything computed ACROSS runs inherits that spread.
   //
-  // That independence is the point. A direct run cannot serve as the reference
-  // here because it fluctuates -- the same job against the same origin
-  // measured 173 s and 1025 s within one evening -- so any overhead computed
-  // ACROSS runs inherits that spread. This one cannot.
+  // IT IS NOT A FRACTION OF WALL CLOCK, and an earlier version of this comment
+  // said it was. Both terms are SUMS of per-operation durations across threads,
+  // so each is thread-seconds, and the sum discards when each interval
+  // happened. Two things therefore fail to cancel:
   //
-  // Checked against three fills whose direct reference happened to be known:
-  // 0.010 and 0.012 where the true overhead was 0.05 and 0.01, and 1.227 where
-  // it was 1.13. Meaningless for a warm run, which never asks the origin: 0
-  // there means "nothing to compare", not "no overhead".
+  //   - The two activities run at different widths. Origin waits accrue on the
+  //     job's read threads (32 in the measured campaigns); cache writes accrue
+  //     on the executor pool, capped at 8. One fill recorded 22.8 threads
+  //     waiting on the origin on average against 0.26 threads writing, so the
+  //     ratio there mostly compared thread counts, not time.
+  //   - Even at equal width, a ratio of 1.0 only means "the run took twice as
+  //     long" if the two never overlap. They do overlap -- that is the point of
+  //     writing on a background pool -- so it overstates whenever they do.
+  //
+  // MEASURED ERROR, against nine fills whose no-cache wall was measured
+  // directly: reported over true ran from 0.17x to 3.01x, in both directions.
+  // Four rearrangements of the recorded counters were tried and none was
+  // better; the information needed for a true wall figure (the UNION of the
+  // blocked intervals, not their sum) is not recorded at all.
+  //
+  // SO USE IT ONLY FOR WHAT IT CAN DO: telling a 1-2% effect from a 20%+ one.
+  // At that job it was right on all nine. Sorted by the independently measured
+  // truth, the reported values were
+  //
+  //     truly cheap (<=10%) : 0.011, 0.013, 0.015
+  //     truly expensive     : 0.608, 1.055, 1.295, 1.459, 1.858, 2.227
+  //
+  // -- a 40x gap with kMaxOverhead sitting in the middle of it. Nothing was
+  // measured between 0.015 and 0.608, so a value landing in that band is
+  // outside the evidence and is the trigger to build the real measurement
+  // rather than to trust this one.
+  //
+  // Meaningless for a warm run, which never asks the origin: 0 there means
+  // "nothing to compare", not "no overhead".
   double overhead() const {
     const double o = originWaitS();
     return o > 0.0 ? writeWaitS() / o : 0.0;
@@ -214,8 +239,11 @@ struct Run {
   // every other guard here does.
   bool overheadKnown() const { return originWaitS() > 0.0; }
   // A fill is usable as a baseline when the cache added little to it. The
-  // bound is the product's own cold-pass target -- no more than 1.1x the
-  // direct read -- so the two say the same thing in the same units.
+  // bound is NOT the cold-pass target restated: overhead() is not in those
+  // units (see above). It is a separator, placed in the empty 40x gap between
+  // the fills measured as cheap and those measured as expensive, and it is
+  // worth exactly as much as that evidence -- nine fills, none of them in the
+  // band between.
   static constexpr double kMaxOverhead = 0.10;
 };
 
