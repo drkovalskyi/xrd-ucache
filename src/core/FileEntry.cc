@@ -155,15 +155,18 @@ void FileEntry::emitObsRecord() {
   if (obsEmitted_.exchange(true))
     return;
   auto v = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
-  // ONE look at the footprint, for the signature AND the count. Taking them
-  // separately lets a poison() from another handle on this URL land between
-  // the two and emit `read_sig:"<hash>", read_buckets:0` -- a record that
-  // contradicts itself, which is exactly what the sibling emitter in
-  // CacheStore was changed to stop doing. Read granularity is not the issue;
-  // the two answers have to come from one state.
-  const ReadFootprint& fp = footprint();
-  const std::string readSig = fp.sig(meta_.fileSize);
-  const uint64_t readBuckets = readSig.empty() ? 0 : fp.count(meta_.fileSize);
+  // ONE look at the footprint, under ONE lock, for the signature AND the count.
+  // Holding a single reference was not enough: sig() and count() each take the
+  // footprint's mutex on their own, so a poison() from another handle on this
+  // URL could still land between them and emit `read_sig:"<hash>",
+  // read_buckets:0` -- a record that contradicts itself, which is worse than
+  // emitting neither. sigAndCount() answers both from one locked state.
+  std::string readSig;
+  uint64_t readBuckets = 0;
+  if (!footprint().sigAndCount(meta_.fileSize, readSig, readBuckets)) {
+    readSig.clear();
+    readBuckets = 0;
+  }
   std::ostringstream os;
   os << "{\"ts\":" << nowS() << ",\"key\":\"" << jsonEscapeMin(key_.key) << '"'
      << ",\"opens\":" << v(obs_.opens) << ",\"served_bytes\":" << v(obs_.servedBytes)

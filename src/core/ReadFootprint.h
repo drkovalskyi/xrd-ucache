@@ -66,6 +66,15 @@ class ReadFootprint {
   bool empty() const;
   uint64_t count(uint64_t limitBytes = 0) const;
 
+  // Both, under ONE lock. Taking sig() and count() separately lets a poison()
+  // from another handle on the same URL land between them, so the record gets a
+  // confident signature next to a zero bucket count -- a self-contradicting
+  // pair, which is worse than emitting neither. Holding one reference to the
+  // footprint does not close that: the two calls still lock independently.
+  // Returns false when the footprint has nothing to say (poisoned, or empty),
+  // in which case neither out-parameter is written.
+  bool sigAndCount(uint64_t limitBytes, std::string& sigOut, uint64_t& countOut) const;
+
   // Declare this file's footprint permanently UNKNOWN. Sticky, and it wins
   // over anything recorded before or after.
   //
@@ -85,6 +94,11 @@ class ReadFootprint {
   std::vector<uint64_t> buckets(uint64_t limitBytes = 0) const;
 
  private:
+  // Both assume mu_ is held. The public accessors take the lock and check the
+  // poison flag; sigAndCount() does so once for the pair.
+  std::string sigLocked(uint64_t limitBytes) const;
+  uint64_t countLocked(uint64_t limitBytes) const;
+
   mutable std::mutex mu_;
   std::vector<uint64_t> bits_;
   bool poisoned_ = false;

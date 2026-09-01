@@ -850,9 +850,15 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
   // shipped consumer guards that rule on the signature being non-empty. The
   // record was wrong, its consequence was contained, and claiming the
   // consequence made the fix sound more urgent than the evidence supported.
+  // One locked read for the pair -- see FileEntry::emitObsRecord. Separate
+  // sig()/count() calls leave a window for a concurrent poison() between them.
   const bool sizeKnown = fp && originSize;
-  const std::string readSig = sizeKnown ? fp->sig(originSize) : std::string();
-  const uint64_t readBuckets = sizeKnown ? fp->count(originSize) : 0;
+  std::string readSig;
+  uint64_t readBuckets = 0;
+  if (sizeKnown && !fp->sigAndCount(originSize, readSig, readBuckets)) {
+    readSig.clear();
+    readBuckets = 0;
+  }
   // Sample the process width here too: a cache-disabled run -- the BASELINE --
   // never creates an entry, so this is its only chance to record the width its
   // wall must be divided by.

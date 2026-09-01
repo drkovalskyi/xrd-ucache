@@ -7,6 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 using ucache::ReadFootprint;
 
 namespace {
@@ -161,4 +165,75 @@ TEST(ReadFootprint, TheBucketIsExactlyOneMebibyte) {
   EXPECT_EQ(f.count(16 << 20), 1u) << "a byte short of the boundary is the same bucket";
   f.note(1024 * 1024, 1); // first byte of bucket 1
   EXPECT_EQ(f.count(16 << 20), 2u) << "and the boundary byte is the next one";
+}
+
+TEST(ReadFootprint, SigAndCountAgreeUnderAConcurrentPoison) {
+  // The pair must never contradict itself. Reading sig() and count()
+  // separately leaves a window: a poison() landing between them yields a
+  // confident signature next to a zero bucket count, and a record saying "this
+  // run read these exact bytes, and it read nothing" is worse than no record.
+  //
+  // Written as a race on purpose. Every other test in this file is
+  // single-threaded, while the class exists to be written from an analysis
+  // job's threads through a footprint shared across handles -- so the property
+  // that matters most had no test at all.
+  for (int round = 0; round < 200; ++round) {
+    ReadFootprint f;
+    for (int i = 0; i < 64; ++i)
+      f.note(static_cast<uint64_t>(i) * ReadFootprint::kBucket, 1);
+
+    std::atomic<bool> go{false};
+    std::atomic<int> contradictions{0};
+    std::vector<std::thread> ts;
+
+    ts.emplace_back([&] {
+      while (!go.load(std::memory_order_acquire)) {
+      }
+      f.poison();
+    });
+    for (int r = 0; r < 3; ++r)
+      ts.emplace_back([&] {
+        while (!go.load(std::memory_order_acquire)) {
+        }
+        for (int i = 0; i < 200; ++i) {
+          std::string sig;
+          uint64_t n = 0;
+          if (f.sigAndCount(0, sig, n) && (sig.empty() || n == 0))
+            contradictions.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+
+    go.store(true, std::memory_order_release);
+    for (auto& t : ts)
+      t.join();
+
+    ASSERT_EQ(contradictions.load(), 0)
+        << "sigAndCount returned true with an empty signature or a zero count";
+    // And once poisoned it stays that way, for this accessor too.
+    std::string sig;
+    uint64_t n = 0;
+    EXPECT_FALSE(f.sigAndCount(0, sig, n));
+  }
+}
+
+TEST(ReadFootprint, SigAndCountMatchesTheSingleValueAccessors) {
+  // The combined call must not become a second implementation that drifts.
+  ReadFootprint f;
+  f.note(0, 1);
+  f.note(5 * ReadFootprint::kBucket, 3 * ReadFootprint::kBucket);
+  const uint64_t limit = 16 << 20;
+  std::string sig;
+  uint64_t n = 0;
+  ASSERT_TRUE(f.sigAndCount(limit, sig, n));
+  EXPECT_EQ(sig, f.sig(limit));
+  EXPECT_EQ(n, f.count(limit));
+}
+
+TEST(ReadFootprint, SigAndCountSaysNothingRatherThanEmptyForAnUntouchedFootprint) {
+  ReadFootprint f;
+  std::string sig = "sentinel";
+  uint64_t n = 12345;
+  EXPECT_FALSE(f.sigAndCount(0, sig, n)) << "an untouched footprint has nothing to say";
+  EXPECT_EQ(sig, "sentinel") << "out-parameters must be left alone on false";
+  EXPECT_EQ(n, 12345u);
 }

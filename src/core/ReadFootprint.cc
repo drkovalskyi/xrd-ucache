@@ -55,6 +55,12 @@ uint64_t ReadFootprint::count(uint64_t limitBytes) const {
   std::lock_guard<std::mutex> g(mu_);
   if (poisoned_)
     return 0;
+  return countLocked(limitBytes);
+}
+
+// Callers hold mu_. Split out so sigAndCount() computes exactly what the
+// single-value accessors do rather than a second copy of it.
+uint64_t ReadFootprint::countLocked(uint64_t limitBytes) const {
   const uint64_t last = lastBucket(limitBytes);
   uint64_t n = 0;
   for (size_t i = 0; i < bits_.size(); ++i) {
@@ -85,10 +91,28 @@ std::vector<uint64_t> ReadFootprint::buckets(uint64_t limitBytes) const {
   return out;
 }
 
+bool ReadFootprint::sigAndCount(uint64_t limitBytes, std::string& sigOut,
+                                uint64_t& countOut) const {
+  std::lock_guard<std::mutex> g(mu_);
+  if (poisoned_)
+    return false;
+  const std::string sg = sigLocked(limitBytes);
+  if (sg.empty())
+    return false;
+  sigOut = sg;
+  countOut = countLocked(limitBytes);
+  return true;
+}
+
 std::string ReadFootprint::sig(uint64_t limitBytes) const {
   std::lock_guard<std::mutex> g(mu_);
   if (poisoned_)
     return {};
+  return sigLocked(limitBytes);
+}
+
+// Callers hold mu_.
+std::string ReadFootprint::sigLocked(uint64_t limitBytes) const {
   const uint64_t last = lastBucket(limitBytes);
   uint64_t h = 1469598103934665603ull;
   bool any = false;
