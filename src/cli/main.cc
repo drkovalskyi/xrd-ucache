@@ -1175,7 +1175,11 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
       std::snprintf(cpuSplit, sizeof cpuSplit, "%4s", fit(r.coresBusy(), 4, 1).c_str());
     else
       std::snprintf(cpuSplit, sizeof cpuSplit, "%4s", "-");
-    // What caching ADDED, as a fraction of the direct read this run performed.
+    // A COARSE estimate of what caching cost this run: time blocked writing
+    // over time blocked fetching, both summed across threads. NOT a fraction of
+    // the wall clock -- measured error against nine fills whose no-cache wall
+    // was known ran 0.17x to 3.01x, in both directions -- so read it only as
+    // "a percent or two" versus "tens of percent". See Run::overhead().
     // Only a run that asked the origin has one; a warm run gets "-" rather
     // than a zero that would read as "no overhead".
     char wrCell[16];

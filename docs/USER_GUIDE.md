@@ -314,10 +314,14 @@ truthfulness costs.
 a first pass over data the cache does not have yet — a *fill* — provided the
 cache added little to it: the origin has to have delivered at least 95% of the
 bytes, and the cache's own writing must have cost no more than a tenth of the
-time spent waiting on the origin, which is the same bound as the product's
-cold-pass target. That second kind means an ordinary first run can supply a
+time spent waiting on the origin. That second figure is a coarse estimate, not
+a percentage of your job: it compares time blocked writing against time blocked
+fetching, and both are summed across threads, so it can be off by a factor of
+two or three in either direction. It is used only to tell a 1-2% effect from a
+20%+ one, which is all the admission decision needs. That second kind of
+reference means an ordinary first run can supply a
 measurement without anyone having known to record one. A switched-off run still
-wins over a fill however much nearer in time the fill is, because a fill carries
+wins over a fill however recent the fill is, because a fill carries
 its own writing in its wall.
 
 Rules the comparison enforces, so a number is never printed where it would

@@ -382,9 +382,12 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   // The reference is a measured BASELINE: the same files read once with the
   // cache out of the loop. EITHER side of this run in time qualifies -- people
   // usually think to measure a baseline only after they have been running
-  // cached for a while -- and among the ones that qualify the NEAREST in time
-  // wins, because origin drift is the only thing that separates them (a
-  // baseline has no cache machinery in its wall to distort).
+  // cached for a while -- and among the ones that qualify the LATEST wins,
+  // because origin drift is the only thing that separates them and the most
+  // recent measurement is the best estimate of conditions now (a baseline has
+  // no cache machinery in its wall to distort). One consequence, deliberate:
+  // recording a new reference re-computes the gain of every earlier run
+  // against it, so a printed figure can change with no new data of its own.
   const Run* best = nullptr;
   double bestC = 0.0, bestD = 0.0;         // closest near-miss, for the refusal text
   double refC = 0.0, refD = 0.0, refWireTotalD = 0.0;
