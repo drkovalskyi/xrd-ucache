@@ -320,6 +320,10 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
   // measurement taken before the feature -- but the estimate then says the
   // work was not verified instead of implying it was.
   constexpr double kMinSigCoverage = 0.50;
+  // How many files must disagree before a sub-threshold agreement ratio counts
+  // as evidence of different work. Paired with kMinReadAgreement so that more
+  // agreement can never produce a refusal -- see the rule below.
+  constexpr size_t kMinDisagreeingFiles = 3;
 
   if (run.disabled) {
     g.why = GainEstimate::Why::kIsBaseline;
@@ -459,18 +463,70 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // Expressed THROUGH the constant, not beside it: the first version
     // hardcoded the comparison and left kMinSigCoverage used only in a message,
     // so changing the constant changed the text and not the rule.
-    const bool checkable =
-        sigPairs > 0 &&
-        static_cast<double>(sigPairs) >= kMinSigCoverage * static_cast<double>(matchedCount);
-    if (checkable) {
+    // Stated as a count of DISAGREEMENTS against the files compared, which is
+    // monotone by construction: adding an AGREEING signature raises sigPairs
+    // and sigAgree together, leaving sigDisagree and matchedCount untouched, so
+    // it cannot change the verdict.
+    //
+    // The previous form compared agreement WITHIN the signed pairs, and applied
+    // that comparison only once coverage cleared kMinSigCoverage. That made the
+    // floor a cliff rather than a threshold: with forty files compared and
+    // nineteen signed at 79% agreement the comparison stood, and adding one
+    // more AGREEING pair switched the rule on at exactly 50% coverage, where
+    // 80% then failed the 90% bar and destroyed the measurement. One more piece
+    // of evidence FOR the runs matching made the answer worse -- the very thing
+    // the paragraph above forbids. Moving the cliff from one-of-N to half-of-N
+    // shrank the window; it did not close it.
+    //
+    // At full coverage the two forms agree exactly (disagreements above
+    // (1 - kMinReadAgreement) of the files is the same statement as agreement
+    // below kMinReadAgreement). Below full coverage this one is the stricter,
+    // which is the safe direction: partial evidence of different work now
+    // refuses instead of being discarded along with the rest of the comparison.
+    // TWO conditions, and the conjunction is what makes this monotone: the
+    // signed pairs must disagree by RATIO, and there must be enough of them in
+    // absolute terms for that ratio to be evidence rather than an accident.
+    //
+    // Adding an AGREEING signature raises the ratio (toward accepting) and
+    // leaves the disagreement count untouched, so it can never turn a valid
+    // measurement into a refusal. That is the property the paragraph above
+    // demands and the previous form did not have: it applied the ratio only
+    // once coverage cleared a floor, so at the boundary one more agreeing pair
+    // switched the rule ON and a sub-threshold ratio then refused a comparison
+    // that had stood a signature earlier.
+    //
+    // The floor could not simply be dropped, because the ratio alone refuses on
+    // a single disagreeing file out of a thousand -- the case the paragraph
+    // above records as having destroyed every measurement in a directory. An
+    // absolute count answers that without a cliff: one file disagreeing is a
+    // relocated basket or a refetch, several is a pattern. Unsigned files are
+    // deliberately NOT counted on either side, so they cannot dilute a
+    // disagreement into agreement.
+    const size_t sigDisagree = sigPairs - sigAgree;
+    if (sigPairs > 0) {
       const double agree = static_cast<double>(sigAgree) / static_cast<double>(sigPairs);
-      if (agree < kMinReadAgreement) {
+      // Strict ABOVE the coverage floor, as before -- and also strict below it
+      // once enough files disagree outright. The second clause is what removes
+      // the cliff: the case that used to flip (a sub-threshold ratio sitting
+      // just under the floor, made checkable by one more AGREEING pair) now
+      // already refuses before the floor is crossed, so crossing it changes
+      // nothing. Coverage alone still decides a single decisive file, which is
+      // why the floor stays.
+      const bool covered =
+          static_cast<double>(sigPairs) >= kMinSigCoverage * static_cast<double>(matchedCount);
+      if (agree < kMinReadAgreement && (covered || sigDisagree >= kMinDisagreeingFiles)) {
         ++readSigMismatch;
         if (agree > bestAgree)
           bestAgree = agree;
         continue;
       }
     }
+    // Coverage still decides what the readout CLAIMS: enough of the compared
+    // files must be checkable before "verified" means anything. That is a
+    // statement about how much was checked, not a reason to refuse.
+    const bool checkable =
+        sigPairs > 0 &&
+        static_cast<double>(sigPairs) >= kMinSigCoverage * static_cast<double>(matchedCount);
     const double c = static_cast<double>(matchedWire) / static_cast<double>(refWireTotal);
     const double d = static_cast<double>(matchedWork) / static_cast<double>(runWorkTotal);
     if (c < kMinOverlap || d < kMinOverlap) {
