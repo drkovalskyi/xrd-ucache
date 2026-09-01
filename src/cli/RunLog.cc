@@ -536,19 +536,22 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       }
       continue;
     }
-    auto dist = [&](const Run& x) {
-      return x.startS > run.startS ? x.startS - run.startS : run.startS - x.startS;
-    };
     // A run with the cache switched off beats a qualifying fill, however much
-    // nearer in time the fill is: the fill carries its own writing in its wall
+    // more recent the fill is: the fill carries its own writing in its wall
     // -- bounded, but not zero -- while the switched-off run carries none.
     // It also keeps admitting fills from being a silent revision: a dataset
     // that already had a clean baseline reports exactly what it reported
     // before, and fills only ever supply an answer where there was none.
-    // Within one kind, nearest in time still wins, since origin drift is then
-    // the only thing separating the candidates.
-    const bool better = !best || (r.disabled != best->disabled ? r.disabled
-                                                              : dist(r) < dist(*best));
+    //
+    // Within one kind, the LATEST wins. The conditions a reference describes
+    // are the thing that drifts -- the same job against the same origin
+    // measured 173 s and 1025 s within one evening -- and the most recent
+    // measurement is the best available estimate of the conditions now. There
+    // is no way to know the true value during any given run, so this is an
+    // estimator, not a tie-break: any rule that leaned toward the larger or
+    // the smaller wall would be choosing a bias instead.
+    const bool better =
+        !best || (r.disabled != best->disabled ? r.disabled : r.startS > best->startS);
     if (better) {
       best = &r;
       refC = c;

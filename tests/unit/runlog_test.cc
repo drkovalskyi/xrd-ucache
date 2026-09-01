@@ -333,9 +333,8 @@ TEST(Gain, SuppressedWhenEitherRunIsTooShortToTime) {
 }
 
 // A baseline recorded AFTER the cached runs still measures them -- people
-// usually think of it late -- and with several on record the NEAREST in time
-// wins, because origin drift is the only thing separating baselines.
-TEST(Gain, UsesTheNearestBaselineIncludingALaterOne) {
+// usually think of it late.
+TEST(Gain, UsesABaselineRecordedAfterTheRun) {
   test::TempDir td;
   twoFileBaseline(td.path(), 100, /*pid=*/50, /*startS=*/500);   // far past: 100 s
   twoFileBaseline(td.path(), 200, /*pid=*/60, /*startS=*/4000);  // near future: 200 s
@@ -349,7 +348,39 @@ TEST(Gain, UsesTheNearestBaselineIncludingALaterOne) {
   ASSERT_NE(warm, nullptr);
   auto g = estimateGain(*warm, runs);
   ASSERT_TRUE(g.valid) << g.reason;
-  EXPECT_EQ(g.referenceStartS, 4000u); // nearest in time, though it came later
+  EXPECT_EQ(g.referenceStartS, 4000u); // recorded later, and still the one used
+  EXPECT_NEAR(g.gain, 4.0, 0.01);
+}
+
+// With several baselines on record the LATEST wins, even when an older one sits
+// closer in time to the run being measured.
+//
+// What separates two baselines is drift -- the same job against the same origin
+// measured 173 s and 1025 s within one evening -- so the question is which one
+// best describes conditions, and the most recent measurement is the best
+// available estimate of that. There is no way to know the true value during any
+// given run, which is why this is an estimator rather than a preference: a rule
+// leaning toward the larger or the smaller wall would be choosing a bias.
+//
+// The two candidates here disagree on purpose. The older one is NEARER (100 s
+// away against 2000 s) and would give 2.0; the later one gives 4.0. A test
+// where both rules agree would pin nothing, which is what the test above does
+// and why this one exists beside it.
+TEST(Gain, WithSeveralBaselinesTheLatestWins) {
+  test::TempDir td;
+  twoFileBaseline(td.path(), 100, /*pid=*/50, /*startS=*/2900);  // near, older
+  twoFileBaseline(td.path(), 200, /*pid=*/60, /*startS=*/5000);  // far, latest
+  writeRun(td.path(), "host", 200, 3000, 3050, warmCounters(kGiB),
+           {{"root://o//a", kGiB / 2, 0, 0, 0}, {"root://o//b", kGiB / 2, 0, 0, 0}});
+  auto runs = loadRuns(td.path());
+  const ucache::Run* warm = nullptr;
+  for (const auto& r : runs)
+    if (r.startS == 3000)
+      warm = &r;
+  ASSERT_NE(warm, nullptr);
+  auto g = estimateGain(*warm, runs);
+  ASSERT_TRUE(g.valid) << g.reason;
+  EXPECT_EQ(g.referenceStartS, 5000u) << "the nearer baseline is older; the later one is current";
   EXPECT_NEAR(g.gain, 4.0, 0.01);
 }
 
