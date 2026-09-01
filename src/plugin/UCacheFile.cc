@@ -441,17 +441,8 @@ static void noteRelayChunks(const std::shared_ptr<HandleState>& st,
 // gets a per-file record now (FileEntry emits one only for entries).
 // `entry` is the handle's entry as swapped out by the caller — non-null means
 // FileEntry's own record covers this file and this one must not duplicate it.
-// mayProbeOrigin: whether this caller may ask the origin for the file size.
-// Close may; the DESTRUCTOR may not. statInfo is only ever set on the setup
-// path, which a pass-through handle never runs -- so for exactly the handles
-// this records, the fallback below is always reached, and from a destructor a
-// blocking call on a dead connection stalls teardown once per relayed file.
-// A job whose origin went away then pays that stall for every file it touched,
-// at exit, where nothing can report it. The size is worth having; it is not
-// worth hanging a job to get.
 static void emitRelayObs(const std::shared_ptr<HandleState>& st,
-                         const std::shared_ptr<FileEntry>& entry,
-                         bool mayProbeOrigin) {
+                         const std::shared_ptr<FileEntry>& entry) {
   if (st->relayObsDone.exchange(true))
     return;
   const uint64_t n = st->relayedBytes.load(std::memory_order_relaxed);
@@ -460,7 +451,23 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
     const uint64_t b = nowUs(); // the handle is closing: this IS its last activity
     // The file's size at the origin, which is the one figure that means the
     // same thing on both routes. force=false answers from the open response,
-    // so this costs no round trip.
+    // so this costs no round trip in the common case.
+    //
+    // This DOES run from the destructor, and a blocking call on a dead
+    // connection stalls teardown once per relayed file. Suppressing it there
+    // was tried and reverted: the size does not only weight originShare(), it
+    // GATES the read signature -- CacheStore's relay record emits read_sig and
+    // read_buckets only when the size is known -- and a relayed handle is what
+    // a cache-disabled BASELINE leaves behind. Losing it makes every later
+    // comparison against that baseline unverified, and with no signed pairs at
+    // all the agreement rule is skipped entirely, so a genuinely
+    // different-work comparison stops being refused. That is a worse failure
+    // than a slow exit.
+    //
+    // It also bought less than it looked: shutdownInner() below destroys the
+    // inner File, whose destructor runs a synchronous Close, so this teardown
+    // blocks on a dead origin either way. Removing the Stat removed one of two
+    // blocking calls and paid for it with the evidence.
     // Prefer the copy taken at open: it costs nothing and, unlike the inner
     // file, it cannot be swapped out from under this by a retry. Asking the
     // inner file is the fallback, and it goes through acquire/release like
@@ -470,19 +477,15 @@ static void emitRelayObs(const std::shared_ptr<HandleState>& st,
     uint64_t originSize = 0;
     if (st->statInfo) {
       originSize = st->statInfo->GetSize();
-    } else if (mayProbeOrigin) {
-      if (XrdCl::File* f = st->acquireInner()) {
-        if (f->IsOpen()) {
-          XrdCl::StatInfo* si = nullptr;
-          if (f->Stat(false, si).IsOK() && si)
-            originSize = si->GetSize();
-          delete si;
-        }
-        st->releaseInner();
+    } else if (XrdCl::File* f = st->acquireInner()) {
+      if (f->IsOpen()) {
+        XrdCl::StatInfo* si = nullptr;
+        if (f->Stat(false, si).IsOK() && si)
+          originSize = si->GetSize();
+        delete si;
       }
+      st->releaseInner();
     }
-    // Otherwise originSize stays 0, which consumers already read as "unknown"
-    // and weight by delivered bytes instead.
     st->store->recordRelayObs(st->url, n, "relay", b > a ? b - a : 0, originSize);
   }
 }
@@ -1182,7 +1185,7 @@ UCacheFile::~UCacheFile() {
   }
   if (e)
     e->flushAll(); // synchronous (covers the no-explicit-Close path)
-  emitRelayObs(st_, e, /*mayProbeOrigin=*/false); // destructor: never block
+  emitRelayObs(st_, e);
   st_->shutdownInner();
 }
 
@@ -1568,7 +1571,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   }
   if (e)
     e->flushAll(); // synchronous: staged pages + bitmap must hit disk before we may exit
-  emitRelayObs(st_, e, /*mayProbeOrigin=*/true);
+  emitRelayObs(st_, e);
   // Background recompression: a closed entry's read set is complete —
   // queue it for the drainer. Off the Close path (executor task); captures
   // only values, never the plugin object.
