@@ -274,6 +274,13 @@ struct GainEstimate {
   // names alone -- true of records written before signatures existed, and
   // worth saying rather than leaving a reader to assume the check ran.
   uint64_t sigPairs = 0;
+  // The denominator the coverage RULE runs against, which is NOT matchedFiles:
+  // it counts only files the reference actually fetched over the wire, because
+  // a reference file with no wire bytes says nothing about what the origin
+  // cost. Printing sigPairs over matchedFiles told the reader the check was
+  // weaker than it was -- a comparison that legitimately cleared the half-way
+  // bar could show a ratio below half.
+  uint64_t comparedFiles = 0;
   bool workVerified = false;
   uint64_t referenceStartS = 0;
   // Which KIND of reference produced the number: a run explicitly recorded

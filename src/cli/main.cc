@@ -1121,10 +1121,18 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
         // was an explicit no-cache run, when the whole point of the inference
         // is that most will be qualifying fills.
         std::printf("%.3f,\"gain_source\":\"%s\",\"work_verified\":%s,"
-                    "\"checked_files\":%llu,\"matched_files\":%llu}",
+                    // compared_files is the denominator the coverage rule uses;
+                    // matched_files is the plain intersection and is the larger
+                    // of the two. Publishing only the latter let a reader divide
+                    // checked by matched and conclude the check was weaker than
+                    // it was. Both are here so neither reading is a guess.
+                    "\"checked_files\":%llu,\"compared_files\":%llu,"
+                    "\"matched_files\":%llu}",
                     g.gain, g.referenceDisabled ? "disabled" : "fill",
                     g.workVerified ? "true" : "false",
-                    (unsigned long long)g.sigPairs, (unsigned long long)g.matchedFiles);
+                    (unsigned long long)g.sigPairs,
+                    (unsigned long long)g.comparedFiles,
+                    (unsigned long long)g.matchedFiles);
       else
         std::printf("null,\"gain_source\":null}");
       continue;
@@ -1283,12 +1291,14 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
       std::printf("{\"estimate\":%.3f,\"saved_s\":%.1f,\"origin_mb_s\":%.1f,"
                   "\"matched_files\":%llu,\"origin_equivalent_bytes\":%llu,"
                   "\"work_verified\":%s,\"checked_files\":%llu,"
+                  "\"compared_files\":%llu,"
                   "\"reference\":{\"start\":%llu,\"kind\":\"%s\"}}",
                   gain.gain, gain.savedS, gain.originMBs,
                   (unsigned long long)gain.matchedFiles,
                   (unsigned long long)gain.originEquivBytes,
                   gain.workVerified ? "true" : "false",
                   (unsigned long long)gain.sigPairs,
+                  (unsigned long long)gain.comparedFiles,
                   (unsigned long long)gain.referenceStartS,
                   gain.referenceDisabled ? "disabled" : "fill");
     else
@@ -1534,13 +1544,13 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     if (gain.workVerified)
       std::printf("             same work: verified on %llu of %llu compared files\n",
                   (unsigned long long)gain.sigPairs,
-                  (unsigned long long)gain.matchedFiles);
+                  (unsigned long long)gain.comparedFiles);
     else
       std::printf("             same work: NOT verified — %llu of %llu compared files "
                   "carry a read footprint on both sides; the walls are compared on the "
                   "file names alone\n",
                   (unsigned long long)gain.sigPairs,
-                  (unsigned long long)gain.matchedFiles);
+                  (unsigned long long)gain.comparedFiles);
   } else {
     // Two ways to get a number; name the one that is closer to hand.
     std::printf("gain       : not measured — %s\n", gain.reason.c_str());

@@ -500,6 +500,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       refWireTotalD = static_cast<double>(refWireTotal);
       g.originEquivBytes = matchedWire;
       g.sigPairs = sigPairs;
+      g.comparedFiles = matchedCount;
       // Verified means the work-identity check actually RAN on at least half
       // the compared files, not merely that it did not refuse.
       g.workVerified = checkable;
