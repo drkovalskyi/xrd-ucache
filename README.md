@@ -1,3 +1,4 @@
+[![arXiv](https://img.shields.io/badge/arXiv-2609.00400-B31B1B.svg)](https://arxiv.org/abs/2609.00400)
 # uCache
 
 xrd-ucache or simply uCache is a transparent, per-user read cache for
