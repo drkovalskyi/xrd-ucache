@@ -407,7 +407,7 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     if (r.files.empty() || r.durationS() < kMinDurationS || r.faults())
       continue;
     uint64_t refWireTotal = 0, matchedWire = 0, matchedWork = 0;
-    size_t sigPairs = 0, sigAgree = 0, matchedCount = 0, eitherSigned = 0;
+    size_t sigPairs = 0, sigAgree = 0, matchedCount = 0;
     for (const auto& [k, f] : r.files) {
       (void)k;
       refWireTotal += f.wireBytes;
@@ -422,8 +422,6 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
       matchedWire += it->second.wireBytes;
       matchedWork += f.deliveredBytes();
       ++matchedCount;
-      if (!f.readSig.empty() || !it->second.readSig.empty())
-        ++eitherSigned;
       if (!f.readSig.empty() && !it->second.readSig.empty()) {
         ++sigPairs;
         if (f.readSig == it->second.readSig)
@@ -436,14 +434,6 @@ GainEstimate estimateGain(const Run& run, const std::vector<Run>& all) {
     // is never reported as "it covered different files": they are different
     // problems with different remedies.
     //
-    // Enough of the compared files must be checkABLE before the agreement rule
-    // is worth applying. `eitherSigned == 0` is the pre-signature case -- no
-    // record on either side carries a footprint -- and is let through
-    // unverified. Anything else means the machinery WAS working, so a shortage
-    // of pairs is evidence about these runs rather than about the format: the
-    // shape that produces it is one side signing nothing, which is what a
-    // baseline whose files never populated their size looks like, and it would
-    // otherwise hand every later run an unchecked reference.
     // Enough of the compared files must carry a footprint on BOTH sides before
     // the agreement rule means anything: agreement measured over the one file
     // that happens to be checkable says nothing about the other three hundred.
