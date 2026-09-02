@@ -1,5 +1,7 @@
 # uCache
 
+[![arXiv](https://img.shields.io/badge/arXiv-2609.00400-B31B1B.svg)](https://arxiv.org/abs/2609.00400)
+
 xrd-ucache or simply uCache is a transparent, per-user read cache for
 remote ROOT/XRootD data. You install it once and point it at the servers
 you read from; thereafter every file your jobs read from them is cached
@@ -88,6 +90,25 @@ Further validation is performed with tools outside this repository.
   candidate cache directory, and why the choice matters
 - [On-disk format](docs/FORMAT.md) — what a cached entry is made of on disk,
   for anyone inspecting or writing tooling against it
+
+## Citing uCache
+
+The design and its measurements are described in the paper
+([arXiv:2609.00400](https://arxiv.org/abs/2609.00400)). If uCache is useful
+in your work, please cite it:
+
+```bibtex
+@misc{kovalskyi2026ucache,
+  title         = {Client-side transparent caching for remote {ROOT} data analysis},
+  author        = {Kovalskyi, Dmytro and Eysermans, Jan and D'Alfonso, Mariarosaria and Paus, Christoph},
+  year          = {2026},
+  eprint        = {2609.00400},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DC},
+  doi           = {10.48550/arXiv.2609.00400},
+  url           = {https://arxiv.org/abs/2609.00400}
+}
+```
 
 ## License
 
