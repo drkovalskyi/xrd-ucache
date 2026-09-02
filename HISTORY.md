@@ -3,13 +3,32 @@ things that affect someone using uCache; the commit history has the detail.
 Heading size is how much the release matters: `#` a landmark, `##` new
 capability, `###` fixes and refinements.
 
-Versions are `0.y.z` while the project is pre-production: `y` adds capability,
+Versions are SemVer: `x` changes something you depend on, `y` adds capability,
 `z` fixes and refines. Prebuilt EL9 packages are attached to each release.
 
 **Across every release so far:** the on-disk cache format has not changed, so a
 newer release reads a cache written by an older one. Recompression stays off
 unless you turn it on. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
+
+# v1.0.0 — 2026-09-02
+- `ucache summary` answers the question the cache exists for: how much time it
+  has saved you, across every run it holds records for and for the last one on
+  its own.
+- `ucache history` lists one row per run — how long it took, how much it read,
+  which tier served it, and the gain where one could be measured. Both commands
+  take `--json`, and `summary --detail` breaks the aggregate down.
+- **The gain is measured, never guessed.** It compares a cached run against a
+  run of the same files with the cache switched off (`UCACHE_DISABLE=1`), which
+  the plugin now records. With no such run to compare against, the readouts say
+  why instead of estimating — and when the cache costs you time, they report the
+  loss rather than rounding it up to no change.
+- `ucache stats --reset` moves records aside instead of deleting them, so
+  starting a fresh measurement window no longer throws away the run the gain is
+  measured against.
+- First stable release. The command surface, the configuration keys and the
+  on-disk format are what a major version now protects: a `1.x` release will
+  read a cache written by any other, and will not rename a setting under you.
 
 ## v0.21.0 — 2026-08-21
 - XRootD 6 clients are supported — the plugin builds against and loads into 6 as
