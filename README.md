@@ -1,4 +1,3 @@
-[![arXiv](https://img.shields.io/badge/arXiv-2609.00400-B31B1B.svg)](https://arxiv.org/abs/2609.00400)
 # uCache
 
 xrd-ucache or simply uCache is a transparent, per-user read cache for
@@ -8,6 +7,8 @@ on local disk, so the **second and later** passes over the same data
 come from that disk instead of the network. Nothing in your analysis
 code changes and the first cold run has minimal overhead, so there's
 little to lose in trying it.
+
+[![arXiv](https://img.shields.io/badge/arXiv-2609.00400-B31B1B.svg)](https://arxiv.org/abs/2609.00400)
 
 ## Try it
 
