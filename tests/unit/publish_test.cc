@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 
 #include <sys/stat.h>
@@ -94,6 +95,24 @@ TEST(Publish, HashesMatchTheServiceReference) {
   EXPECT_EQ(machineHash(kSalt, " Node-A.example.org "), machineHash(kSalt, "node-a.example.org"));
   EXPECT_NE(locationHash(kSalt, "node-a", "/data/x/cache"),
             locationHash("ffffffffffffffffffffffffffffffff", "node-a", "/data/x/cache"));
+  // The host is lowercased and trimmed for EVERY id, not only the machine's:
+  // a mixed-case hostname (macOS) must hash like the web page hashes it.
+  EXPECT_EQ(locationHash(kSalt, " Node-1.EXAMPLE.org ", "/scratch/user//cache/./"),
+            "385c4438c397c96755cb418f2a154bfe");
+  EXPECT_EQ(volumeHash(kSalt, "NODE-1.example.ORG", "/scratch/"), "00e74f7f596ef35a4b4e4484cbbbe581");
+}
+
+TEST(Publish, LabelProblem) {
+  EXPECT_EQ(labelProblem("scratch SSD"), "");
+  EXPECT_EQ(labelProblem("   "), "");
+  EXPECT_EQ(labelProblem(std::string(80, 'x')), "");
+  EXPECT_NE(labelProblem(std::string(81, 'x')), "");
+  EXPECT_NE(labelProblem("--url"), "");
+  EXPECT_NE(labelProblem("cache on /home/alice"), "");
+  EXPECT_NE(labelProblem("~/cache"), "");
+  EXPECT_NE(labelProblem("nfs1:/export"), "");
+  EXPECT_NE(labelProblem("alice@node"), "");
+  EXPECT_NE(labelProblem("C:\\cache"), "");
 }
 
 TEST(Publish, NormPathIsPythonsNormpath) {
@@ -150,6 +169,10 @@ TEST(Publish, RegistrableDomainAndUrlCoarsening) {
 }
 
 TEST(Publish, DatesOnly) {
+  // UTC by construction: a local-time implementation would pass on a UTC
+  // runner and fail east of it, so the test pins a far-east zone.
+  ScopedEnv tz("TZ", "Asia/Tokyo");
+  ::tzset();
   EXPECT_EQ(dateOnlyUtc(1725494400), "2024-09-05");
   EXPECT_EQ(dateOnlyUtc(1757030399), "2025-09-04");
   EXPECT_EQ(dateOnlyUtc(1788000727), "2026-08-29");
@@ -183,13 +206,48 @@ TEST(Publish, JsonRoundTripKeepsNumberTextAndOrder) {
   EXPECT_EQ(again.dump(), j.dump());
 }
 
+TEST(Publish, JsonUnicodeEscapesNumbersAndHostileInput) {
+  Json k;
+  std::string err;
+  ASSERT_TRUE(Json::parse(R"("é€😀")", k, &err)) << err;
+  EXPECT_EQ(k.s, "\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80");
+  ASSERT_TRUE(Json::parse(R"("\ud83dA")", k, &err)) << err; // broken pair: U+FFFD, then the A survives
+  EXPECT_EQ(k.s, "\xEF\xBF\xBD" "A");
+  ASSERT_TRUE(Json::parse(R"("\ude00x")", k, &err)) << err;     // a low surrogate on its own
+  EXPECT_EQ(k.s, "\xEF\xBF\xBDx");
+  ASSERT_TRUE(Json::parse(R"("\ud83d")", k, &err)) << err;      // a high surrogate at the end
+  EXPECT_EQ(k.s, "\xEF\xBF\xBD");
+  // Nesting is bounded: a hostile record-store line fails, it does not
+  // overflow the stack.
+  EXPECT_FALSE(Json::parse(std::string(200000, '['), k, &err));
+  EXPECT_NE(err.find("nesting"), std::string::npos);
+  EXPECT_TRUE(Json::parse(std::string(60, '[') + std::string(60, ']'), k, &err)) << err;
+  // The number grammar is JSON's, not strtod's.
+  EXPECT_FALSE(Json::parse("01", k, &err));
+  EXPECT_FALSE(Json::parse("1.", k, &err));
+  EXPECT_FALSE(Json::parse("-", k, &err));
+  EXPECT_FALSE(Json::parse(".5", k, &err));
+  EXPECT_FALSE(Json::parse("1e", k, &err));
+  ASSERT_TRUE(Json::parse("-0.5e-3", k, &err));
+  EXPECT_EQ(k.s, "-0.5e-3");
+  ASSERT_TRUE(Json::parse("0", k, &err));
+  // The pretty printer closes a mixed array on its own line, and it parses back.
+  Json m;
+  ASSERT_TRUE(Json::parse("[1,{\"a\":2}]", m, &err));
+  EXPECT_EQ(m.dump(1), "[\n 1,\n {\n  \"a\": 2\n }\n]");
+  Json back;
+  ASSERT_TRUE(Json::parse(m.dump(1), back, &err)) << err;
+  EXPECT_EQ(back.dump(), m.dump());
+}
+
 TEST(Publish, RedactBenchDropsBlanksHashesAndNormalizes) {
   Json raw;
   ASSERT_TRUE(Json::parse(kRawBench, raw));
   Identity id;
   ASSERT_TRUE(parseIdentity(kTestIdentity, id));
   const Json r = redactBench(raw, &id, "00000000-0000-4000-8000-000000000001");
-  for (const char* k : kBenchDropKeys)
+  // Named here, not iterated from the array: shortening kBenchDropKeys must fail this.
+  for (const char* k : {"path", "mount", "mount_source", "mount_opts", "mount_super_opts", "dev_name"})
     EXPECT_FALSE(r.has(k)) << k;
   EXPECT_EQ(r.str("host"), "");
   EXPECT_EQ(r.str("cmd"), "ucache bench --size 64g --phase-seconds 60 --streams 1,16,32 <path>");
@@ -202,7 +260,8 @@ TEST(Publish, RedactBenchDropsBlanksHashesAndNormalizes) {
   EXPECT_EQ(r.get("randr16_iops")->s, "73863");
   EXPECT_EQ(r.obj.front().first, "schema");
   const std::string text = r.dump();
-  for (const char* leak : {"/scratch", "/home/", "example.org", "sdb1", "nfs-server", "--log"})
+  for (const char* leak : {"/scratch", "/home/", "example.org", "sdb1", "nfs-server", "--log", "relatime",
+                           "seclabel"})
     EXPECT_EQ(text.find(leak), std::string::npos) << leak;
   // Without an identity: no hashes, still no leaks.
   const Json anon = redactBench(raw, nullptr);
@@ -230,6 +289,7 @@ TEST(Publish, RedactNetbench) {
 TEST(Publish, MachineBlockHasHardwareAndHashedId) {
   Identity id;
   ASSERT_TRUE(parseIdentity(kTestIdentity, id));
+  ASSERT_FALSE(hostName().empty()); // the "never appears" check below would be vacuous otherwise
   const Json m = machineBlock(&id, "v5.8.3", "1.0.0");
   EXPECT_EQ(m.str("id"), machineHash(kSalt, hostName()));
   EXPECT_EQ(m.str("id").size(), 32u);

@@ -109,7 +109,9 @@ keep that machine's records and the file maintains itself. Two consequences
 worth knowing:
 
 - an exploratory run started from a directory holding a curated record files
-  itself into that record. Pass `--no-log` for anything you do not want kept.
+  itself into that record. Pass `--no-log` for anything you do not want in the
+  text log; the JSON record is still kept in the per-user store described next
+  (point `UCACHE_RECORDS_FILE` at `/dev/null` to skip that as well).
 - appended blocks are **newest last**.
 
 The JSON record is also kept, independently of the log, in the per-user store

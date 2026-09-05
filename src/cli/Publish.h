@@ -122,9 +122,16 @@ std::string coarsenRootUrl(const std::string& url);
 // Unix seconds -> `YYYY-MM-DD` in UTC.
 std::string dateOnlyUtc(uint64_t epochS);
 
-// Keys dropped from a bench record, and the ones blanked, in the order the
-// service lists them (the service refuses a record where any is still set).
+// Keys DROPPED from a bench record, in the order the service lists them (it
+// refuses a record where any is still set). `host` is not dropped but blanked,
+// by redactBench itself.
 extern const char* const kBenchDropKeys[6];
+
+// Why a label is refused, or "" when it is acceptable: a label is a name, so
+// it may not look like a flag, a path, an address or a home directory, and it
+// is at most 80 characters. The service applies its own place patterns after.
+std::string labelProblem(const std::string& label);
+inline constexpr size_t kLabelMax = 80;
 
 // A raw `ucache-bench-json` record -> what may be sent. With an identity the
 // location and volume hashes are added from the record's own host, path and
@@ -203,13 +210,15 @@ struct PublishOutcome {
   bool duplicate = false;
   std::vector<Finding> findings;
   std::string error, detail, field; // from an error reply
-  std::string failure;              // local reason when httpStatus == 0
+  std::string failure;              // why it did not go through (local or remote)
   std::string savedPayload;         // where the payload was left on failure
+  std::string endpoint;             // the URL that was posted to
 };
 // POST via the system's `curl` (UCACHE_CURL overrides the executable), with
-// three retries at 2/8/30 s on connection failures and 503, honouring a short
-// Retry-After on 429. Prints progress to stderr. Returns the process exit code
-// to use: 0 accepted (201 or 200 duplicate), 1 refused or unreachable.
+// three retries at 2/8/30 s on connection failures and 502/503/504, and a
+// Retry-After of at most 60 s honoured on 429 (a longer one is reported, not
+// waited for). Prints progress to stderr. Returns the process exit code to use:
+// 0 accepted (201, or 200 duplicate) with a report URL, 1 otherwise.
 int sendPayload(const Json& payload, const std::string& baseUrl, PublishOutcome& out);
 // The report, the findings and the owner page, for a terminal.
 void printOutcome(const PublishOutcome& out);

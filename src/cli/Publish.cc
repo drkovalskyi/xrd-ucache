@@ -138,12 +138,24 @@ std::string jsonEscape(const std::string& s) {
 
 namespace {
 
+// Nesting the parser will follow before giving up. The payloads it reads are
+// two levels deep; a hostile record store line or reply must fail, not
+// overflow the stack.
+constexpr int kMaxDepth = 64;
+
 struct Parser {
   const std::string& t;
   size_t i = 0;
+  int depth = 0;
   std::string err;
 
   explicit Parser(const std::string& text) : t(text) {}
+
+  struct Deeper {
+    int& d;
+    explicit Deeper(int& x) : d(x) { ++d; }
+    ~Deeper() { --d; }
+  };
 
   void ws() {
     while (i < t.size() && (t[i] == ' ' || t[i] == '\t' || t[i] == '\n' || t[i] == '\r'))
@@ -217,13 +229,27 @@ struct Parser {
         uint32_t cp = 0;
         if (!hex4(cp))
           return false;
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= t.size() && t[i] == '\\' && t[i + 1] == 'u') {
-          i += 2;
-          uint32_t lo = 0;
-          if (!hex4(lo))
-            return false;
-          if (lo >= 0xDC00 && lo <= 0xDFFF)
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          // A high surrogate needs a low one right behind it. Anything else is
+          // a broken pair: the high half becomes U+FFFD and whatever follows
+          // is read on its own, so nothing after it is lost.
+          if (i + 6 <= t.size() && t[i] == '\\' && t[i + 1] == 'u') {
+            const size_t save = i;
+            i += 2;
+            uint32_t lo = 0;
+            if (!hex4(lo))
+              return false;
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+              cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            } else {
+              cp = 0xFFFD;
+              i = save;
+            }
+          } else {
+            cp = 0xFFFD;
+          }
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+          cp = 0xFFFD; // a low surrogate on its own
         }
         utf8(out, cp);
         break;
@@ -238,7 +264,10 @@ struct Parser {
     if (i >= t.size())
       return fail("unexpected end");
     const char c = t[i];
+    if ((c == '{' || c == '[') && depth >= kMaxDepth)
+      return fail("nesting too deep");
     if (c == '{') {
+      Deeper deeper(depth);
       ++i;
       out = Json::object();
       ws();
@@ -272,6 +301,7 @@ struct Parser {
       }
     }
     if (c == '[') {
+      Deeper deeper(depth);
       ++i;
       out = Json::array();
       ws();
@@ -322,20 +352,21 @@ struct Parser {
       const size_t start = i;
       if (t[i] == '-')
         ++i;
-      bool digits = false;
-      while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i]))) {
+      const size_t intStart = i;
+      while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i])))
         ++i;
-        digits = true;
-      }
+      if (i == intStart)
+        return fail("bad number");
+      if (t[intStart] == '0' && i - intStart > 1)
+        return fail("leading zero"); // JSON forbids 01
       if (i < t.size() && t[i] == '.') {
         ++i;
-        while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i]))) {
+        const size_t fracStart = i;
+        while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i])))
           ++i;
-          digits = true;
-        }
+        if (i == fracStart)
+          return fail("bad fraction"); // JSON forbids 1.
       }
-      if (!digits)
-        return fail("bad number");
       if (i < t.size() && (t[i] == 'e' || t[i] == 'E')) {
         ++i;
         if (i < t.size() && (t[i] == '+' || t[i] == '-'))
@@ -371,24 +402,25 @@ void dumpInto(const Json& j, std::string& out, int indent, int level) {
     out += jsonEscape(j.s);
     out += '"';
     break;
-  case Json::Type::Array:
+  case Json::Type::Array: {
     out += '[';
+    // Arrays of scalars stay on one line even when pretty: a 40-point curve
+    // one number per line is not more readable.
+    const bool scalars = std::all_of(j.arr.begin(), j.arr.end(), [](const Json& e) {
+      return e.type != Json::Type::Array && e.type != Json::Type::Object;
+    });
     for (size_t k = 0; k < j.arr.size(); ++k) {
       if (k)
         out += ',';
-      // Arrays of scalars stay on one line even when pretty: a 40-point curve
-      // one number per line is not more readable.
-      const bool scalars = std::all_of(j.arr.begin(), j.arr.end(), [](const Json& e) {
-        return e.type != Json::Type::Array && e.type != Json::Type::Object;
-      });
       if (!scalars)
         nl(level + 1);
       dumpInto(j.arr[k], out, indent, level + 1);
     }
-    if (!j.arr.empty() && (j.arr[0].type == Json::Type::Array || j.arr[0].type == Json::Type::Object))
+    if (!scalars && !j.arr.empty())
       nl(level);
     out += ']';
     break;
+  }
   case Json::Type::Object:
     out += '{';
     for (size_t k = 0; k < j.obj.size(); ++k) {
@@ -938,6 +970,19 @@ std::string dateOnlyUtc(uint64_t epochS) {
 const char* const kBenchDropKeys[6] = {"path", "mount", "mount_source", "mount_opts", "mount_super_opts",
                                        "dev_name"};
 
+std::string labelProblem(const std::string& labelIn) {
+  const std::string label = trim(labelIn);
+  if (label.empty())
+    return "";
+  if (label[0] == '-')
+    return "a label may not start with '-' (that reads as a flag)";
+  if (label.find_first_of("/\\@~") != std::string::npos)
+    return "a label is a name, not a location or an address: no '/', '\\', '@' or '~'";
+  if (label.size() > kLabelMax)
+    return "a label is at most " + std::to_string(kLabelMax) + " characters";
+  return "";
+}
+
 Json redactBench(const Json& record, const Identity* id, const std::string& installIdValue) {
   Json out = Json::object();
   for (const auto& kv : record.obj) {
@@ -1405,6 +1450,7 @@ bool retryableCurlExit(int code) {
 int sendPayload(const Json& payload, const std::string& baseUrl, PublishOutcome& out) {
   const std::string version = payload.str("ucache_version", "unknown");
   const std::string endpoint = baseUrl + "/v1/publish";
+  out.endpoint = endpoint;
   const std::string text = payload.dump();
 
   auto saveForRetry = [&](const std::string& why) {
@@ -1466,7 +1512,15 @@ int sendPayload(const Json& payload, const std::string& baseUrl, PublishOutcome&
             for (const auto& x : f->arr)
               out.findings.push_back({x.str("code"), x.str("severity"), x.str("text"), x.str("doc_url")});
         }
-        result = 0;
+        // Accepted, but a reply without a report URL is not a success the user
+        // can act on. Not saved for retry: the service has it.
+        if (out.reportUrl.empty()) {
+          out.failure = "the service accepted the payload (HTTP " + std::to_string(r.httpStatus) +
+                        ") but its reply carried no report URL";
+          result = 1;
+        } else {
+          result = 0;
+        }
         break;
       }
       if (parsed) {
@@ -1480,8 +1534,9 @@ int sendPayload(const Json& payload, const std::string& baseUrl, PublishOutcome&
           wait = ra;
           reason = "the service asks to wait (rate limit)";
         } else {
-          result = saveForRetry(ra > 0 ? "the service asks to retry in " + std::to_string(ra) + " s: " + out.detail
-                                       : "rate limited: " + out.detail);
+          // The reply's own words follow in printOutcome; do not repeat them here.
+          result = saveForRetry(ra > 0 ? "the service asks to retry in " + std::to_string(ra) + " s"
+                                       : "rate limited");
           break;
         }
       } else if (r.httpStatus == 502 || r.httpStatus == 503 || r.httpStatus == 504) {
@@ -1505,7 +1560,7 @@ int sendPayload(const Json& payload, const std::string& baseUrl, PublishOutcome&
 }
 
 void printOutcome(const PublishOutcome& out) {
-  if (out.httpStatus == 201 || out.httpStatus == 200) {
+  if ((out.httpStatus == 201 || out.httpStatus == 200) && !out.reportUrl.empty()) {
     if (out.duplicate)
       std::printf("already published — nothing new in this payload\n");
     std::printf("report   %s\n", out.reportUrl.c_str());
@@ -1537,8 +1592,9 @@ void printOutcome(const PublishOutcome& out) {
   if (!out.savedPayload.empty())
     std::fprintf(stderr,
                  "  the redacted payload is kept at %s — inspect it, and retry by hand with\n"
-                 "  curl -H 'Content-Type: application/json' --data-binary @%s <service>/v1/publish\n",
-                 out.savedPayload.c_str(), out.savedPayload.c_str());
+                 "  curl -H 'Content-Type: application/json' --data-binary @%s %s\n",
+                 out.savedPayload.c_str(), out.savedPayload.c_str(),
+                 out.endpoint.empty() ? "<service>/v1/publish" : out.endpoint.c_str());
 }
 
 bool confirmPublish(const std::string& summary, bool yes) {

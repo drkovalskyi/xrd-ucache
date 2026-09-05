@@ -561,8 +561,9 @@ struct PublishFlags {
 };
 
 // Recognises a publish flag at argv[i], consuming its value when it has one.
-// False when argv[i] is not one of ours; `bad` set when a value is missing.
-bool takePublishFlag(int argc, char** argv, int& i, PublishFlags& f, bool& bad) {
+// False when argv[i] is not one of ours; `bad` receives the complaint when a
+// value is missing or a label is not a name (the caller prints it, exits 2).
+bool takePublishFlag(int argc, char** argv, int& i, PublishFlags& f, std::string& bad) {
   const std::string a = argv[i];
   if (a == "--publish") {
     f.publish = true;
@@ -579,7 +580,11 @@ bool takePublishFlag(int argc, char** argv, int& i, PublishFlags& f, bool& bad) 
   if (a == "--label" || a.rfind("--label=", 0) == 0) {
     const char* v = flagValue(argc, argv, i, 7);
     if (!v) {
-      bad = true;
+      bad = "--label needs a value";
+      return true;
+    }
+    if (const std::string why = labelProblem(v); !why.empty()) {
+      bad = "--label: " + why;
       return true;
     }
     f.label = v;
@@ -589,7 +594,7 @@ bool takePublishFlag(int argc, char** argv, int& i, PublishFlags& f, bool& bad) 
   if (a == "--url" || a.rfind("--url=", 0) == 0) {
     const char* v = flagValue(argc, argv, i, 5);
     if (!v || !*v) {
-      bad = true;
+      bad = "--url needs a value";
       return true;
     }
     f.url = v;
@@ -620,14 +625,14 @@ void noteCreatedIdentity(bool created) {
 std::string diskLabel(const PublishFlags& f, const std::vector<StoredRecord>& store,
                       const std::string& host, const std::string& path, const char* what) {
   if (f.labelGiven)
-    return f.label.substr(0, 80);
+    return f.label;
   if (std::string known = knownLabel(store, host, path); !known.empty())
     return known;
   if (f.yes || f.dryRun || !::isatty(STDIN_FILENO) || !::isatty(STDOUT_FILENO))
     return "";
   std::printf("A short label for this %s, shown on your pages instead of its path (optional;\n"
-              "no paths or hostnames, at most 80 characters; Enter for none): ",
-              what);
+              "a name, not a path or a hostname, at most %zu characters; Enter for none): ",
+              what, kLabelMax);
   std::fflush(stdout);
   char buf[160] = {0};
   if (!std::fgets(buf, sizeof buf, stdin))
@@ -635,7 +640,11 @@ std::string diskLabel(const PublishFlags& f, const std::vector<StoredRecord>& st
   std::string s = buf;
   while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
     s.pop_back();
-  return s.substr(0, 80);
+  if (const std::string why = labelProblem(s); !why.empty()) {
+    std::printf("no label kept: %s\n", why.c_str());
+    return "";
+  }
+  return s;
 }
 
 // Builds, shows, confirms and sends one payload, and records the outcome.
@@ -666,18 +675,22 @@ int publishPayload(const PayloadParts& parts, const PublishFlags& f, const char*
 // to the per-user store either way; with --publish it also goes to the service.
 int cmdNetbench(const Config& cfg, int argc, char** argv) {
   PublishFlags pf;
-  bool bad = false;
+  std::string bad;
   std::vector<char*> pass;
   for (int i = 2; i < argc; ++i) {
     if (takePublishFlag(argc, argv, i, pf, bad)) {
-      if (bad) {
-        std::fputs("netbench: --label and --url need a value\n", stderr);
+      if (!bad.empty()) {
+        std::fprintf(stderr, "netbench: %s\n", bad.c_str());
         return 2;
       }
       continue;
     }
     pass.push_back(argv[i]);
   }
+  if (pf.labelGiven)
+    std::fputs("netbench: --label ignored — an origin measurement attaches to the machine, not to a "
+               "disk\n",
+               stderr);
   std::vector<std::string> cands;
   if (const char* v = ::getenv("UCACHE_NETBENCH"))
     cands.push_back(v);
@@ -764,6 +777,10 @@ int cmdNetbench(const Config& cfg, int argc, char** argv) {
                  err.c_str());
   if (!pf.publish)
     return rc;
+  if (rc != 0) {
+    std::fprintf(stderr, "netbench: the measurement did not complete (exit %d); nothing published\n", rc);
+    return rc;
+  }
   Json raw;
   if (!Json::parse(record, raw) || !raw.isObject()) {
     std::fputs("netbench: the record line did not parse; nothing published\n", stderr);
@@ -794,29 +811,20 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
   // recorded command line (which is what makes two runs comparable) and out of
   // the option parsing below.
   PublishFlags pf;
-  std::set<int> publishArgs;
+  std::set<int> publishArgs, pathArgs;
   {
-    bool bad = false;
+    std::string bad;
     for (int i = 2; i < argc; ++i) {
       const int before = i;
       if (takePublishFlag(argc, argv, i, pf, bad)) {
-        if (bad) {
-          std::fputs("bench: --label and --url need a value\n", stderr);
+        if (!bad.empty()) {
+          std::fprintf(stderr, "bench: %s\n", bad.c_str());
           return 2;
         }
         for (int k = before; k <= i; ++k)
           publishArgs.insert(k);
       }
     }
-  }
-  for (int i = 1; i < argc; ++i) { // argv[0] is the program: record the rest
-    if (publishArgs.count(i))
-      continue;
-    if (!opts.cmdline.empty())
-      opts.cmdline += ' ';
-    else
-      opts.cmdline = "ucache ";
-    opts.cmdline += argv[i];
   }
   for (int i = 2; i < argc; ++i) {
     if (publishArgs.count(i))
@@ -936,7 +944,25 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
       return 2;
     } else {
       paths.push_back(a);
+      pathArgs.insert(i);
     }
+  }
+  // The recorded command line: the publish flags left out (they are not part
+  // of the measurement), and every directory argument as its resolved absolute
+  // path — a bare name such as `scratch` would otherwise survive the published
+  // form's path replacement, which only recognises a path by its slash.
+  opts.cmdline = "ucache";
+  for (int i = 1; i < argc; ++i) { // argv[0] is the program: record the rest
+    if (publishArgs.count(i))
+      continue;
+    std::string arg = argv[i];
+    if (pathArgs.count(i)) {
+      char rbuf[4096];
+      if (::realpath(argv[i], rbuf))
+        arg = rbuf;
+    }
+    opts.cmdline += ' ';
+    opts.cmdline += arg;
   }
   if (paths.empty()) {
     if (cfg.cacheDir.empty()) {
@@ -999,7 +1025,7 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
     parts.ucacheVersion = UCACHE_VERSION;
     parts.installId = inst;
     parts.label = diskLabel(pf, store, host, path, "disk");
-    if (!parts.label.empty() && parts.label != knownLabel(store, host, path))
+    if (!pf.dryRun && !parts.label.empty() && parts.label != knownLabel(store, host, path))
       rememberLabel(host, path, parts.label);
     parts.machine = machineBlock(identity ? &*identity : nullptr, client, UCACHE_VERSION);
     parts.bench.push_back(redacted);
@@ -1575,12 +1601,12 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
 int cmdPublish(const Config& cfg, int argc, char** argv) {
   PublishFlags pf;
   pf.publish = true;
-  bool bad = false;
+  std::string bad;
   size_t window = 200; // runs sent, newest first; the service dedups
   for (int i = 2; i < argc; ++i) {
     if (takePublishFlag(argc, argv, i, pf, bad)) {
-      if (bad) {
-        std::fputs("publish: --label and --url need a value\n", stderr);
+      if (!bad.empty()) {
+        std::fprintf(stderr, "publish: %s\n", bad.c_str());
         return 2;
       }
       continue;
@@ -1601,13 +1627,42 @@ int cmdPublish(const Config& cfg, int argc, char** argv) {
                  cfg.cacheDir.c_str());
     return 2;
   }
+  const std::string host = hostName();
+  const std::string mount = mountPointOf(cacheDir);
+
+  // What there is to send, decided BEFORE anything is created on disk: a
+  // refusal for want of data must not leave a fresh identity behind.
+  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
+  const auto store = loadRecords();
+  std::vector<std::pair<const Json*, bool>> benchRecords; // record, is this very disk
+  std::vector<const Json*> netRecords;
+  for (const auto& r : store) {
+    if (lowerTrim(r.body.str("host")) != lowerTrim(host))
+      continue;
+    if (r.kind == "bench") {
+      if (!r.body.str("error").empty())
+        continue;
+      const bool sameDisk = normPath(r.body.str("path")) == normPath(cacheDir);
+      const bool sameVolume = !mount.empty() && normPath(r.body.str("mount")) == normPath(mount);
+      if (sameDisk || sameVolume)
+        benchRecords.emplace_back(&r.body, sameDisk);
+    } else if (r.kind == "netbench") {
+      netRecords.push_back(&r.body);
+    }
+  }
+  if (runs.empty() && benchRecords.empty() && netRecords.empty()) {
+    std::fputs("publish: nothing to send yet — no run has been recorded for this cache, and no\n"
+               "         `ucache bench` or `ucache netbench` record from this machine matches it.\n"
+               "         Run a job through the cache, or `ucache bench --threads N <cache dir>`.\n",
+               stderr);
+    return 1;
+  }
+
   bool created = false;
   auto identity = ensureIdentity(!pf.dryRun, &created);
   noteCreatedIdentity(created);
   if (!identity && pf.dryRun)
     identity = newIdentity(); // shape only; the dry run prints placeholders
-  const std::string host = hostName();
-  const std::string mount = mountPointOf(cacheDir);
 
   PayloadParts parts;
   parts.identity = identity;
@@ -1622,7 +1677,6 @@ int cmdPublish(const Config& cfg, int argc, char** argv) {
   }
   // History: the newest runs, emitted oldest first, with the origins each run
   // read from reduced to domains. The per-file records stay here.
-  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
   if (!runs.empty()) {
     Json h;
     if (Json::parse(historyJson(runs, window, /*redacted=*/true, /*oldestFirst=*/true), h))
@@ -1630,32 +1684,12 @@ int cmdPublish(const Config& cfg, int argc, char** argv) {
   }
   // This disk's benchmark records, then any on the same volume; this machine's
   // origin measurements. All from the per-user store, all redacted here.
-  const auto store = loadRecords();
-  for (const auto& r : store) {
-    if (lowerTrim(r.body.str("host")) != lowerTrim(host))
-      continue;
-    if (r.kind == "bench") {
-      if (!r.body.str("error").empty())
-        continue;
-      const bool sameDisk = normPath(r.body.str("path")) == normPath(cacheDir);
-      const bool sameVolume = !mount.empty() && normPath(r.body.str("mount")) == normPath(mount);
-      if (!sameDisk && !sameVolume)
-        continue;
-      parts.bench.push_back(
-          redactBench(r.body, identity ? &*identity : nullptr, sameDisk ? parts.installId : ""));
-    } else if (r.kind == "netbench") {
-      parts.netbench.push_back(redactNetbench(r.body));
-    }
-  }
-  if (!parts.history.isObject() && parts.bench.empty() && parts.netbench.empty()) {
-    std::fputs("publish: nothing to send yet — no run has been recorded for this cache, and no\n"
-               "         `ucache bench` or `ucache netbench` record from this machine matches it.\n"
-               "         Run a job through the cache, or `ucache bench --threads N <cache dir>`.\n",
-               stderr);
-    return 1;
-  }
+  for (const auto& [rec, sameDisk] : benchRecords)
+    parts.bench.push_back(redactBench(*rec, identity ? &*identity : nullptr, sameDisk ? parts.installId : ""));
+  for (const Json* rec : netRecords)
+    parts.netbench.push_back(redactNetbench(*rec));
   parts.label = diskLabel(pf, store, host, cacheDir, "cache");
-  if (!parts.label.empty() && parts.label != knownLabel(store, host, cacheDir))
+  if (!pf.dryRun && !parts.label.empty() && parts.label != knownLabel(store, host, cacheDir))
     rememberLabel(host, cacheDir, parts.label);
   parts.machine =
       machineBlock(identity ? &*identity : nullptr, ambientClientVersion(), UCACHE_VERSION);
