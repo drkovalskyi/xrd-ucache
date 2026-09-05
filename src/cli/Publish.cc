@@ -967,8 +967,7 @@ std::string dateOnlyUtc(uint64_t epochS) {
   return buf;
 }
 
-const char* const kBenchDropKeys[6] = {"path", "mount", "mount_source", "mount_opts", "mount_super_opts",
-                                       "dev_name"};
+const char* const kBenchDropKeys[5] = {"path", "mount", "mount_source", "mount_opts", "mount_super_opts"};
 
 std::string labelProblem(const std::string& labelIn) {
   const std::string label = trim(labelIn);

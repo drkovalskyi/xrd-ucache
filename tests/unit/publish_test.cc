@@ -247,8 +247,9 @@ TEST(Publish, RedactBenchDropsBlanksHashesAndNormalizes) {
   ASSERT_TRUE(parseIdentity(kTestIdentity, id));
   const Json r = redactBench(raw, &id, "00000000-0000-4000-8000-000000000001");
   // Named here, not iterated from the array: shortening kBenchDropKeys must fail this.
-  for (const char* k : {"path", "mount", "mount_source", "mount_opts", "mount_super_opts", "dev_name"})
+  for (const char* k : {"path", "mount", "mount_source", "mount_opts", "mount_super_opts"})
     EXPECT_FALSE(r.has(k)) << k;
+  EXPECT_EQ(r.str("dev_name"), "sdb1"); // the block device is hardware, not a place
   EXPECT_EQ(r.str("host"), "");
   EXPECT_EQ(r.str("cmd"), "ucache bench --size 64g --phase-seconds 60 --streams 1,16,32 <path>");
   EXPECT_EQ(r.str("location"), "385c4438c397c96755cb418f2a154bfe"); // host + normpath(path)
@@ -260,8 +261,7 @@ TEST(Publish, RedactBenchDropsBlanksHashesAndNormalizes) {
   EXPECT_EQ(r.get("randr16_iops")->s, "73863");
   EXPECT_EQ(r.obj.front().first, "schema");
   const std::string text = r.dump();
-  for (const char* leak : {"/scratch", "/home/", "example.org", "sdb1", "nfs-server", "--log", "relatime",
-                           "seclabel"})
+  for (const char* leak : {"/scratch", "/home/", "example.org", "nfs-server", "--log", "relatime", "seclabel"})
     EXPECT_EQ(text.find(leak), std::string::npos) << leak;
   // Without an identity: no hashes, still no leaks.
   const Json anon = redactBench(raw, nullptr);

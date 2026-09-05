@@ -123,9 +123,12 @@ std::string coarsenRootUrl(const std::string& url);
 std::string dateOnlyUtc(uint64_t epochS);
 
 // Keys DROPPED from a bench record, in the order the service lists them (it
-// refuses a record where any is still set). `host` is not dropped but blanked,
-// by redactBench itself.
-extern const char* const kBenchDropKeys[6];
+// refuses a record where any is still set): the directory, the mount point,
+// and the mount's source and options (an NFS source is `server:/export`, an
+// LVM source carries a volume name, options can carry paths). The block device
+// NAME (`sdb1`, `nvme0n1p1`, `rbd0`) is hardware, not a place, and stays.
+// `host` is not dropped but blanked, by redactBench itself.
+extern const char* const kBenchDropKeys[5];
 
 // Why a label is refused, or "" when it is acceptable: a label is a name, so
 // it may not look like a flag, a path, an address or a home directory, and it

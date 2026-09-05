@@ -36,8 +36,9 @@ backstop, not the mechanism.
 | storage benchmark (`ucache bench`) | every measured rate, latency and count | numbers | as measured |
 | | `host` | the hostname | blank; the machine block carries a salted hash instead |
 | | `path` | the benchmarked directory | **not sent** — `location`, a salted hash of hostname + path, replaces it |
-| | `mount`, `mount_source`, `mount_opts`, `mount_super_opts`, `dev_name` | the mount point, `server:/export` on NFS, options, `sdb1` | **not sent**; `volume`, a salted hash of hostname + mount point, replaces the mount point |
-| | `mount_fstype`, `dev_model`, `dev_rotational`, `dev_sched`, `dev_size_gb` | filesystem type, device model, SSD/HDD, scheduler, size | as measured (hardware, not location) |
+| | `mount`, `mount_source`, `mount_opts`, `mount_super_opts` | the mount point, `server:/export` on NFS or a volume name on LVM, the options | **not sent**; `volume`, a salted hash of hostname + mount point, replaces the mount point |
+| | `dev_name`, `dev_model`, `dev_rotational`, `dev_sched`, `dev_size_gb`, `dev` | the block device (`sdb1`, `nvme0n1p1`, `rbd0`), its model, SSD or HDD, scheduler, size, major:minor | as measured: hardware, not a place |
+| | `mount_fstype`, `fs` | the filesystem type | as measured |
 | | `cmd` | the command line | kept, normalized: the executable becomes `ucache`, `--log` and its value are removed, every path becomes `<path>`. The parameters stay because they are what makes two runs comparable |
 | | `kernel`, `arch`, `ncpu`, `mem_gb`, `cpu_model`, `version`, `time` | machine facts, tool version, when | as recorded |
 | origin benchmark (`ucache netbench`) | rates and latencies per stream count | numbers | as measured |
