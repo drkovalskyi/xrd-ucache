@@ -69,6 +69,9 @@ void usage() {
 } // namespace
 
 int main(int argc, char** argv) {
+  // `ucache netbench` runs this through a pipe to keep the record it prints;
+  // line buffering keeps the table arriving one stream at a time there too.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   std::string url;
   uint64_t blockKb = 4;
   double seconds = 5.0;

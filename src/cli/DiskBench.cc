@@ -1393,7 +1393,11 @@ void evict(int fd) {
 
 Result benchOne(const std::string& path, const DiskBenchOpts& o) {
   Result r;
-  r.path = path;
+  // The record names the directory by its resolved absolute path: a relative
+  // argument (`.`) would otherwise identify nothing once the run is over, and
+  // the published form hashes exactly this string, so it must be canonical.
+  char rbuf[4096];
+  r.path = ::realpath(path.c_str(), rbuf) ? std::string(rbuf) : path;
   r.fs = fsName(path);
   r.blockKib = o.blockBytes / 1024;
   r.threads = o.threads; // 0 = not given; never probed (see planBlock)
@@ -2008,7 +2012,10 @@ void appendLog(const std::string& path, const std::string& text) {
 
 } // namespace
 
-int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opts) {
+std::string mountPointOf(const std::string& path) { return mountFor(path).mountPoint; }
+
+int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opts,
+                 std::vector<std::string>* records) {
   std::string log;
   const std::string plan = planBlock(paths, opts);
   std::fputs(plan.c_str(), stdout);
@@ -2019,10 +2026,19 @@ int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opt
   std::vector<Result> results;
   for (const auto& p : paths) {
     Result r = benchOne(p, opts);
-    std::string block = contextBlock(r, opts) + humanBlock(r) + "\n" + jsonLine(r, opts) + "\n";
+    const std::string json = jsonLine(r, opts);
+    std::string block = contextBlock(r, opts) + humanBlock(r) + "\n" + json + "\n";
     std::fputs(block.c_str(), stdout);
     std::fflush(stdout);
     log += block;
+    if (records) {
+      // The line is `ucache-bench-json: {...}\n`; hand back the object alone.
+      static const std::string prefix = "ucache-bench-json: ";
+      std::string obj = json.compare(0, prefix.size(), prefix) == 0 ? json.substr(prefix.size()) : json;
+      while (!obj.empty() && (obj.back() == '\n' || obj.back() == '\r'))
+        obj.pop_back();
+      records->push_back(std::move(obj));
+    }
     results.push_back(std::move(r));
   }
   if (results.size() > 1) {

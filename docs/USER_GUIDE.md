@@ -424,6 +424,25 @@ write them. `ucache stats --reset` starts a fresh counter window but keeps the
 run history (moved under `stats/history/`, where both commands still read it) —
 baselines survive a reset.
 
+## A report with recommendations — `ucache publish`
+
+`summary` and `history` tell you what happened; the report service tells you
+what it means for this disk and this origin, and how your setup compares with
+other published installations. One command, foreground, nothing automatic:
+
+```sh
+ucache publish              # asks for confirmation, prints the report URL
+ucache publish --dry-run    # shows the exact payload and sends nothing
+```
+
+What goes out is the run history, the disk's benchmark records and this
+machine's origin measurements — as numbers. Paths, mount points and the
+hostname are replaced by salted hashes whose salt never leaves the machine;
+file names and origin URLs are reduced to domains; timestamps to dates. Every
+field is listed in **`docs/PUBLISH.md`**, and the report URLs are unlisted:
+whoever has one can read that page and nobody else can. `ucache bench
+--publish` and `ucache netbench --publish` send a single record the same way.
+
 ## Monitoring — reading `ucache stats`
 
 `ucache stats` aggregates the counters every process wrote and prints four
@@ -594,8 +613,10 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache stats`     | aggregate `stats/*.jsonl` across all processes, plus the derived **workflow picture**: opens per distinct file, bytes served per tier (direct / fill / RAM / disk / replica), disk-read count + mean size + sequential share, re-read factor, fill flush shape, and p50/p95/p99 latencies |
 | `ucache stats --files [--top N]` | per-file records (one per file per process), costliest first: which files were re-opened, re-read, served from which tier |
 | `ucache stats --reset` | start a fresh counter window for measuring **one** run against a specific cache state (run it between jobs — it warns if a file looks live). The counter and per-file records MOVE to `stats/history`, where `summary` and `history` keep reading them: deleting them would delete any measured no-cache baseline, which is the one thing later runs are compared against. Traces are deleted (bulky, per-op, no run-level meaning). The cache contents are untouched |
-| `ucache bench --threads N [PATH …] [--size SZ] [--measurement-duration S] [--block KB] [--fill writers=N,block=SZ] [--sweep] [--cache-path [--cache-sample SZ]] [--log FILE\|--no-log]` | storage self-test of the cache dir (or of candidate dirs, to pick one). Three groups: **standard** measures at pinned block sizes and queue depths 1/16/32, comparable to a datasheet; **pattern** measures at your job's concurrency — each serving tier's read shape, and random reads under writeback; and, with `--cache-path`, the same storage **through uCache's own fill and read code** rather than an imitation of it. Plus fsync, create/unlink. `--threads` is **required and never guessed** — it is what your analyses run at, not the core count. `--measurement-duration` is the window of ONE measurement (the build stage gets 3×; the plan and estimated total print up front). Appends every run, with the machine, load and block device behind the path, to `./ucache-bench.txt`. **Full guide: `docs/BENCH.md`** |
-| `ucache netbench <root://…> [--streams N,…] [--block KB] [--seconds S]` | origin random-read baseline at 1/16/64 streams: what the network side delivers, for a fair cache-vs-origin comparison |
+| `ucache bench --threads N [PATH …] [--size SZ] [--measurement-duration S] [--block KB] [--fill writers=N,block=SZ] [--sweep] [--cache-path [--cache-sample SZ]] [--log FILE\|--no-log]` | storage self-test of the cache dir (or of candidate dirs, to pick one). Three groups: **standard** measures at pinned block sizes and queue depths 1/16/32, comparable to a datasheet; **pattern** measures at your job's concurrency — each serving tier's read shape, and random reads under writeback; and, with `--cache-path`, the same storage **through uCache's own fill and read code** rather than an imitation of it. Plus fsync, create/unlink. `--threads` is **required and never guessed** — it is what your analyses run at, not the core count. `--measurement-duration` is the window of ONE measurement (the build stage gets 3×; the plan and estimated total print up front). Appends every run, with the machine, load and block device behind the path, to `./ucache-bench.txt`. `--publish` also sends the record — path and mount point replaced by salted hashes, hostname blanked — and prints the report URL (`docs/PUBLISH.md`). **Full guide: `docs/BENCH.md`** |
+| `ucache netbench <root://…> [--streams N,…] [--block KB] [--seconds S] [--publish]` | origin random-read baseline at 1/16/64 streams: what the network side delivers, for a fair cache-vs-origin comparison. `--publish` sends the record (hostname blanked, URL reduced to its domain) for a report |
+| `ucache publish [--label TEXT] [--dry-run] [--yes] [--url URL]` | send this cache's run history, its disk's benchmark records and this machine's origin measurements to the report service and print the report URL with its recommendations. **Paths, hostnames and file names never leave the machine** — `docs/PUBLISH.md` lists every field. `--dry-run` prints the exact payload instead; `--yes` for scripts (a non-terminal without it is refused). `bench --publish` and `netbench --publish` send one record the same way |
+| `ucache identity [--set STRING \| --new \| --path]` | the identity string that groups everything you publish under one owner page: an owner id plus a salt that never leaves the machine. Created by the first publish; `--set` installs it on another machine, `--new` starts over |
 | `ucache evict [--older-than DUR \| --newer-than DUR \| --to-size SIZE] [--dry-run]` | reclaim space: no flags = one pass to the configured budget; `--older-than 30d` drops entries unused that long; `--newer-than 1h` drops entries used within the window (undo a polluting run); `--to-size 20g` LRU-evicts down to a total size; `--dry-run` previews |
 | `ucache rm <url> [url…]` | remove specific entries (byte cache + replica) |
 | `ucache clear [--yes] [--keep-pinned]` | empty the whole cache (prompts unless `--yes`) |

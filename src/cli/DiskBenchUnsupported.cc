@@ -19,7 +19,10 @@
 
 namespace ucache {
 
-int runDiskBench(const std::vector<std::string>& /*paths*/, const DiskBenchOpts& /*opts*/) {
+std::string mountPointOf(const std::string& /*path*/) { return ""; }
+
+int runDiskBench(const std::vector<std::string>& /*paths*/, const DiskBenchOpts& /*opts*/,
+                 std::vector<std::string>* /*records*/) {
   std::fputs("bench: the storage self-test is not available on this platform.\n"
              "       It measures with O_DIRECT and reads per-device counters, which this\n"
              "       system does not provide; a substitute measurement would print the same\n"

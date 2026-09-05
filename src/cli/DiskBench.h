@@ -95,6 +95,15 @@ struct DiskBenchOpts {
 // removed). Prints the run plan, then a human table plus one
 // `ucache-bench-json: {...}` line per path, and a comparison table when more
 // than one path is given. Returns 0 if every path completed, 1 if any failed.
-int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opts);
+// `records`, when given, receives each path's JSON record (the object after the
+// `ucache-bench-json: ` prefix, one string per path, in path order) so the
+// caller can keep or publish it without re-parsing the terminal output.
+int runDiskBench(const std::vector<std::string>& paths, const DiskBenchOpts& opts,
+                 std::vector<std::string>* records = nullptr);
+
+// The mount point a directory lives on ("" when it cannot be resolved), from
+// the same lookup the benchmark records use. `publish` hashes it to link a
+// cache with the disk benchmarks taken on the same volume.
+std::string mountPointOf(const std::string& path);
 
 } // namespace ucache

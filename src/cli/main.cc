@@ -10,6 +10,7 @@
 #include "ReplicaStore.h"
 #include "RunLog.h"
 #include "DiskBench.h"
+#include "Publish.h"
 #include "UrlKey.h"
 #ifdef UCACHE_HAVE_TRANSPOSE
 #include "CacheSource.h"
@@ -24,6 +25,7 @@ namespace tp = ucache::transpose;
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -75,7 +77,7 @@ void usage() {
       "  status            cache location, budget, usage, and aggregated stats\n"
       "  bench [PATH ...] [--size SZ] [--measurement-duration S] [--threads N]\n"
       "                    [--block KB] [--fill k=v,...] [--cache-path]\n"
-      "                    [--cache-sample SZ] [--log FILE | --no-log]\n"
+      "                    [--cache-sample SZ] [--log FILE | --no-log] [--publish]\n"
       "                    measure a cache location's raw storage performance.\n"
       "                    STANDARD measurements use pinned block sizes and\n"
       "                    queue depths, so they compare to a datasheet or to\n"
@@ -92,9 +94,22 @@ void usage() {
       "                    comparison. Every run appends its numbers plus the\n"
       "                    machine, load and block device behind PATH to\n"
       "                    ./ucache-bench.txt\n"
-      "  netbench <root://url> [--streams 1,4,16] [--block KB] [--seconds S]\n"
+      "  netbench <root://url> [--streams 1,4,16] [--block KB] [--seconds S] [--publish]\n"
       "                    measure the ORIGIN's random-read rates from this\n"
       "                    machine — the numbers a cache location must beat\n"
+      "  publish [--label TEXT] [--dry-run] [--yes] [--url URL] [--runs N]\n"
+      "                    send this cache's run history, its disk's benchmark\n"
+      "                    records and this machine's origin measurements to the\n"
+      "                    report service; prints the report URL and its\n"
+      "                    recommendations. Paths, hostnames and file names never\n"
+      "                    leave the machine (docs/PUBLISH.md lists every field).\n"
+      "                    `bench --publish` / `netbench --publish` send one record\n"
+      "                    the same way; --dry-run prints the exact payload instead\n"
+      "  identity [--set STRING | --new | --path]\n"
+      "                    the identity that groups everything you publish under\n"
+      "                    one owner page: an owner id plus a salt that never leaves\n"
+      "                    this machine. Show it, install one from another machine,\n"
+      "                    or start over\n"
       "  ls [--sort age|size]  list cached entries (size, cached, coverage,\n"
       "                    last-used age, replica, pinned); default sort = size\n"
       "  stats [--reset | --files [--top N]]\n"
@@ -537,7 +552,132 @@ std::string selfExePath() {
 // helper — the origin-baseline companion of `bench`. A separate binary
 // because it needs XrdCl, which this CLI deliberately does not link (same
 // spawn pattern as the recompress drainer); exec keeps stdio and exit code.
-int cmdNetbench(int argc, char** argv) {
+// ---- publishing: the flags bench, netbench and publish share ----------------
+std::string ambientClientVersion(); // defined with doctor's probes, below
+
+struct PublishFlags {
+  bool publish = false, dryRun = false, yes = false, labelGiven = false;
+  std::string label, url;
+};
+
+// Recognises a publish flag at argv[i], consuming its value when it has one.
+// False when argv[i] is not one of ours; `bad` set when a value is missing.
+bool takePublishFlag(int argc, char** argv, int& i, PublishFlags& f, bool& bad) {
+  const std::string a = argv[i];
+  if (a == "--publish") {
+    f.publish = true;
+    return true;
+  }
+  if (a == "--dry-run") {
+    f.publish = f.dryRun = true;
+    return true;
+  }
+  if (a == "--yes" || a == "-y") {
+    f.yes = true;
+    return true;
+  }
+  if (a == "--label" || a.rfind("--label=", 0) == 0) {
+    const char* v = flagValue(argc, argv, i, 7);
+    if (!v) {
+      bad = true;
+      return true;
+    }
+    f.label = v;
+    f.labelGiven = true;
+    return true;
+  }
+  if (a == "--url" || a.rfind("--url=", 0) == 0) {
+    const char* v = flagValue(argc, argv, i, 5);
+    if (!v || !*v) {
+      bad = true;
+      return true;
+    }
+    f.url = v;
+    return true;
+  }
+  return false;
+}
+
+// The identity is created silently on the first publish, and said once: the
+// string is the key to the owner's pages and the only way to get a second
+// machine or a browser onto the same pages.
+void noteCreatedIdentity(bool created) {
+  if (!created)
+    return;
+  const auto id = loadIdentity();
+  if (!id)
+    return;
+  std::printf("\ncreated your identity at %s:\n  %s\n"
+              "  Paste it into `ucache identity --set <string>` on your other machines and\n"
+              "  into the report service's identity field, and everything you publish lands\n"
+              "  on one owner page. It contains the salt that protects your paths — keep it\n"
+              "  to yourself. `ucache identity` shows it again.\n\n",
+              identityPath().c_str(), id->text().c_str());
+}
+
+// The label for a disk or cache: the flag, the one remembered for this
+// location, or — interactively, once — a question. Empty means none.
+std::string diskLabel(const PublishFlags& f, const std::vector<StoredRecord>& store,
+                      const std::string& host, const std::string& path, const char* what) {
+  if (f.labelGiven)
+    return f.label.substr(0, 80);
+  if (std::string known = knownLabel(store, host, path); !known.empty())
+    return known;
+  if (f.yes || f.dryRun || !::isatty(STDIN_FILENO) || !::isatty(STDOUT_FILENO))
+    return "";
+  std::printf("A short label for this %s, shown on your pages instead of its path (optional;\n"
+              "no paths or hostnames, at most 80 characters; Enter for none): ",
+              what);
+  std::fflush(stdout);
+  char buf[160] = {0};
+  if (!std::fgets(buf, sizeof buf, stdin))
+    return "";
+  std::string s = buf;
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+    s.pop_back();
+  return s.substr(0, 80);
+}
+
+// Builds, shows, confirms and sends one payload, and records the outcome.
+// `kind` names the record type in the store's published mark.
+int publishPayload(const PayloadParts& parts, const PublishFlags& f, const char* kind) {
+  const Json payload = buildPayload(parts);
+  const std::string url = serviceUrl(f.url);
+  if (f.dryRun) {
+    std::printf("dry run — this is what would be sent to %s/v1/publish, with every identifier\n"
+                "replaced by a placeholder (they are keys to your pages):\n",
+                url.c_str());
+    std::puts(withPlaceholderIds(payload).dump(2).c_str());
+    return 0;
+  }
+  const std::string summary = "Publishing to " + url + ":\n" + describePayload(payload);
+  if (!confirmPublish(summary, f.yes))
+    return 1;
+  PublishOutcome out;
+  const int rc = sendPayload(payload, url, out);
+  printOutcome(out);
+  if (rc == 0 && !out.reportUrl.empty())
+    markPublished(kind, out.reportUrl);
+  return rc;
+}
+
+// `ucache netbench`: runs the XrdCl-linked helper through a pipe, relaying its
+// output as it comes and keeping the record line it prints. The record goes
+// to the per-user store either way; with --publish it also goes to the service.
+int cmdNetbench(const Config& cfg, int argc, char** argv) {
+  PublishFlags pf;
+  bool bad = false;
+  std::vector<char*> pass;
+  for (int i = 2; i < argc; ++i) {
+    if (takePublishFlag(argc, argv, i, pf, bad)) {
+      if (bad) {
+        std::fputs("netbench: --label and --url need a value\n", stderr);
+        return 2;
+      }
+      continue;
+    }
+    pass.push_back(argv[i]);
+  }
   std::vector<std::string> cands;
   if (const char* v = ::getenv("UCACHE_NETBENCH"))
     cands.push_back(v);
@@ -547,24 +687,102 @@ int cmdNetbench(int argc, char** argv) {
     cands.push_back(bindir + "/ucache-netbench");          // install tree (bin/)
     cands.push_back(bindir + "/../plugin/ucache-netbench"); // build tree
   }
+  std::string helper;
   struct ::stat st;
   for (const auto& c : cands)
     if (::stat(c.c_str(), &st) == 0) {
-      std::vector<char*> args;
-      args.push_back(const_cast<char*>(c.c_str()));
-      for (int i = 2; i < argc; ++i)
-        args.push_back(argv[i]);
-      args.push_back(nullptr);
-      ::execv(c.c_str(), args.data());
-      std::fprintf(stderr, "netbench: exec %s failed: %s\n", c.c_str(),
-                   std::strerror(errno));
-      return 1;
+      helper = c;
+      break;
     }
-  std::fputs("netbench: ucache-netbench helper not found — it ships next to the\n"
-             "plugin and needs an XrdCl installation (see USER_GUIDE §1); on a\n"
-             "machine without xrootd only the disk-side `ucache bench` runs\n",
-             stderr);
-  return 2;
+  if (helper.empty()) {
+    std::fputs("netbench: ucache-netbench helper not found — it ships next to the\n"
+               "plugin and needs an XrdCl installation (see USER_GUIDE §1); on a\n"
+               "machine without xrootd only the disk-side `ucache bench` runs\n",
+               stderr);
+    return 2;
+  }
+  int fds[2];
+  if (::pipe(fds) != 0) {
+    std::fprintf(stderr, "netbench: pipe: %s\n", std::strerror(errno));
+    return 1;
+  }
+  std::fflush(stdout);
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    std::fprintf(stderr, "netbench: fork: %s\n", std::strerror(errno));
+    return 1;
+  }
+  if (pid == 0) {
+    ::dup2(fds[1], STDOUT_FILENO);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    std::vector<char*> args;
+    args.push_back(const_cast<char*>(helper.c_str()));
+    for (char* a : pass)
+      args.push_back(a);
+    args.push_back(nullptr);
+    ::execv(helper.c_str(), args.data());
+    std::fprintf(stderr, "netbench: exec %s failed: %s\n", helper.c_str(), std::strerror(errno));
+    ::_exit(127);
+  }
+  ::close(fds[1]);
+  static const std::string prefix = "ucache-netbench-json: ";
+  std::string pending, record;
+  char chunk[4096];
+  for (;;) {
+    const ssize_t n = ::read(fds[0], chunk, sizeof chunk);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      break;
+    pending.append(chunk, static_cast<size_t>(n));
+    size_t nl;
+    while ((nl = pending.find('\n')) != std::string::npos) {
+      const std::string line = pending.substr(0, nl + 1);
+      pending.erase(0, nl + 1);
+      std::fputs(line.c_str(), stdout);
+      std::fflush(stdout);
+      if (line.compare(0, prefix.size(), prefix) == 0) {
+        record = line.substr(prefix.size());
+        while (!record.empty() && (record.back() == '\n' || record.back() == '\r'))
+          record.pop_back();
+      }
+    }
+  }
+  if (!pending.empty())
+    std::fputs(pending.c_str(), stdout);
+  ::close(fds[0]);
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  const int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+  if (record.empty())
+    return rc;
+  std::string err;
+  if (appendRecordLine(prefix + record, &err))
+    std::fprintf(stderr, "netbench: could not keep the record in %s (%s)\n", recordsPath().c_str(),
+                 err.c_str());
+  if (!pf.publish)
+    return rc;
+  Json raw;
+  if (!Json::parse(record, raw) || !raw.isObject()) {
+    std::fputs("netbench: the record line did not parse; nothing published\n", stderr);
+    return rc ? rc : 1;
+  }
+  bool created = false;
+  auto identity = ensureIdentity(!pf.dryRun, &created);
+  noteCreatedIdentity(created);
+  if (!identity && pf.dryRun)
+    identity = newIdentity(); // shape only; the dry run prints placeholders
+  PayloadParts parts;
+  parts.identity = identity;
+  parts.ucacheVersion = UCACHE_VERSION;
+  if (raw.str("mode") == "through-cache" && !cfg.cacheDir.empty())
+    parts.installId = installId(cfg.cacheDir, !pf.dryRun);
+  parts.machine = machineBlock(identity ? &*identity : nullptr, ambientClientVersion(), UCACHE_VERSION);
+  parts.netbench.push_back(redactNetbench(raw));
+  const int prc = publishPayload(parts, pf, "netbench");
+  return rc ? rc : prc;
 }
 
 // `ucache bench`: raw storage numbers for the cache dir or any
@@ -572,7 +790,28 @@ int cmdNetbench(int argc, char** argv) {
 int cmdBench(const Config& cfg, int argc, char** argv) {
   DiskBenchOpts opts;
   std::vector<std::string> paths;
+  // The publish flags are not part of the measurement, so they stay out of the
+  // recorded command line (which is what makes two runs comparable) and out of
+  // the option parsing below.
+  PublishFlags pf;
+  std::set<int> publishArgs;
+  {
+    bool bad = false;
+    for (int i = 2; i < argc; ++i) {
+      const int before = i;
+      if (takePublishFlag(argc, argv, i, pf, bad)) {
+        if (bad) {
+          std::fputs("bench: --label and --url need a value\n", stderr);
+          return 2;
+        }
+        for (int k = before; k <= i; ++k)
+          publishArgs.insert(k);
+      }
+    }
+  }
   for (int i = 1; i < argc; ++i) { // argv[0] is the program: record the rest
+    if (publishArgs.count(i))
+      continue;
     if (!opts.cmdline.empty())
       opts.cmdline += ' ';
     else
@@ -580,6 +819,8 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
     opts.cmdline += argv[i];
   }
   for (int i = 2; i < argc; ++i) {
+    if (publishArgs.count(i))
+      continue;
     std::string a = argv[i];
     if (a == "--size" || a.rfind("--size=", 0) == 0) {
       const char* v = flagValue(argc, argv, i, 6);
@@ -719,7 +960,59 @@ int cmdBench(const Config& cfg, int argc, char** argv) {
                stderr);
     return 2;
   }
-  return runDiskBench(paths, opts);
+  std::vector<std::string> records;
+  const int rc = runDiskBench(paths, opts, &records);
+  if (records.empty())
+    return rc;
+  // Every record is kept locally whatever happens next: a later `ucache
+  // publish` sends a cache's disk measurements from here.
+  std::string err;
+  for (const auto& rec : records)
+    if (appendRecordLine("ucache-bench-json: " + rec, &err)) {
+      std::fprintf(stderr, "bench: could not keep the record in %s (%s)\n", recordsPath().c_str(),
+                   err.c_str());
+      break;
+    }
+  bool created = false;
+  auto identity = ensureIdentity(/*create=*/pf.publish && !pf.dryRun, &created);
+  noteCreatedIdentity(created);
+  const bool realIdentity = identity.has_value();
+  if (!identity && pf.dryRun)
+    identity = newIdentity(); // shape only; the dry run prints placeholders
+  const std::vector<StoredRecord> store = pf.publish ? loadRecords() : std::vector<StoredRecord>{};
+  const std::string client = pf.publish ? ambientClientVersion() : std::string();
+  int worst = rc;
+  for (const auto& text : records) {
+    Json raw;
+    if (!Json::parse(text, raw) || !raw.isObject())
+      continue;
+    const std::string host = raw.str("host"), path = raw.str("path");
+    const std::string inst = installId(path, /*create=*/false); // a cache dir already has one
+    const Json redacted = redactBench(raw, identity ? &*identity : nullptr, inst);
+    // The same record with nothing that names a place: safe to paste anywhere.
+    if (realIdentity)
+      std::printf("ucache-bench-public: %s\n", redacted.dump().c_str());
+    if (!pf.publish || !raw.str("error").empty())
+      continue;
+    PayloadParts parts;
+    parts.identity = identity;
+    parts.ucacheVersion = UCACHE_VERSION;
+    parts.installId = inst;
+    parts.label = diskLabel(pf, store, host, path, "disk");
+    if (!parts.label.empty() && parts.label != knownLabel(store, host, path))
+      rememberLabel(host, path, parts.label);
+    parts.machine = machineBlock(identity ? &*identity : nullptr, client, UCACHE_VERSION);
+    parts.bench.push_back(redacted);
+    const int prc = publishPayload(parts, pf, "bench");
+    if (prc && !worst)
+      worst = prc;
+  }
+  if (!pf.publish)
+    std::printf("\nFor a report with recommendations, re-run with --publish, or run `ucache publish`\n"
+                "later from a cache on this volume. Paths, hostnames and file names never leave\n"
+                "the machine (docs/PUBLISH.md lists every field sent). Records: %s\n",
+                recordsPath().c_str());
+  return worst;
 }
 
 // A promise of disk space that has not been written yet, released however the
@@ -973,6 +1266,117 @@ const char* runKind(const Run& r) {
   return "idle";
 }
 
+void putf(std::string& s, const char* f, ...) __attribute__((format(printf, 2, 3)));
+void putf(std::string& s, const char* f, ...) {
+  va_list ap;
+  va_start(ap, f);
+  char buf[4096];
+  const int n = std::vsnprintf(buf, sizeof buf, f, ap);
+  va_end(ap);
+  if (n < 0)
+    return;
+  if (static_cast<size_t>(n) < sizeof buf) {
+    s.append(buf, static_cast<size_t>(n));
+    return;
+  }
+  std::string big(static_cast<size_t>(n) + 1, '\0');
+  va_start(ap, f);
+  std::vsnprintf(big.data(), big.size(), f, ap);
+  va_end(ap);
+  big.resize(static_cast<size_t>(n));
+  s += big;
+}
+
+// `history --json` and the history `publish` sends are ONE emitter: the report
+// service reads the keys this command prints, and a second copy would drift.
+// `redacted` drops the process id, blanks the host, reduces the start time to
+// a date and adds the origin domains the run read from (derived from per-file
+// records that never leave); `oldestFirst` reverses the window, which is how
+// the service charts it. `shown` is the newest-N window either way.
+std::string historyJson(const std::vector<Run>& runs, size_t shown, bool redacted, bool oldestFirst) {
+  std::string s;
+  const Totals t = summarize(runs);
+  putf(s,
+       "{\"schema\":1,\"totals\":{\"runs\":%zu,\"runs_estimated\":%zu,\"distinct_files\":%zu,"
+       "\"duration_s\":%llu,\"cache_bytes\":%llu,\"origin_bytes\":%llu,"
+       "\"relay_bytes\":%llu,\"faults\":%llu,\"saved_s\":%.1f,\"gain\":",
+       t.runs, t.runsEstimated, t.distinctFiles, (unsigned long long)t.durationS,
+       (unsigned long long)t.cacheBytes(), (unsigned long long)t.originBytes,
+       (unsigned long long)t.relayBytes, (unsigned long long)t.faults, t.savedS);
+  if (t.haveGain)
+    putf(s, "%.3f},\"runs\":[", t.gain);
+  else
+    s += "null},\"runs\":[";
+  shown = std::min(shown, runs.size());
+  for (size_t n = 0; n < shown; ++n) {
+    const Run& r = runs[oldestFirst ? shown - 1 - n : n];
+    const GainEstimate g = estimateGain(r, runs);
+    if (n)
+      s += ',';
+    if (redacted)
+      putf(s, "{\"start\":\"%s\",\"duration_s\":%llu,\"host\":\"\",", dateOnlyUtc(r.startS).c_str(),
+           (unsigned long long)r.durationS());
+    else
+      putf(s, "{\"start\":%llu,\"duration_s\":%llu,\"host\":\"%s\",\"pid\":%llu,",
+           (unsigned long long)r.startS, (unsigned long long)r.durationS(), r.host.c_str(),
+           (unsigned long long)r.pid);
+    putf(s,
+         "\"kind\":\"%s\",\"files\":%llu,\"served_bytes\":%llu,"
+         "\"origin_bytes\":%llu,\"hit_bytes\":%llu,\"replica_bytes\":%llu,"
+         "\"relay_bytes\":%llu,\"faults\":%llu,\"sig\":\"%s\","
+         "\"threads\":%llu,\"cpu_us\":%llu,\"instructions\":%llu,"
+         "\"cycles\":%llu,\"read_sig\":\"%s\","
+         // The two columns the table shows and this did not: a scripted
+         // reader was told it gets the same figures.
+         "\"peak_cores\":%llu,\"origin_reads_in_flight_high_water\":%llu,"
+         // `overhead` is the live measure a fill is judged by; `fill_cost`
+         // beside it is superseded and kept only so a consumer that reads it
+         // does not lose the key.
+         "\"origin_share\":%.3f,\"fill_cost\":%.4f,"
+         "\"overhead\":%.4f,\"overhead_known\":%s,\"gain\":",
+         runKind(r), (unsigned long long)r.files.size(), (unsigned long long)r.servedBytes,
+         (unsigned long long)r.originBytes, (unsigned long long)r.hitBytes,
+         (unsigned long long)r.replicaBytesServed, (unsigned long long)r.relayBytes,
+         (unsigned long long)r.faults(), r.sig.c_str(), (unsigned long long)r.threadsHighWater,
+         (unsigned long long)r.cpuUs, (unsigned long long)r.instructions,
+         (unsigned long long)r.cycles, r.readSig.c_str(), (unsigned long long)r.peakCores,
+         (unsigned long long)r.originReadsInFlight, r.originShare(), r.fillCost(), r.overhead(),
+         r.overheadKnown() ? "true" : "false");
+    if (g.valid)
+      // Not a literal: "baseline" told a scripted reader every reference was
+      // an explicit no-cache run, when the whole point of the inference is
+      // that most will be qualifying fills. compared_files is the denominator
+      // the coverage rule uses; matched_files is the plain intersection.
+      putf(s,
+           "%.3f,\"gain_source\":\"%s\",\"work_verified\":%s,"
+           "\"checked_files\":%llu,\"compared_files\":%llu,\"matched_files\":%llu",
+           g.gain, g.referenceDisabled ? "disabled" : "fill", g.workVerified ? "true" : "false",
+           (unsigned long long)g.sigPairs, (unsigned long long)g.comparedFiles,
+           (unsigned long long)g.matchedFiles);
+    else
+      s += "null,\"gain_source\":null";
+    if (redacted) {
+      std::set<std::string> domains;
+      for (const auto& [host, count] : r.originHosts) {
+        (void)count;
+        domains.insert("root://" + registrableDomain(host));
+      }
+      s += ",\"origins\":[";
+      bool first = true;
+      for (const auto& d : domains) {
+        if (!first)
+          s += ',';
+        first = false;
+        s += '"' + jsonEscape(d) + '"';
+      }
+      s += ']';
+    }
+    s += '}';
+  }
+  s += "]}";
+  return s;
+}
+
 int cmdHistory(const Config& cfg, int argc, char** argv) {
   size_t top = 20;
   bool asJson = false;
@@ -987,18 +1391,19 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     }
   }
   const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
+  if (asJson) {
+    std::puts(historyJson(runs, top, /*redacted=*/false, /*oldestFirst=*/false).c_str());
+    return 0;
+  }
   if (runs.empty()) {
-    if (asJson)
-      std::puts("{\"runs\":[]}");
-    else
-      std::puts("no runs recorded yet — records appear when a job that used the "
-                "cache exits. Anything shorter than ten seconds is left out: the "
-                "store writes a line whenever it closes, so `ucache` invocations "
-                "leave one-second entries that are not runs");
+    std::puts("no runs recorded yet — records appear when a job that used the "
+              "cache exits. Anything shorter than ten seconds is left out: the "
+              "store writes a line whenever it closes, so `ucache` invocations "
+              "leave one-second entries that are not runs");
     return 0;
   }
   const size_t shown = std::min(top, runs.size());
-  if (!asJson) {
+  {
     std::printf("%zu run(s) recorded, newest first (showing %zu)\n", runs.size(), shown);
     // CPU/WR are mean CORES, not a share: the denominator a share would need
     // is the job's own width, which is invisible from here (an --ncores 8
@@ -1038,18 +1443,7 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
   auto pct = [](uint64_t part, uint64_t whole) {
     return whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
   };
-  if (asJson) {
-    std::printf("{\"totals\":{\"runs\":%zu,\"runs_estimated\":%zu,\"distinct_files\":%zu,"
-                "\"duration_s\":%llu,\"cache_bytes\":%llu,\"origin_bytes\":%llu,"
-                "\"relay_bytes\":%llu,\"faults\":%llu,\"saved_s\":%.1f,\"gain\":",
-                t.runs, t.runsEstimated, t.distinctFiles, (unsigned long long)t.durationS,
-                (unsigned long long)t.cacheBytes(), (unsigned long long)t.originBytes,
-                (unsigned long long)t.relayBytes, (unsigned long long)t.faults, t.savedS);
-    if (t.haveGain)
-      std::printf("%.3f},\"runs\":[", t.gain);
-    else
-      std::printf("null},\"runs\":[");
-  } else {
+  {
     // Two header rows: the name, then its unit underneath. Units in the name
     // row cost width where it is scarcest and put a "/" over columns of
     // digits, which reads as a column that failed to line up.
@@ -1087,56 +1481,6 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
     const Run& r = runs[i];
     const uint64_t total = r.hitBytes + r.replicaBytesServed + r.relayBytes;
     const GainEstimate g = estimateGain(r, runs);
-    if (asJson) {
-      std::printf("%s{\"start\":%llu,\"duration_s\":%llu,\"host\":\"%s\",\"pid\":%llu,"
-                  "\"kind\":\"%s\",\"files\":%llu,\"served_bytes\":%llu,"
-                  "\"origin_bytes\":%llu,\"hit_bytes\":%llu,\"replica_bytes\":%llu,"
-                  "\"relay_bytes\":%llu,\"faults\":%llu,\"sig\":\"%s\","
-                  "\"threads\":%llu,\"cpu_us\":%llu,\"instructions\":%llu,"
-                  "\"cycles\":%llu,\"read_sig\":\"%s\","
-                  // The two columns the table shows and this did not: a
-                  // scripted reader was told it gets the same figures.
-                  "\"peak_cores\":%llu,\"origin_reads_in_flight_high_water\":%llu,"
-                  // `overhead` is the live measure a fill is judged by;
-                  // `fill_cost` beside it is superseded and kept only so a
-                  // consumer that reads it does not lose the key. Publishing
-                  // the dead one and withholding the live one is backwards.
-                  "\"origin_share\":%.3f,\"fill_cost\":%.4f,"
-                  "\"overhead\":%.4f,\"overhead_known\":%s,\"gain\":",
-                  i ? "," : "", (unsigned long long)r.startS,
-                  (unsigned long long)r.durationS(), r.host.c_str(),
-                  (unsigned long long)r.pid, runKind(r),
-                  (unsigned long long)r.files.size(), (unsigned long long)r.servedBytes,
-                  (unsigned long long)r.originBytes, (unsigned long long)r.hitBytes,
-                  (unsigned long long)r.replicaBytesServed,
-                  (unsigned long long)r.relayBytes, (unsigned long long)r.faults(),
-                  r.sig.c_str(), (unsigned long long)r.threadsHighWater,
-                  (unsigned long long)r.cpuUs, (unsigned long long)r.instructions,
-                  (unsigned long long)r.cycles, r.readSig.c_str(),
-                  (unsigned long long)r.peakCores,
-                  (unsigned long long)r.originReadsInFlight, r.originShare(),
-                  r.fillCost(), r.overhead(), r.overheadKnown() ? "true" : "false");
-      if (g.valid)
-        // Not a literal: "baseline" told a scripted reader every reference
-        // was an explicit no-cache run, when the whole point of the inference
-        // is that most will be qualifying fills.
-        std::printf("%.3f,\"gain_source\":\"%s\",\"work_verified\":%s,"
-                    // compared_files is the denominator the coverage rule uses;
-                    // matched_files is the plain intersection and is the larger
-                    // of the two. Publishing only the latter let a reader divide
-                    // checked by matched and conclude the check was weaker than
-                    // it was. Both are here so neither reading is a guess.
-                    "\"checked_files\":%llu,\"compared_files\":%llu,"
-                    "\"matched_files\":%llu}",
-                    g.gain, g.referenceDisabled ? "disabled" : "fill",
-                    g.workVerified ? "true" : "false",
-                    (unsigned long long)g.sigPairs,
-                    (unsigned long long)g.comparedFiles,
-                    (unsigned long long)g.matchedFiles);
-      else
-        std::printf("null,\"gain_source\":null}");
-      continue;
-    }
     // GAIN carries three things and no more: a measured number, `base` for a
     // run that IS the reference, or `-`. Why a run has no number belongs in
     // --detail, not in a column a reader scans.
@@ -1219,11 +1563,168 @@ int cmdHistory(const Config& cfg, int argc, char** argv) {
   if (!asJson && t.gainCapped)
     std::printf("%zu older run(s) not included in the gain — too many to estimate\n",
                 t.gainCapped);
-  if (asJson)
-    std::puts("]}");
-  else if (runs.size() > shown)
+  if (runs.size() > shown)
     std::printf("(%zu older run(s) not shown — `--top %zu` for more)\n", runs.size() - shown,
                 runs.size());
+  return 0;
+}
+
+// `ucache publish`: this cache's history, its disk's benchmark records (by
+// location, then by volume), this machine's origin measurements, and the
+// machine block — redacted here, confirmed, sent, and the report URL printed.
+int cmdPublish(const Config& cfg, int argc, char** argv) {
+  PublishFlags pf;
+  pf.publish = true;
+  bool bad = false;
+  size_t window = 200; // runs sent, newest first; the service dedups
+  for (int i = 2; i < argc; ++i) {
+    if (takePublishFlag(argc, argv, i, pf, bad)) {
+      if (bad) {
+        std::fputs("publish: --label and --url need a value\n", stderr);
+        return 2;
+      }
+      continue;
+    }
+    if (!std::strcmp(argv[i], "--runs") && i + 1 < argc) {
+      window = static_cast<size_t>(std::max(1, ::atoi(argv[++i])));
+      continue;
+    }
+    std::fprintf(stderr, "publish: unknown argument %s\n", argv[i]);
+    return 2;
+  }
+  char rbuf[4096];
+  const std::string cacheDir =
+      ::realpath(cfg.cacheDir.c_str(), rbuf) ? std::string(rbuf) : cfg.cacheDir;
+  struct ::stat st;
+  if (::stat(cacheDir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+    std::fprintf(stderr, "publish: cache dir %s does not exist — nothing to publish yet\n",
+                 cfg.cacheDir.c_str());
+    return 2;
+  }
+  bool created = false;
+  auto identity = ensureIdentity(!pf.dryRun, &created);
+  noteCreatedIdentity(created);
+  if (!identity && pf.dryRun)
+    identity = newIdentity(); // shape only; the dry run prints placeholders
+  const std::string host = hostName();
+  const std::string mount = mountPointOf(cacheDir);
+
+  PayloadParts parts;
+  parts.identity = identity;
+  parts.ucacheVersion = UCACHE_VERSION;
+  parts.installId = installId(cacheDir, !pf.dryRun);
+  if (parts.installId.empty()) // only a dry run gets here without one
+    parts.installId = "00000000-0000-4000-8000-000000000001";
+  if (identity && !host.empty()) {
+    parts.location = locationHash(identity->salt, host, cacheDir);
+    if (!mount.empty())
+      parts.volume = volumeHash(identity->salt, host, mount);
+  }
+  // History: the newest runs, emitted oldest first, with the origins each run
+  // read from reduced to domains. The per-file records stay here.
+  const auto runs = withoutTrivial(loadRuns(cfg.cacheDir + "/stats", cfg.cacheDir + "/stats/history"));
+  if (!runs.empty()) {
+    Json h;
+    if (Json::parse(historyJson(runs, window, /*redacted=*/true, /*oldestFirst=*/true), h))
+      parts.history = h;
+  }
+  // This disk's benchmark records, then any on the same volume; this machine's
+  // origin measurements. All from the per-user store, all redacted here.
+  const auto store = loadRecords();
+  for (const auto& r : store) {
+    if (lowerTrim(r.body.str("host")) != lowerTrim(host))
+      continue;
+    if (r.kind == "bench") {
+      if (!r.body.str("error").empty())
+        continue;
+      const bool sameDisk = normPath(r.body.str("path")) == normPath(cacheDir);
+      const bool sameVolume = !mount.empty() && normPath(r.body.str("mount")) == normPath(mount);
+      if (!sameDisk && !sameVolume)
+        continue;
+      parts.bench.push_back(
+          redactBench(r.body, identity ? &*identity : nullptr, sameDisk ? parts.installId : ""));
+    } else if (r.kind == "netbench") {
+      parts.netbench.push_back(redactNetbench(r.body));
+    }
+  }
+  if (!parts.history.isObject() && parts.bench.empty() && parts.netbench.empty()) {
+    std::fputs("publish: nothing to send yet — no run has been recorded for this cache, and no\n"
+               "         `ucache bench` or `ucache netbench` record from this machine matches it.\n"
+               "         Run a job through the cache, or `ucache bench --threads N <cache dir>`.\n",
+               stderr);
+    return 1;
+  }
+  parts.label = diskLabel(pf, store, host, cacheDir, "cache");
+  if (!parts.label.empty() && parts.label != knownLabel(store, host, cacheDir))
+    rememberLabel(host, cacheDir, parts.label);
+  parts.machine =
+      machineBlock(identity ? &*identity : nullptr, ambientClientVersion(), UCACHE_VERSION);
+  return publishPayload(parts, pf, "publish");
+}
+
+// `ucache identity`: show, install or regenerate the string that groups
+// everything a person publishes. Nothing here talks to the service.
+int cmdIdentity(int argc, char** argv) {
+  std::string setTo;
+  bool makeNew = false, showPath = false;
+  for (int i = 2; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--set" && i + 1 < argc)
+      setTo = argv[++i];
+    else if (a.rfind("--set=", 0) == 0)
+      setTo = a.substr(6);
+    else if (a == "--new")
+      makeNew = true;
+    else if (a == "--path")
+      showPath = true;
+    else {
+      std::fprintf(stderr, "identity: unknown argument %s\n", a.c_str());
+      return 2;
+    }
+  }
+  if (showPath) {
+    std::puts(identityPath().c_str());
+    return 0;
+  }
+  std::string err;
+  auto current = loadIdentity(&err);
+  if (!setTo.empty() || makeNew) {
+    Identity next;
+    if (makeNew) {
+      next = newIdentity();
+    } else if (!parseIdentity(setTo, next)) {
+      std::fputs("identity: not an identity string — expected ucache-id:<owner-uuid>:<32 hex>\n",
+                 stderr);
+      return 2;
+    }
+    if (current && current->text() != next.text())
+      std::printf("replacing the previous identity. Keep this string if you still want the pages\n"
+                  "it published under, or merge the two owners on either owner page:\n  %s\n",
+                  current->text().c_str());
+    if (int rc = saveIdentity(next, &err); rc) {
+      std::fprintf(stderr, "identity: could not write %s: %s\n", identityPath().c_str(), err.c_str());
+      return 1;
+    }
+    std::printf("identity %s at %s\n", makeNew ? "created" : "installed", identityPath().c_str());
+    current = next;
+    err.clear();
+  }
+  if (!current) {
+    if (!err.empty()) {
+      std::fprintf(stderr, "identity: %s is unreadable: %s\n", identityPath().c_str(), err.c_str());
+      return 2;
+    }
+    std::printf("no identity yet — the first `ucache publish` or `bench --publish` creates one,\n"
+                "or `ucache identity --new` does now\n  file: %s\n",
+                identityPath().c_str());
+    return 1;
+  }
+  std::printf("%s\n  file: %s\n"
+              "  This string is the key to your published pages: paste it into\n"
+              "  `ucache identity --set <string>` on your other machines and into the report\n"
+              "  service's identity field, and everything lands on one owner page. It\n"
+              "  contains the salt that protects your paths — do not post it anywhere public.\n",
+              current->text().c_str(), identityPath().c_str());
   return 0;
 }
 
@@ -1560,6 +2061,8 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
     std::printf("gain       : not measured — %s\n", gain.reason.c_str());
   }
   std::puts("next       : `ucache history` for the trend across runs");
+  std::puts("publish    : `ucache publish` — a report with recommendations from this history;\n"
+            "             paths, hostnames and file names never leave the machine (docs/PUBLISH.md)");
   return 0;
 }
 
@@ -3877,6 +4380,8 @@ int main(int argc, char** argv) {
     return cmdEnableDisable(false);
   if (cmd == "doctor")
     return cmdDoctor(cfg);
+  if (cmd == "identity") // a file in the user's config dir; no cache involved
+    return cmdIdentity(argc, argv);
   // Settings model — none of these need (or may create) a store.
   if (cmd == "settings")
     return cmdSettings(cfg);
@@ -3899,7 +4404,7 @@ int main(int argc, char** argv) {
   if (cmd == "bench")
     return cmdBench(cfg, argc, argv);
   if (cmd == "netbench")
-    return cmdNetbench(argc, argv);
+    return cmdNetbench(cfg, argc, argv);
   // materialize's pure builder mode (--from-file + --overlay-out) is a
   // file->file transform: no cache touched, no cache dir required or created.
   if (cmd == "materialize") {
@@ -3998,6 +4503,8 @@ int main(int argc, char** argv) {
   }
   if (cmd == "history") // pure file reads, no store
     return cmdHistory(cfg, argc, argv);
+  if (cmd == "publish") // pure file reads plus the network; no store
+    return cmdPublish(cfg, argc, argv);
 
   CacheStore store(io, cfg);
   store.disableStatsDump(); // a CLI run must not litter stats/

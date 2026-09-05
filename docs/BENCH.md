@@ -112,6 +112,20 @@ worth knowing:
   itself into that record. Pass `--no-log` for anything you do not want kept.
 - appended blocks are **newest last**.
 
+The JSON record is also kept, independently of the log, in the per-user store
+`~/.local/share/ucache/records.jsonl`, so that a later `ucache publish` can send
+a cache's disk measurements together with its history. The `path` in the record
+is the directory's resolved absolute path (a relative argument would identify
+nothing once the run is over).
+
+With `--publish` the run also sends the record to the report service and prints
+the report URL; the path and mount point are replaced by salted hashes and the
+hostname blanked before anything goes out — `docs/PUBLISH.md` lists every field.
+Once an identity exists, every run additionally prints that redacted form as a
+`ucache-bench-public:` line, which is safe to paste anywhere; the
+`ucache-bench-json:` line above it carries the path and hostname and is for your
+own log.
+
 Exit status is 0 when every path succeeded, 1 if any measurement failed, 2 for a
 bad argument.
 
