@@ -12,9 +12,9 @@ run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
 ## v1.1.0 — 2026-09-07
-- Added ucache publish: submit benchmark records and run history for
+- Added `ucache publish`: submit benchmark records and run history for
   analysis and recommendations; data is anonymized.
-- Added ucache identity: view or set the identity used to link
+- Added `ucache identity`: view or set the identity used to link
   published records across machines and browsers.
 - Added announce: uCache identifies itself to XRootD servers so sites can see
   traffic that comes through a cache; on by default, off with announce = off.
