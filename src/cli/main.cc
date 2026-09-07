@@ -597,6 +597,15 @@ bool takePublishFlag(int argc, char** argv, int& i, PublishFlags& f, std::string
       bad = "--url needs a value";
       return true;
     }
+    // `--url --dry-run` used to consume the flag as the address and then try
+    // to SEND to it — the one flag whose whole purpose is not to send. A
+    // value is a service address or it is a mistake, and requiring the scheme
+    // also keeps a `-`-leading value from reaching curl as an option.
+    const std::string url = v;
+    if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) {
+      bad = "--url needs an http:// or https:// address (got '" + url + "')";
+      return true;
+    }
     f.url = v;
     return true;
   }
@@ -637,6 +646,13 @@ std::string diskLabel(const PublishFlags& f, const std::vector<StoredRecord>& st
   char buf[160] = {0};
   if (!std::fgets(buf, sizeof buf, stdin))
     return "";
+  if (!std::strchr(buf, '\n')) {
+    // A longer line than the buffer: discard its tail rather than leave it in
+    // the stream, where the next prompt would read it as its own answer.
+    int c;
+    while ((c = std::fgetc(stdin)) != '\n' && c != EOF) {
+    }
+  }
   std::string s = buf;
   while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
     s.pop_back();
@@ -1611,8 +1627,22 @@ int cmdPublish(const Config& cfg, int argc, char** argv) {
       }
       continue;
     }
-    if (!std::strcmp(argv[i], "--runs") && i + 1 < argc) {
-      window = static_cast<size_t>(std::max(1, ::atoi(argv[++i])));
+    if (!std::strcmp(argv[i], "--runs") || !std::strncmp(argv[i], "--runs=", 7)) {
+      // Hand-parsed with atoi before, which made `--runs --yes` eat the
+      // confirmation and then refuse for want of it, `--runs abc` mean one
+      // run, and `--runs=50` an unknown argument.
+      const char* v = flagValue(argc, argv, i, 6);
+      if (!v || !*v) {
+        std::fprintf(stderr, "publish: --runs needs a value\n");
+        return 2;
+      }
+      char* end = nullptr;
+      const long n = std::strtol(v, &end, 10);
+      if (*end != '\0' || n < 1) {
+        std::fprintf(stderr, "publish: --runs needs a positive whole number (got '%s')\n", v);
+        return 2;
+      }
+      window = static_cast<size_t>(n);
       continue;
     }
     std::fprintf(stderr, "publish: unknown argument %s\n", argv[i]);

@@ -37,7 +37,7 @@ backstop, not the mechanism.
 | | `host` | the hostname | blank; the machine block carries a salted hash instead |
 | | `path` | the benchmarked directory | **not sent** — `location`, a salted hash of hostname + path, replaces it |
 | | `mount`, `mount_source`, `mount_opts`, `mount_super_opts` | the mount point, `server:/export` on NFS or a volume name on LVM, the options | **not sent**; `volume`, a salted hash of hostname + mount point, replaces the mount point |
-| | `dev_name`, `dev_model`, `dev_rotational`, `dev_sched`, `dev_size_gb`, `dev` | the block device (`sdb1`, `nvme0n1p1`, `rbd0`), its model, SSD or HDD, scheduler, size, major:minor | as measured: hardware, not a place |
+| | `dev_name`, `dev_model`, `dev_rotational`, `dev_sched`, `dev_size_gb`, `dev` | the block device (`sdb1`, `nvme0n1p1`, `rbd0`), its model, SSD or HDD, scheduler, size, major:minor | as measured: hardware, not a place. `dev_model` is the model the drive reports and is empty for a logical volume — an LVM or LUKS name is **not** sent, because an installer sets it to `<distro>_<hostname>` and that is a place |
 | | `mount_fstype`, `fs` | the filesystem type | as measured |
 | | `cmd` | the command line | kept, normalized: the executable becomes `ucache`, `--log` and its value are removed, every path becomes `<path>`. The parameters stay because they are what makes two runs comparable |
 | | `kernel`, `arch`, `ncpu`, `mem_gb`, `cpu_model`, `version`, `time` | machine facts, tool version, when | as recorded |
@@ -51,7 +51,8 @@ backstop, not the mechanism.
 | machine block | `os`, `os_release`, `arch`, `kernel`, `cpu_model`, `ncpu`, `mem_gb`, `xrootd_client`, `ucache_version` | hardware and software facts | as gathered |
 | | `id` | | a salted hash of the hostname |
 | label | `label` | text you typed | as typed, at most 80 characters. The client refuses a label containing `/`, `\`, `@` or `~`; the service refuses one matching its place patterns (`/home/`, `/eos/`, `/data/`, `user@host`, an IP address). Neither can recognise every path: type a name, never a location |
-| all records | everything else (`fs`, `mode`, `dev` as major:minor, `total_gb`, `free_gb`, `error`, `build_id`, the write-shape words, every count) | numbers, fixed vocabulary, or an error message from the C library | as recorded |
+| all records | everything else that is a NUMBER (`total_gb`, `free_gb`, every count, every rate, arrays of them) | numbers | as recorded |
+| | everything else that is TEXT | anything at all | **not sent.** Only a named list of fields may carry text out — `fs`, `mode`, `error`, `dev`, `dev_name`, `dev_model`, `dev_sched`, `mount_fstype`, `kernel`, `arch`, `cpu_model`, `version`, `build_id`, `time` and the write-shape words. A measurement this tool learns to take tomorrow arrives already published, and a path or a name reaches a record through fields nobody thought of: `cachepath_error` carried the benchmarked directory inside an error message. So the rule is the other way round — text is withheld until it is named here |
 
 The identifiers are what link records without revealing what they hash:
 

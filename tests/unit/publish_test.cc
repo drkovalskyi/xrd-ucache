@@ -178,6 +178,61 @@ TEST(Publish, DatesOnly) {
   EXPECT_EQ(dateOnlyUtc(1788000727), "2026-08-29");
 }
 
+TEST(Publish, DatesRefuseATimestampTheyCannotFormat) {
+  // Reachable, not hypothetical: a run-file name is parsed into a uint64 with
+  // no range check, so a corrupt stats directory reaches this. Both the
+  // library calls can fail here, and glibc leaves the buffer unterminated when
+  // strftime overflows — returning it read past the array and put stack bytes
+  // in the payload. An empty answer is the only honest one.
+  EXPECT_EQ(dateOnlyUtc(32000000000000000ull), "");   // a ten-digit year: strftime overflows
+  EXPECT_EQ(dateOnlyUtc(999999999999999999ull), "");  // gmtime_r fails outright
+  EXPECT_EQ(dateOnlyUtc(9223372036854775807ull), "");
+  EXPECT_EQ(dateOnlyUtc(1788000727), "2026-08-29");   // and the ordinary case still works
+}
+
+TEST(Publish, TextUnderAnUnknownKeyNeverLeaves) {
+  // The record grows as the tool learns to measure more, and a new field
+  // arrives already published. `cachepath_error` carried the benchmarked
+  // directory and the pid in its text and was on no drop list. The rule is
+  // therefore an allowlist over STRINGS: numbers pass, unvouched text does not.
+  Json r = Json::object();
+  r.set("host", Json::string("node-1.example.org"));
+  r.set("randr1_iops", Json::integer(7494));
+  r.set("dev_name", Json::string("dm-0"));
+  r.set("dev_model", Json::string("Samsung SSD 870"));
+  r.set("mount_fstype", Json::string("xfs"));
+  r.set("cachepath_error", Json::string("mkdir /scratch/u/cache/.ucache-bench.4242/ucache-path: No space left on device"));
+  r.set("dev_dm_name", Json::string("almalinux_node1-home"));
+  r.set("cachepath_stalls", Json::integer(3));
+  const Json out = redactBench(r, nullptr, "");
+  const std::string text = out.dump();
+  EXPECT_FALSE(out.has("cachepath_error")) << text;
+  EXPECT_FALSE(out.has("dev_dm_name")) << text;   // the LVM name is <distro>_<hostname>
+  EXPECT_EQ(text.find("/scratch"), std::string::npos) << text;
+  EXPECT_EQ(text.find("almalinux_node1"), std::string::npos) << text;
+  // and the numbers and the vouched-for text are all still there
+  EXPECT_EQ(out.num("randr1_iops"), 7494);
+  EXPECT_EQ(out.num("cachepath_stalls"), 3);
+  EXPECT_EQ(out.str("dev_name"), "dm-0");
+  EXPECT_EQ(out.str("dev_model"), "Samsung SSD 870");
+  EXPECT_EQ(out.str("mount_fstype"), "xfs");
+  EXPECT_EQ(out.str("host"), "");
+}
+
+TEST(Publish, ANumericArrayUnderAnUnknownKeyStillPasses) {
+  Json r = Json::object();
+  Json arr;
+  ASSERT_TRUE(Json::parse("[1.5,2.0,2.5]", arr));
+  r.set("cachepath_fill_curve", arr);
+  Json strs;
+  ASSERT_TRUE(Json::parse(R"(["/scratch/u","/eos/x"])", strs));
+  r.set("some_future_paths", strs);
+  const Json out = redactBench(r, nullptr, "");
+  EXPECT_TRUE(out.has("cachepath_fill_curve")); // numbers are not a leak
+  EXPECT_FALSE(out.has("some_future_paths"));   // text nested in an array is
+  EXPECT_EQ(out.dump().find("/scratch"), std::string::npos);
+}
+
 TEST(Publish, JsonRoundTripKeepsNumberTextAndOrder) {
   Json j;
   std::string err;
@@ -420,6 +475,49 @@ TEST(Publish, InstallIdIsMintedOnceAndSurvivesReuse) {
   const std::string c = installId(dir.path(), true, &fresh);
   EXPECT_TRUE(looksLikeUuid(c));
   EXPECT_NE(c, a);
+}
+
+TEST(Publish, AnInstanceIdIsNeverReplacedByARace) {
+  // Two publishes starting at once both find no id and both try to write one.
+  // A rename-over would give one cache directory two instance ids and two
+  // pages; the loser adopts the winner's file instead.
+  test::TempDir dir;
+  const std::string mine = installId(dir.path(), true);
+  ASSERT_TRUE(looksLikeUuid(mine));
+  // stand in for the other process having won the race: the file is already
+  // there when this call goes to create it
+  EXPECT_EQ(installId(dir.path(), true), mine);
+  // present but unreadable: minting a replacement would orphan the page this
+  // cache already publishes to, so it publishes unlinked and says so
+  ASSERT_EQ(::chmod((dir.path() + "/install-id").c_str(), 0), 0);
+  const std::string none = installId(dir.path(), true);
+  ASSERT_EQ(::chmod((dir.path() + "/install-id").c_str(), 0644), 0);
+  if (::geteuid() != 0) { // root reads it anyway
+    EXPECT_EQ(none, "");
+    EXPECT_EQ(installId(dir.path(), true), mine); // and the file is untouched
+  }
+}
+
+TEST(Publish, ASecondEnsureIdentityAdoptsTheFileRatherThanMintingAgain) {
+  // The invariant, not the race: two calls in one process see each other's
+  // file, so the second adopts it. This passes on the code that had the race
+  // too — an interleaving between the read and the write cannot be produced
+  // sequentially — so the race itself is gated where it can be: six
+  // concurrent publishes in the integration gate, which showed six owner
+  // pages before the fix. Kept because the adopt path is what that fix
+  // relies on, and a change to it should be seen here first.
+  test::TempDir dir;
+  ScopedEnv f("UCACHE_IDENTITY_FILE", dir.path() + "/identity");
+  bool created = false;
+  const auto first = ensureIdentity(true, &created);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_TRUE(created);
+  // a second publish that also found no identity a moment ago
+  created = true;
+  const auto second = ensureIdentity(true, &created);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_FALSE(created);
+  EXPECT_EQ(second->text(), first->text()); // same owner AND same salt
 }
 
 TEST(Publish, ServiceUrlPrecedence) {

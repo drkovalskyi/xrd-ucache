@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -534,6 +535,34 @@ int writeFileAtomic(const std::string& path, const std::string& content, mode_t 
   return 0;
 }
 
+// Create a file, and fail rather than replace one that exists. Returns 0 when
+// this call created it, EEXIST when somebody else got there first, else errno.
+// The identity and the instance id are both "one per machine, minted once" and
+// a rename-over would silently discard the winner's — with the identity that
+// means discarding a salt, and a discarded salt cannot be recovered: the pages
+// its hashes lead to can never be reached again.
+int createFileExclusive(const std::string& path, const std::string& content, mode_t mode) {
+  if (int rc = makeParents(path, 0700))
+    return rc;
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, mode);
+  if (fd < 0)
+    return errno;
+  size_t off = 0;
+  while (off < content.size()) {
+    const ssize_t n = ::write(fd, content.data() + off, content.size() - off);
+    if (n < 0) {
+      const int e = errno;
+      ::close(fd);
+      ::unlink(path.c_str());
+      return e;
+    }
+    off += static_cast<size_t>(n);
+  }
+  ::fchmod(fd, mode); // umask may have narrowed it; the caller's mode is the contract
+  ::close(fd);
+  return 0;
+}
+
 int appendLine(const std::string& path, const std::string& line, mode_t mode) {
   if (int rc = makeParents(path, 0700))
     return rc;
@@ -717,11 +746,23 @@ std::optional<Identity> ensureIdentity(bool create, bool* created) {
   if (!create)
     return std::nullopt;
   Identity id = newIdentity();
-  if (int rc = saveIdentity(id, &err); rc) {
+  const int rc = createFileExclusive(identityPath(), id.text() + "\n", 0600);
+  if (rc == EEXIST) {
+    // Another publish minted one between our read and our write. That one is
+    // the machine's identity: keeping ours would open a second owner page and
+    // throw away the salt of one of them, and the records already sent under
+    // the discarded salt could never be found again.
+    if (auto other = loadIdentity(&err))
+      return other;
+    std::fprintf(stderr, "publish: %s appeared but cannot be read (%s) — records go out without an owner\n",
+                 identityPath().c_str(), err.empty() ? "unreadable" : err.c_str());
+    return std::nullopt;
+  }
+  if (rc) {
     std::fprintf(stderr,
                  "publish: could not write %s (%s) — this record goes out without an owner, so "
                  "it will not appear on an owner page\n",
-                 identityPath().c_str(), err.c_str());
+                 identityPath().c_str(), std::strerror(rc));
     return std::nullopt;
   }
   if (created)
@@ -961,13 +1002,72 @@ std::string coarsenRootUrl(const std::string& urlIn) {
 std::string dateOnlyUtc(uint64_t epochS) {
   const time_t t = static_cast<time_t>(epochS);
   struct tm tmv;
-  ::gmtime_r(&t, &tmv);
-  char buf[16];
-  std::strftime(buf, sizeof buf, "%Y-%m-%d", &tmv);
-  return buf;
+  // BOTH calls have to be checked, and the buffer initialised, because an
+  // absurd timestamp is reachable: a run-file name is parsed into a uint64
+  // with no range check, so a corrupt stats directory reaches this with a
+  // year of ten digits or more. gmtime_r then returns null leaving tmv part
+  // uninitialised, and strftime returns 0 leaving the buffer UNTERMINATED —
+  // after which returning it read past the array and spliced whatever stack
+  // bytes followed into the payload's date field.
+  if (::gmtime_r(&t, &tmv) == nullptr)
+    return "";
+  // A four-digit year or no date at all. Past that the value is not a time
+  // the run could have started at, and a date the service cannot read is
+  // worse than an absent one.
+  if (tmv.tm_year < 0 || tmv.tm_year > 8099)
+    return "";
+  char buf[32] = {0};
+  const size_t n = std::strftime(buf, sizeof buf, "%Y-%m-%d", &tmv);
+  if (n == 0)
+    return "";
+  return std::string(buf, n);
 }
 
 const char* const kBenchDropKeys[5] = {"path", "mount", "mount_source", "mount_opts", "mount_super_opts"};
+
+// The string-valued keys of a bench record that may leave the machine. Every
+// leak is a string — a path, a host, a name — so numbers, booleans and
+// collections of them pass unexamined, while a string under a key not named
+// here is DROPPED.
+//
+// A denylist cannot hold this line. The record is open-ended and grows as the
+// tool learns to measure more, and each new field arrives already published:
+// `cachepath_error` carried the benchmarked directory and the process id in
+// its text, was never on the drop list, and reached a public page for every
+// cache directory the service's own place-patterns did not happen to match.
+// An allowlist fails the other way — a new measurement's units or shape is
+// withheld until it is named here, which costs a line and no privacy.
+const char* const kBenchKeepStrings[] = {
+    "fs",         "mode",   "error",     "build_write_shape", "time", "version",
+    "build_id",   "kernel", "arch",      "cpu_model",         "dev",  "mount_fstype",
+    "dev_name",   "dev_model",           "dev_sched"};
+
+// Does this value contain a string anywhere? A record is flat today; a nested
+// object of numbers is still safe, a nested string is not.
+bool hasAnyString(const Json& v) {
+  if (v.isString())
+    return true;
+  if (v.isArray()) {
+    for (const auto& e : v.arr)
+      if (hasAnyString(e))
+        return true;
+    return false;
+  }
+  if (v.isObject()) {
+    for (const auto& kv : v.obj)
+      if (hasAnyString(kv.second))
+        return true;
+    return false;
+  }
+  return false;
+}
+
+bool keepsItsText(const std::string& key) {
+  for (const char* k : kBenchKeepStrings)
+    if (key == k)
+      return true;
+  return false;
+}
 
 std::string labelProblem(const std::string& labelIn) {
   const std::string label = trim(labelIn);
@@ -995,6 +1095,8 @@ Json redactBench(const Json& record, const Identity* id, const std::string& inst
       out.obj.emplace_back(kv.first, Json::string(""));
     } else if (kv.first == "cmd" && kv.second.isString()) {
       out.obj.emplace_back(kv.first, Json::string(normalizeCmd(kv.second.s)));
+    } else if (hasAnyString(kv.second) && !keepsItsText(kv.first)) {
+      continue; // text under a key nobody vouched for
     } else {
       out.obj.push_back(kv);
     }
@@ -1198,27 +1300,58 @@ std::string installId(const std::string& cacheDir, bool create, bool* fresh) {
     return "";
   const std::string path = cacheDir + "/install-id";
   std::string text;
+  bool replacing = false;
   if (readWholeFile(path, text)) {
     const std::string id = trim(text);
     if (looksLikeUuid(id))
       return id;
     std::fprintf(stderr, "publish: %s is not a UUID — replacing it\n", path.c_str());
+    replacing = true; // a deliberate replacement, not a race
+  } else {
+    struct ::stat ist;
+    if (::stat(path.c_str(), &ist) == 0) {
+      // Present but unreadable. Minting a replacement would silently orphan
+      // the page this cache already publishes to, so say so and publish
+      // without an instance id instead.
+      std::fprintf(stderr,
+                   "publish: %s exists but cannot be read — this cache publishes without an "
+                   "instance id; fix its permissions to keep its page\n",
+                   path.c_str());
+      return "";
+    }
   }
   if (!create)
     return ""; // asked only whether one exists
   const std::string id = newUuid4();
-  if (fresh)
-    *fresh = true;
   // World-readable on purpose: a second user reading this cache read-only
   // publishes the same instance, and the id is not a secret (the report URL
   // it leads to shows nothing that was not published).
-  if (int rc = writeFileAtomic(path, id + "\n", 0644); rc)
+  int rc;
+  if (replacing) {
+    rc = writeFileAtomic(path, id + "\n", 0644); // the file is there and is not an id
+  } else {
+    rc = createFileExclusive(path, id + "\n", 0644);
+    if (rc == EEXIST) {
+      // Another publish minted one between our read and our write. One cache
+      // directory is one instance, so adopt theirs rather than have this cache
+      // appear twice on the owner page under two ids.
+      std::string other;
+      if (readWholeFile(path, other)) {
+        const std::string got = trim(other);
+        if (looksLikeUuid(got))
+          return got;
+      }
+      return "";
+    }
+  }
+  if (rc) {
     std::fprintf(stderr,
                  "publish: could not write %s (%s) — this cache gets a fresh instance id on "
                  "every publish until it can be written\n",
                  path.c_str(), std::strerror(rc));
-  else if (fresh)
-    *fresh = false;
+    if (fresh)
+      *fresh = true;
+  }
   return id;
 }
 
@@ -1611,6 +1744,12 @@ bool confirmPublish(const std::string& summary, bool yes) {
                stderr);
     return false;
   }
+  // Whatever is already in the terminal's buffer was typed or pasted BEFORE
+  // this question appeared, so it is not an answer to it. The label prompt
+  // reads one line with fgets and leaves the rest of a pasted block behind;
+  // without this, pasting a label followed by a line starting with "y" sent
+  // the payload without the user ever seeing the summary above.
+  ::tcflush(STDIN_FILENO, TCIFLUSH);
   std::fputs("Send it? [y/N] ", stdout);
   std::fflush(stdout);
   char buf[16] = {0};

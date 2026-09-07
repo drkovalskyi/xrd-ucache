@@ -250,7 +250,7 @@ struct MountInfo {
   std::string mountPoint, fsType, source, opts, superOpts;
   unsigned maj = 0, min = 0;
   bool haveBlock = false;
-  std::string partName, diskName, model, sched;
+  std::string partName, diskName, model, dmName, sched;
   int rotational = -1;
   double sizeGb = 0;
 };
@@ -371,8 +371,13 @@ MountInfo mountFor(const std::string& path) {
   m.rotational = rot.empty() ? -1 : std::atoi(rot.c_str());
   m.sched = selectedSched(readFileTrim(base + "/queue/scheduler"));
   m.model = readFileTrim(base + "/device/model");
-  if (m.model.empty())
-    m.model = readFileTrim(base + "/dm/name"); // device-mapper: the friendly name
+  // A device-mapper device has no hardware model, and its "friendly name" is
+  // NOT one: it is the LVM or LUKS name, which a stock RHEL-family installer
+  // sets to <distro>_<hostname>. That is a place, and publishing it beside
+  // the salted hash of the same hostname would defeat the hash. It is kept
+  // for this machine's own table and travels no further — `dev_dm_name` is
+  // not in the published record's list of keys that may carry text.
+  m.dmName = readFileTrim(base + "/dm/name");
   std::string sz = readFileTrim(base + "/size");
   if (!sz.empty())
     m.sizeGb = static_cast<double>(std::strtoull(sz.c_str(), nullptr, 10)) * 512.0 / (1ull << 30);
@@ -1194,6 +1199,8 @@ std::string contextBlock(const Result& r, const DiskBenchOpts& o) {
       appendf(s, " (partition %s)", e.mnt.partName.c_str());
     if (!e.mnt.model.empty())
       appendf(s, "   %s", e.mnt.model.c_str());
+    else if (!e.mnt.dmName.empty())
+      appendf(s, "   %s", e.mnt.dmName.c_str());
     if (e.mnt.rotational >= 0)
       appendf(s, "   rotational=%d", e.mnt.rotational);
     if (!e.mnt.sched.empty())
@@ -1357,6 +1364,9 @@ std::string jsonLine(const Result& r, const DiskBenchOpts& o) {
                "\"dev_sched\":\"%s\",\"dev_size_gb\":%.1f",
             jesc(e.mnt.diskName).c_str(), jesc(e.mnt.model).c_str(), e.mnt.rotational,
             jesc(e.mnt.sched).c_str(), e.mnt.sizeGb);
+  // Local only, and deliberately under its own key: see mountFor.
+  if (e.mnt.haveBlock && !e.mnt.dmName.empty())
+    appendf(s, ",\"dev_dm_name\":\"%s\"", jesc(e.mnt.dmName).c_str());
   if (e.pre.valid)
     appendf(s, ",\"pre_read_mbps\":%.1f,\"pre_write_mbps\":%.1f,\"pre_busy_pct\":%.0f,"
                "\"pre_sample_s\":%.1f",
