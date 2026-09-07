@@ -7,8 +7,17 @@ Versions are SemVer: `x` changes something you depend on, `y` adds capability,
 `z` fixes and refines. Prebuilt EL9 packages are attached to each release.
 
 **Across every release:** a newer release reads a cache written by an older one.
-Recompression stays off unless you turn it on. Any XRootD 5.6 or newer 5.x
-client works; 6.x from v0.21.0.
+Recompression stays off unless you turn it on. Nothing is published unless you
+run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
+v0.21.0.
+
+## v1.1.0 — 2026-09-07
+- Added ucache publish: submit benchmark records and run history for
+  analysis and recommendations; data is anonymized.
+- Added ucache identity: view or set the identity used to link
+  published records across machines and browsers.
+- Added announce: uCache identifies itself to XRootD servers so sites can see
+  traffic that comes through a cache; on by default, off with announce = off.
 
 # v1.0.0 — 2026-09-02
 - Changed cache data format to support cache gain monitoring.
