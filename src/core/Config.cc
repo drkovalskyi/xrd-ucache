@@ -168,6 +168,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.openRetryMaxMs = ::atoi(v.c_str());
   else if (k == "transpose")
     c.transpose = !falsy(v); // replica-tier kill switch
+  else if (k == "announce")
+    c.announce = !falsy(v); // default on; see Config.h
   else if (k == "recompress")
     c.recompress = truthy(v);
   else if (k == "recompress_codecs")
@@ -346,6 +348,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"open_retry_max_ms", "UCACHE_OPEN_RETRY_MAX_MS"},
       {"disable", "UCACHE_DISABLE"},
       {"transpose", "UCACHE_TRANSPOSE"},
+      {"announce", "UCACHE_ANNOUNCE"},
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
@@ -432,6 +435,8 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(disable);
   if (key == "transpose")
     return onoff(transpose);
+  if (key == "announce")
+    return onoff(announce);
   if (key == "recompress")
     return onoff(recompress);
   if (key == "recompress_drain_jobs")

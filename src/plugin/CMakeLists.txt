@@ -18,12 +18,16 @@ find_library(XRDCL_LIBRARY XrdCl REQUIRED)
 ucache_require_xrootd_version("${XRDCL_INCLUDE_DIR}")
 
 add_library(XrdClUCache SHARED
+  Announce.cc
   Executor.cc
   OpenRetry.cc
   UCacheFactory.cc
   UCacheFile.cc
 )
 target_include_directories(XrdClUCache SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR}) # SYSTEM: old-header warnings must not trip -Werror (5.6 floor pin)
+# The version uCache announces to servers at login (same source of truth as
+# `ucache --version`).
+target_compile_definitions(XrdClUCache PRIVATE UCACHE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(XrdClUCache PRIVATE ucache-core ${XRDCL_LIBRARY})
 # Match XrdCl plugin naming convention (libXrdClUCache.so, no version suffix
 # needed — the conf file carries the absolute path).

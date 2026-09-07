@@ -85,6 +85,28 @@ XrdAdaptor probing the cache's local-redirect URL for readv limits (it lacks
 the guard ROOT and uproot have); the probe fails fast and sane defaults
 apply.
 
+## A site's monitoring lists my jobs as `ucache`, not as ROOT or cmsRun
+
+Expected, and it is one setting. uCache names itself as the application in the
+login of every session it caches, so that sites can tell traffic that comes
+through a cache from traffic that does not; your program's name goes in the
+information string beside it (`ucache/1.0.0 (root.exe)`). If a dashboard,
+accounting rule or site policy needs your program in the application field
+instead, either turn the announcement off:
+
+```sh
+ucache set announce off      # or `announce = off` in ucache.conf
+```
+
+or set the name yourself, which uCache never overrides:
+
+```sh
+export XRD_APPNAME=my-analysis
+```
+
+Nothing else changes with it either way — the announcement is two strings in
+the login request and is not involved in reading or caching a single byte.
+
 ## The file changed at the origin but uCache serves the old bytes
 
 Expected inside the freshness window (default 7 days, `revalidate_seconds`):

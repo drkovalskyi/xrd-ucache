@@ -35,6 +35,7 @@ TEST(Config, Defaults) {
   EXPECT_EQ(c.recompressCodecs, (std::vector<std::string>{"lzma", "zlib"}));
   EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kSuperseded); // default reclaim mode
   EXPECT_TRUE(c.transpose);
+  EXPECT_TRUE(c.announce); // servers are told uCache is in the path, by default
   EXPECT_FALSE(c.disable);
   EXPECT_TRUE(c.cacheDir.empty()); // deliberately NO default cache dir
   EXPECT_TRUE(c.sources.empty());  // nothing explicitly set anywhere
@@ -55,6 +56,7 @@ TEST(Config, ParsesEverything) {
   ::setenv("UCACHE_REVALIDATE_S", "0", 1); // 0 must override the 7-day default
   ::setenv("UCACHE_DISABLE", "1", 1);
   ::setenv("UCACHE_TRANSPOSE", "off", 1);
+  ::setenv("UCACHE_ANNOUNCE", "off", 1);
   ::setenv("UCACHE_RECOMPRESS", "on", 1);
   ::setenv("UCACHE_RECOMPRESS_RECLAIM", "full", 1);
   ::setenv("UCACHE_KEEP_CGI", "a,b", 1);
@@ -74,6 +76,8 @@ TEST(Config, ParsesEverything) {
   EXPECT_EQ(c.revalidateSeconds, 0);
   EXPECT_TRUE(c.disable);
   EXPECT_FALSE(c.transpose);
+  EXPECT_FALSE(c.announce);
+  EXPECT_EQ(c.valueOf("announce"), "off"); // reported by `ucache settings`
   EXPECT_TRUE(c.recompress);
   EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kFull);
   EXPECT_EQ(c.valueOf("recompress_reclaim"), "full");

@@ -68,6 +68,15 @@ The identifiers are what link records without revealing what they hash:
 Because the salt never leaves your machine, nobody who sees the hashes — us
 included — can test a guess at a path or a hostname against them.
 
+**One other thing leaves your machine, and it is not this.** Independently of
+publishing, uCache names itself to the XRootD servers it reads from — the
+application name and information string every client sends when it opens a
+session, which without uCache name your program. That goes to the storage you
+are already reading, never to the report service, and it carries no path, no
+measurement and no identifier of yours. The user guide's configuration section
+describes it, and `announce = off` turns it off. Publishing and announcing are
+separate: neither switches the other on.
+
 ## The identity string
 
 `ucache-id:<owner-uuid>:<salt-hex>` is one line in one file

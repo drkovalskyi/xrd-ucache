@@ -15,6 +15,7 @@ add_executable(ucache-unit-tests
   unit/xxh3_test.cc
   unit/sha256_test.cc
   unit/config_test.cc
+  unit/announce_test.cc
   unit/log_test.cc
   unit/iobackend_test.cc
   unit/urlkey_test.cc
@@ -34,6 +35,7 @@ add_executable(ucache-unit-tests
   unit/readfootprint_test.cc
   unit/origin_inflight_test.cc
   unit/publish_test.cc
+  ${CMAKE_SOURCE_DIR}/src/plugin/Announce.cc  # pure identity strings (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)

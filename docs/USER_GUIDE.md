@@ -559,6 +559,7 @@ overriding your defaults. Common keys:
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
 | `trace_sample = 64` | `UCACHE_TRACE_SAMPLE` | record every Nth read-class trace op (`1` = everything; opens/flushes are always recorded) |
+| `announce = on`     | `UCACHE_ANNOUNCE`       | name uCache as the application in what the client tells servers at login, so a site can see traffic that comes through a cache (default on; see below). `off` = send your program's own name, as without uCache |
 | `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
 
 Sizes accept `k`/`m`/`g`/`t` suffixes.
@@ -590,6 +591,34 @@ with exponential full-jitter backoff (`UCACHE_OPEN_RETRY_BASE_MS`=200,
 fill; `UCACHE_REVALIDATE_S` then carries later warm passes with no remote contact.
 Off by default; for a large job over a flaky remote, 2–3 retries makes a transient
 per-open failure negligible.
+
+**What a server learns about you.** An XRootD client names itself when it
+opens a session: the program doing the reading (`root.exe`, `python3`,
+`cmsRun`) and a free-form information string, both carried inside the login
+request. With a cache in front, the requests a server actually sees are the
+cache's — page-aligned, never asking twice for the same bytes, and absent
+altogether on a warm pass — so uCache puts its own name there and keeps your
+program beside it:
+
+```
+application   ucache
+information   ucache/1.0.0 (root.exe)
+```
+
+Sites use this to see how much of their traffic already comes through a cache,
+which is worth their knowing and costs you nothing: the two strings travel in
+the login that opens a session, so nothing is added per file and no extra
+request is made, and they are the only thing that changes — what uCache asks
+for and how your job behaves are untouched. Nothing about your data, your
+paths or your identity is in them; your username and host reach the server
+anyway, as they do without uCache.
+
+Turn it off with `announce = off` and your program is named as before. A name
+you set yourself always wins: export `XRD_APPNAME` or `XRD_MONINFO` and uCache
+leaves that field alone. And uCache stays quiet whenever it is not actually in
+the data path — `disable = true`, or no `dir` — because those reads really are
+your program's own, which also keeps a `UCACHE_DISABLE=1` baseline run looking
+like exactly what it is.
 
 **Eviction is on by default.** With no `max_bytes` set, the cache uses the disk
 freely and evicts least-recently-used entries only to keep a free-space floor

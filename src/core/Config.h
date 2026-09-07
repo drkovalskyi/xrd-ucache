@@ -126,6 +126,19 @@ struct Config {
   std::vector<std::string> allowHosts;    // UCACHE_ALLOW glob list (empty = all)
   std::vector<std::string> denyHosts;     // UCACHE_DENY glob list
 
+  // `announce` / UCACHE_ANNOUNCE=0/off/false. An XRootD server learns who is
+  // talking to it from an application name and an information string the
+  // client sends at login; by default they name the host program, so a cache
+  // in front of it cannot be told apart from the program reading directly.
+  // uCache names itself there instead and keeps the host program beside it
+  // (see the plugin's announcement header). Sites can then see how much of
+  // their traffic comes through a cache, which is the whole point. Off = say
+  // nothing, i.e. the host program's own name as before. A name exported in
+  // the environment always wins over both settings. Nothing is announced when
+  // uCache is not in the data path (`disable`, or no cache dir): the requests
+  // the server sees are then the program's own.
+  bool announce = true;
+
   // Per-key provenance for `ucache settings` / doctor: "conf", "state" or
   // "env" for keys that were explicitly set; absent = built-in default.
   std::map<std::string, std::string> sources;

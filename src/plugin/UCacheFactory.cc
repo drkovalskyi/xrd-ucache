@@ -6,10 +6,12 @@
 // CreateFileSystem returns nullptr: XrdCl logs and continues without a
 // plugin for filesystem objects (verified in XrdClFileSystem.cc) — all FS
 // ops are naturally pass-through, and a broken cache can never break a job.
+#include "Announce.h"
 #include "Executor.h"
 #include "Log.h"
 #include "UCacheFile.h"
 
+#include <XrdCl/XrdClDefaultEnv.hh>
 #include <XrdVersion.hh>
 
 #include <dlfcn.h>
@@ -51,6 +53,53 @@ void pinSelfInMemory() {
 #endif
 }
 
+// Tell servers that uCache, not the host program, is the one asking.
+//
+// The two strings travel in the login request that opens a session, so this
+// has to happen before the first connection -- it does: the client loads its
+// plugins from inside its own environment setup, which is where this runs, and
+// the strings it reads at login are the ones left here. They are also the only
+// use the client makes of them, so nothing about the requests uCache issues
+// changes.
+//
+// Silent when uCache is not actually in the data path. A disabled cache, or
+// one with nowhere to store anything, relays the program's own reads
+// untouched, and claiming those would misreport them -- a baseline run must
+// look like what it is.
+void announceIdentity(const Config& cfg) {
+  if (!cfg.announce) {
+    UCACHE_DEBUG("announce = off: leaving the application name as the host program's");
+    return;
+  }
+  if (cfg.disable || cfg.cacheDir.empty()) {
+    UCACHE_DEBUG("not announcing: uCache is passing through (%s), so the reads a server "
+                 "sees are the program's own",
+                 cfg.disable ? "disabled" : "no cache dir");
+    return;
+  }
+  XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv();
+  if (!env) { // never seen: the client builds its environment before loading us
+    UCACHE_DEBUG("not announcing: no client environment yet");
+    return;
+  }
+  std::string hostApp;
+  env->GetString("AppName", hostApp); // the host program, or the user's own name
+  const Announcement a = buildAnnouncement(hostApp, UCACHE_VERSION);
+  // A name exported in the environment is the user's decision and is kept:
+  // these writes are declined in that case, which is why they are checked
+  // rather than assumed.
+  const bool named = env->PutString("AppName", a.appName);
+  const bool informed = env->PutString("MonInfo", a.monInfo);
+  if (named && informed)
+    UCACHE_INFO("servers will see this session as '%s' (%s)", a.appName.c_str(),
+                a.monInfo.c_str());
+  else
+    UCACHE_INFO("announcing partially: application name %s, information string %s "
+                "(a name set in the environment wins over uCache's)",
+                named ? "= 'ucache'" : "kept from the environment",
+                informed ? "= 'ucache/...'" : "kept from the environment");
+}
+
 void initGlobals() {
   pinSelfInMemory(); // before any thread exists that could outlive an unload
   // Leaked intentionally: destruction order against XrdCl teardown and the
@@ -61,6 +110,7 @@ void initGlobals() {
   if (gConfig->cacheDir.empty() && !gConfig->disable)
     UCACHE_WARN("no cache dir configured — set `dir =` in ucache.conf (USER_GUIDE §2) "
                 "or UCACHE_DIR; running uncached (pass-through)");
+  announceIdentity(*gConfig);
   gStore = new std::shared_ptr<CacheStore>(
       gConfig->cacheDir.empty()
           ? nullptr
