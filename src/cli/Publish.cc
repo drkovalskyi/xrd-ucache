@@ -1024,8 +1024,11 @@ Json redactNetbench(const Json& record) {
 // the machine block
 // ============================================================================
 
+#if !defined(__APPLE__)
 namespace {
 
+// /etc/os-release values are quoted; macOS reads its version another way and
+// has no caller for this, and AppleClang refuses an unused function.
 std::string unquote(std::string v) {
   v = trim(v);
   if (v.size() >= 2 && (v.front() == '"' || v.front() == '\'') && v.back() == v.front())
@@ -1034,6 +1037,7 @@ std::string unquote(std::string v) {
 }
 
 } // namespace
+#endif
 
 Json machineBlock(const Identity* id, const std::string& xrootdClient, const std::string& ucacheVersion) {
   Json m = Json::object();
