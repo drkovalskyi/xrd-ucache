@@ -16,8 +16,8 @@ v0.21.0.
   analysis and recommendations; data is anonymized.
 - Added `ucache identity`: view or set the identity used to link
   published records across machines and browsers.
-- Added announce: uCache identifies itself to XRootD servers so sites can see
-  traffic that comes through a cache; on by default, off with announce = off.
+- Added `announce`: uCache identifies itself to XRootD servers so sites can see
+  traffic that comes through a cache; on by default, off with `announce = off`.
 
 # v1.0.0 — 2026-09-02
 - Changed cache data format to support cache gain monitoring.
