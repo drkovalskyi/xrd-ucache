@@ -88,6 +88,10 @@ Further validation is performed with tools outside this repository.
   jobs, and the JSON files it writes
 - [Storage benchmarking](docs/BENCH.md) — `ucache bench`: measuring a
   candidate cache directory, and why the choice matters
+- [Publishing a measurement](docs/PUBLISH.md) — the optional `ucache publish`:
+  what a report gives you, your identity string and where it lives, and the
+  field-by-field statement of what leaves the machine. Nothing is published
+  unless you run it
 - [On-disk format](docs/FORMAT.md) — what a cached entry is made of on disk,
   for anyone inspecting or writing tooling against it
 
