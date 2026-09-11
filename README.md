@@ -10,6 +10,22 @@ little to lose in trying it.
 
 [![arXiv](https://img.shields.io/badge/arXiv-2609.00400-B31B1B.svg)](https://arxiv.org/abs/2609.00400)
 
+## How it works
+
+uCache is a plug-in for the XRootD client — the library ROOT already uses for
+every `root://` URL. Before your job opens its first file, that library's
+plug-in manager reads the plugin configs in your home directory and asks
+whether any of them claims the server in your URL. If `ucache.conf` does, the
+manager loads the library it names, and from then on uCache answers that
+file's reads: a data block already on your local disk is served from there,
+anything else is fetched from the server and kept for next time.
+
+![ROOT hands every root:// URL to the XRootD client library, whose plug-in manager reads ucache.conf from your home directory and loads the uCache plugin; the plugin then serves data blocks from your local disk and fetches the rest from the server.](docs/images/how-it-works.png)
+
+Nothing about your analysis changes — same commands, same file names, same
+results; only where the bytes come from. Delete that one config file and the
+same job runs exactly as it did before.
+
 ## Try it
 
 To use uCache with your analysis, install it and activate it with a
