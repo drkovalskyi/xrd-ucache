@@ -28,7 +28,11 @@ Install uCache: download the latest tarball from this repository's
 Releases page, then
 
 ```sh
-# install plugin in ~/.local
+# look before you unpack into your home: eleven files, no installer, no scripts
+tar tzf xrd-ucache-<version>-el9-x86_64.tar.gz
+
+# --strip-components=1 drops the tarball's own top-level directory, so the
+# bin/, lib64/ and share/ inside it merge into ~/.local
 tar -C ~/.local --strip-components=1 -xf xrd-ucache-<version>-el9-x86_64.tar.gz
 
 # make CLI client accessible
@@ -40,6 +44,20 @@ ucache doctor                       # static check: install + activation + setti
 ucache test root://<host>//<file>   # end-to-end self-test (cold + warm, cleans up)
 # ... run your ROOT/RDataFrame/uproot job normally ...
 ```
+
+That puts exactly this in your home, and touches nothing else:
+
+| path | what it is |
+|---|---|
+| `~/.local/lib64/libXrdClUCache.so` | the plugin — the only part that loads into your job |
+| `~/.local/bin/ucache` | the command you just used |
+| `~/.local/bin/ucache-netbench` | measures an origin's read rates; used by `ucache netbench` |
+| `~/.local/share/doc/xrd-ucache/` | these guides, for reading offline |
+
+`ucache setup` then writes the absolute path of that `.so` into the conf file,
+so the plugin is found by record rather than by search — which is why any
+prefix works, not just `~/.local`. To remove uCache, delete those four paths and the
+conf `ucache setup` names.
 
 Activation is user-global and needs no root. The cache directory has **no
 default** — `doctor` complains until you set one. `ucache setup
