@@ -28,12 +28,14 @@ Install uCache: download the latest tarball from this repository's
 Releases page, then
 
 ```sh
-# look before you unpack into your home: eleven files, no installer, no scripts
-tar tzf xrd-ucache-<version>-el9-x86_64.tar.gz
+# unpack where you are: this writes only into the new directory
+tar xf xrd-ucache-<version>-el9-x86_64.tar.gz
+cd xrd-ucache-<version>-el9-x86_64
 
-# --strip-components=1 drops the tarball's own top-level directory, so the
-# bin/, lib64/ and share/ inside it merge into ~/.local
-tar -C ~/.local --strip-components=1 -xf xrd-ucache-<version>-el9-x86_64.tar.gz
+# copy the three files it consists of, wherever you want them
+mkdir -p ~/.local/bin ~/.local/lib64
+cp bin/ucache bin/ucache-netbench  ~/.local/bin/
+cp lib64/libXrdClUCache.so         ~/.local/lib64/
 
 # make CLI client accessible
 export PATH="$HOME/.local/bin:$PATH"
@@ -45,19 +47,20 @@ ucache test root://<host>//<file>   # end-to-end self-test (cold + warm, cleans 
 # ... run your ROOT/RDataFrame/uproot job normally ...
 ```
 
-That puts exactly this in your home, and touches nothing else:
+Three files, and nothing else is written. `libXrdClUCache.so` is the plugin,
+the only part that loads into your job; `ucache` is the command above; and
+`ucache-netbench` is a helper that `ucache netbench` runs for you, kept a
+separate executable because it is the one piece needing the XRootD client
+library. The archive also carries these guides under `share/doc/xrd-ucache/`,
+useful on a machine with no web access; nothing requires them.
 
-| path | what it is |
-|---|---|
-| `~/.local/lib64/libXrdClUCache.so` | the plugin — the only part that loads into your job |
-| `~/.local/bin/ucache` | the command you just used |
-| `~/.local/bin/ucache-netbench` | measures an origin's read rates; used by `ucache netbench` |
-| `~/.local/share/doc/xrd-ucache/` | these guides, for reading offline |
+`ucache setup` writes the absolute path of the plugin into the conf file, so it
+is found by record rather than by search — which is why any prefix works, not
+just `~/.local`. To remove uCache, delete the files you copied and the conf
+that `ucache setup` names.
 
-`ucache setup` then writes the absolute path of that `.so` into the conf file,
-so the plugin is found by record rather than by search — which is why any
-prefix works, not just `~/.local`. To remove uCache, delete those four paths and the
-conf `ucache setup` names.
+If you would rather a package manager owned all of this, each release also
+ships an EL9 RPM — see [the user guide](docs/USER_GUIDE.md).
 
 Activation is user-global and needs no root. The cache directory has **no
 default** — `doctor` complains until you set one. `ucache setup
