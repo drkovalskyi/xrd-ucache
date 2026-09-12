@@ -26,79 +26,136 @@ Nothing about your analysis changes — same commands, same file names, same
 results; only where the bytes come from. Delete that one config file and the
 same job runs exactly as it did before.
 
-## Try it
+## Getting started
 
-To use uCache with your analysis, install it and activate it with a
-plugin configuration file. The following instructions show how to do
-it using the EL9 (Alma/Rocky/RHEL 9) tarball. For Debian/Ubuntu, other Linux
-distributions, or macOS — and for building from source on any of them — see
-[the user guide](docs/USER_GUIDE.md).
+### 1. What you need
 
-First, ensure that you have all relevant packages for data access over XRootD:
+An XRootD client (5.6 or newer) and whatever reads your data — ROOT, uproot,
+`cmsRun`. On EL9:
 
 ```sh
 sudo dnf install epel-release xrootd-client root-netx
 ```
 
-Install uCache: download the latest tarball from this repository's
-Releases page, then
+uCache itself needs no administrator. For Debian/Ubuntu, macOS, or building
+from source, see [the user guide](docs/USER_GUIDE.md).
+
+### 2. Install three files
+
+Download the tarball from the Releases page, then unpack it where you stand
+and copy the parts you want, so nothing is written anywhere you did not name:
 
 ```sh
-# unpack where you are: this writes only into the new directory
 tar xf xrd-ucache-<version>-el9-x86_64.tar.gz
 cd xrd-ucache-<version>-el9-x86_64
 
-# copy the three files it consists of, wherever you want them
 mkdir -p ~/.local/bin ~/.local/lib64
 cp bin/ucache bin/ucache-netbench  ~/.local/bin/
 cp lib64/libXrdClUCache.so         ~/.local/lib64/
 
-# make CLI client accessible
 export PATH="$HOME/.local/bin:$PATH"
-
-ucache setup --dir /path/to/cache   # writes the ONE conf file (or write it
-                                    # yourself per the guide — same result)
-ucache doctor                       # static check: install + activation + settings
-ucache test root://<host>//<file>   # end-to-end self-test (cold + warm, cleans up)
-# ... run your ROOT/RDataFrame/uproot job normally ...
 ```
 
-Three files, and nothing else is written. `libXrdClUCache.so` is the plugin,
-the only part that loads into your job; `ucache` is the command above; and
-`ucache-netbench` is a helper that `ucache netbench` runs for you, kept a
-separate executable because it is the one piece needing the XRootD client
-library. The archive also carries these guides under `share/doc/xrd-ucache/`,
-useful on a machine with no web access; nothing requires them.
+`libXrdClUCache.so` is the plugin, the only part loaded into your job.
+`ucache` is the command you will use. `ucache-netbench` is a helper that
+`ucache netbench` runs for you; it is a separate executable because it is the
+one piece that needs the XRootD client library. The archive also carries the
+guides under `share/doc/xrd-ucache/` for machines with no web access; nothing
+requires them. If you would rather a package manager owned the files, each
+release also ships an EL9 RPM.
 
-`ucache setup` writes the absolute path of the plugin into the conf file, so it
-is found by record rather than by search — which is why any prefix works, not
-just `~/.local`. To remove uCache, delete the files you copied and the conf
-that `ucache setup` names.
+### 3. Choose a disk
 
-If you would rather a package manager owned all of this, each release also
-ships an EL9 RPM — see [the user guide](docs/USER_GUIDE.md).
+The disk decides whether caching helps at all: on a slow or network-backed
+volume a cache can be worse than reading the origin. Use a **local SSD or
+NVMe**, never AFS or NFS, and avoid `/tmp` if a system reaper cleans it. If
+you have a choice, measure the candidates before committing to one —
+`ucache bench /path/to/candidate`, a few minutes each; [storage
+benchmarking](docs/BENCH.md) explains how to read the result.
 
-Activation is user-global and needs no root. The cache directory has **no
-default** — `doctor` complains until you set one. `ucache setup
---host <host:port>` binds one host if a system plugin conf already claims the
-`*` slot (see [the user guide](docs/USER_GUIDE.md)). Eviction is on by default (keep the disk from
-filling; `ucache status` shows the budget).
+### 4. Write one config file
 
-Config file example
+Activation is that file and nothing else. Create the directory the XRootD
+client reads, and put `ucache.conf` in it:
 
-``` sh
-url = eospublic.cern.ch:1094
-lib = /home/<you>/.local/lib64/libXrdClUCache.so
+```sh
+mkdir -p ~/.xrootd/client.plugins.d
+```
+
+`~/.xrootd/client.plugins.d/ucache.conf`:
+
+```
+# which servers to cache (several: separate them with ;)
+url = eospublic.cern.ch:1094;eoscms.cern.ch:1094
+
+# the plugin library, absolute path (~ is not expanded)
+lib = /home/you/.local/lib64/libXrdClUCache.so
 enable = true
-dir = /tmp/cache
+
+# the cache itself: a local SSD or NVMe, not AFS or NFS
+dir = /path/to/cache
 ```
 
-`lib` must be a literal absolute path — this file is read by the XRootD
-client, which does not expand `~`.
+This is the file in the diagram above, and each line is doing one job:
 
-Note: `/tmp/cache` is not an optimal location due to automatic
-cleanup. Find a better location by testing candidate directories with
-`ucache bench <dir>`.
+- `url` — the servers uCache intercepts, separated by `;`. The port is
+  optional. `*` means every server, but a site-wide plugin config may already
+  hold that slot, in which case yours is skipped and `ucache doctor` says so;
+  naming your servers avoids the question.
+- `lib` — a literal absolute path. This file is read by the XRootD client,
+  which does not expand `~`, so run
+  `echo "$HOME/.local/lib64/libXrdClUCache.so"` and paste what it prints.
+- `enable` — the switch. `false` turns uCache off without deleting anything.
+- `dir`, and anything below it, is uCache's own configuration. There is
+  deliberately **no default cache directory**: a default would quietly land in
+  your home, which at many sites is AFS, and caching network data onto a
+  network filesystem defeats the point.
+
+Three syntax rules the client enforces strictly, none of which it explains: a
+`#` comment must start in the **first column** — an indented one makes the
+client reject the whole file and load nothing; a comment written after a value
+becomes **part of that value**; and the file must be named `*.conf`.
+
+Nothing else takes part. No environment variable, no `LD_PRELOAD`, no ROOT
+configuration, and no shell to reload — a batch job launched tomorrow picks up
+the same file.
+
+### 5. Check it before trusting it
+
+```sh
+ucache doctor                       # install, activation, settings, cache filesystem
+ucache test root://<host>//<file>   # real cold and warm read, then cleans up
+```
+
+`doctor` is static and exits non-zero if anything is wrong. `test` is the
+end-to-end proof: it reads a file twice and passes only if the second read
+fetched nothing from the origin.
+
+### 6. Run your job
+
+Nothing changes. Run ROOT, uproot or `cmsRun` exactly as before; the first
+pass fills the cache and later passes are served locally. If anything goes
+wrong with the cache the read falls back to the origin rather than failing —
+that behaviour is the design's first rule, not a safety net bolted on.
+
+### 7. See whether it helped
+
+```sh
+ucache status     # what is cached, disk used, headroom
+ucache summary    # is this cache worth having
+ucache history    # per-run detail
+```
+
+One thing worth doing once: run the same job with `UCACHE_DISABLE=1`, so there
+is a switched-off run to compare against. uCache reports a gain only when it
+has measured one, and it reports a loss as a loss.
+
+### Housekeeping
+
+Eviction is on by default so the disk cannot fill; `ucache status` shows the
+budget. To remove uCache, delete the files you copied and
+`~/.xrootd/client.plugins.d/ucache.conf`.
+
 
 ## Testing
 
