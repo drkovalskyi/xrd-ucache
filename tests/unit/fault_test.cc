@@ -256,3 +256,17 @@ TEST(Fault, EvictionStatvfsFailureDoesNotBreakReads) {
   ASSERT_TRUE(e->readCached(0, 4096, buf.data())); // no crash; cached data intact
   EXPECT_EQ(0, memcmp(buf.data(), src.data(), 4096));
 }
+
+TEST(Fault, OpenTruncateFailureClosesTheDataFdOnce) {
+  // The fresh-start truncate fails: open() gives up (nullptr) and the
+  // descriptor it opened is closed exactly once. It used to be closed a second
+  // time by the destructor, and between the two closes that number could
+  // already belong to another file -- another entry's .data, a sidecar, a
+  // socket.
+  Fx fx;
+  fx.io.failNth(IoOp::kFtruncate, 2, EIO);
+  const int closesBefore = fx.io.calls(IoOp::kClose);
+  auto e = fx.open();
+  EXPECT_FALSE(e);
+  EXPECT_EQ(fx.io.calls(IoOp::kClose) - closesBefore, 1);
+}

@@ -6,7 +6,11 @@
 // (no starvation / deadlock); (4) zero CRC/meta corruption on the protected set.
 //
 // Roles across UCACHE_SOAK_PROCS children on a shared UCACHE_DIR:
-//   - writers: churn fresh keys (drive the cache past the limit -> eviction);
+//   - writers: churn fresh keys (drive the cache past the limit -> eviction),
+//     and each one also fills ITS OWN slice of ONE shared, pinned entry -- the
+//     shape a chunked multi-process reader produces (one job per chunk of the
+//     same file), which the fresh-key churn never does; the entry must be
+//     complete and byte-correct at exit;
 //   - readers: re-read the pinned working set and verify every byte;
 //   - one admin: interleaves evictNow() + setPinnedByKey() (the CLI-vs-plugin
 //     concurrent mutation path the w1-verify review flagged).
@@ -51,6 +55,12 @@ std::vector<uint8_t> pinnedBytes(uint64_t idx, size_t n) {
 
 std::string pinKey(uint64_t i) { return "root://soak//pin/" + std::to_string(i); }
 
+// One entry every writer fills a different slice of, concurrently, all run.
+std::string sharedKey() { return "root://soak//shared/one-entry-many-fillers"; }
+constexpr size_t kSliceBytes = 64 * 1024;
+uint64_t writerCount(uint64_t procs) { return procs / 2; } // the odd roles
+std::vector<uint8_t> sharedBytes(size_t n) { return pinnedBytes(0x5A4ED, n); }
+
 Config soakCfg(const std::string& dir, uint64_t maxBytes) {
   Config cfg;
   cfg.cacheDir = dir;
@@ -67,12 +77,15 @@ Config soakCfg(const std::string& dir, uint64_t maxBytes) {
 // One worker process. Returns via _exit: 0 ok, 3 content mismatch, 4 no progress.
 [[noreturn]] void worker(int role, const std::string& dir, uint64_t maxBytes,
                          uint64_t pinnedCount, size_t pinnedSize, size_t writeSize,
-                         uint64_t deadline, uint64_t seed, uint64_t writeDelayUs) {
+                         uint64_t nWriters, uint64_t deadline, uint64_t seed,
+                         uint64_t writeDelayUs) {
   RealIO io;
   CacheStore store(io, soakCfg(dir, maxBytes));
   std::mt19937_64 rng(seed);
   std::vector<uint8_t> wbuf(writeSize, static_cast<uint8_t>(seed));
   std::vector<uint8_t> rbuf(pinnedSize);
+  const size_t sharedSize = nWriters * kSliceBytes;
+  const std::vector<uint8_t> shared = sharedBytes(sharedSize);
   uint64_t ops = 0, ctr = 0;
   while (static_cast<uint64_t>(::time(nullptr)) < deadline) {
     if (role == 0) {
@@ -97,6 +110,13 @@ Config soakCfg(const std::string& dir, uint64_t maxBytes) {
       std::string k = "root://soak//w/" + std::to_string(::getpid()) + "/" + std::to_string(ctr++);
       if (auto e = store.open(*UrlKey::parse(k), writeSize))
         e->writePages(0, writeSize, wbuf.data());
+      // Shared entry: open, fill this writer's slice, close -- the close
+      // commits the slice to a sidecar every other writer is committing to.
+      {
+        const uint64_t w = static_cast<uint64_t>(role) / 2; // index among the odd roles
+        if (auto e = store.open(*UrlKey::parse(sharedKey()), sharedSize))
+          e->writePages(w * kSliceBytes, kSliceBytes, shared.data() + w * kSliceBytes);
+      }
       if (writeDelayUs)
         ::usleep(static_cast<useconds_t>(writeDelayUs));
     } else {
@@ -127,6 +147,8 @@ int main() {
   // cap, not an unbounded firehose. 0 = flat out (stress eviction throughput).
   const uint64_t writeDelayUs = envU64("UCACHE_SOAK_WRITE_DELAY_US", 3000);
   const uint64_t seed0 = envU64("UCACHE_SOAK_SEED", std::random_device{}());
+  const uint64_t nWriters = writerCount(procs);
+  const size_t sharedSize = nWriters * kSliceBytes;
 
   std::string dir;
   if (const char* d = ::getenv("UCACHE_DIR")) {
@@ -158,6 +180,12 @@ int main() {
         return 1;
       }
     }
+    // The shared entry starts EMPTY and pinned; the writers fill it.
+    auto e = store.open(*UrlKey::parse(sharedKey()), sharedSize);
+    if (!e || !store.setPinnedByKey(*UrlKey::parse(sharedKey()), true)) {
+      std::fprintf(stderr, "setup: shared entry failed\n");
+      return 1;
+    }
   }
 
   const uint64_t deadline = static_cast<uint64_t>(::time(nullptr)) + seconds;
@@ -165,8 +193,8 @@ int main() {
   for (uint64_t r = 0; r < procs; ++r) {
     pid_t pid = ::fork();
     if (pid == 0)
-      worker(static_cast<int>(r), dir, maxBytes, pinnedCount, pinnedSize, writeSize, deadline,
-             seed0 + r, writeDelayUs);
+      worker(static_cast<int>(r), dir, maxBytes, pinnedCount, pinnedSize, writeSize, nWriters,
+             deadline, seed0 + r, writeDelayUs);
     if (pid < 0) {
       std::perror("fork");
       return 1;
@@ -261,15 +289,39 @@ int main() {
     }
   }
 
+  // The shared entry: every writer committed its slice from its own process,
+  // concurrently with the others, hundreds of times. All slices must be there
+  // and byte-correct -- a sidecar store that replaced the image instead of
+  // committing into it leaves only the last writer's slice.
+  uint64_t sharedBad = 0;
+  if (!exploded) {
+    auto e = store.open(*UrlKey::parse(sharedKey()), sharedSize);
+    std::vector<uint8_t> buf(sharedSize);
+    const auto exp = sharedBytes(sharedSize);
+    if (!e || !e->hasRange(0, sharedSize)) {
+      std::fprintf(stderr, "FAIL: shared entry incomplete after soak: %llu of %llu bytes\n",
+                   e ? (unsigned long long)e->cachedBytes() : 0ull, (unsigned long long)sharedSize);
+      ++sharedBad;
+    } else if (!e->readCached(0, sharedSize, buf.data()) ||
+               std::memcmp(buf.data(), exp.data(), sharedSize) != 0) {
+      std::fprintf(stderr, "FAIL: shared entry served wrong bytes after soak\n");
+      ++sharedBad;
+    } else if (e->verifyAll().bad != 0) {
+      std::fprintf(stderr, "FAIL: shared entry has CRC-bad pages\n");
+      ++sharedBad;
+    }
+  }
+
   // Usage must have stayed bounded (eviction kept up). A peak above the bound is
   // reported but does not by itself fail the run; only a sustained breach or the
   // hard ceiling does, which is what `exploded` records.
   bool boundOk = !exploded;
   std::printf("soak done: maxUsage=%llu (cap=%llu, bound=%llu, hard=%llu) maxOverStreak=%d/%d "
-              "badPins=%llu workerFails=%d\n",
+              "badPins=%llu sharedBad=%llu workerFails=%d\n",
               (unsigned long long)maxUsage, (unsigned long long)maxBytes,
               (unsigned long long)bound, (unsigned long long)hardBound, maxOverStreak,
-              kSustainedSamples, (unsigned long long)badPins, fails);
+              kSustainedSamples, (unsigned long long)badPins, (unsigned long long)sharedBad,
+              fails);
   if (!boundOk)
     std::fprintf(stderr,
                  "FAIL: usage exceeded bound %llu (%s; peak %llu, %d consecutive samples "
@@ -284,5 +336,5 @@ int main() {
   if (!::getenv("UCACHE_DIR"))
     rmTree(dir); // only clean a dir we created
 
-  return (fails == 0 && badPins == 0 && boundOk) ? 0 : 1;
+  return (fails == 0 && badPins == 0 && sharedBad == 0 && boundOk) ? 0 : 1;
 }

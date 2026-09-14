@@ -26,11 +26,21 @@
 // bytes are invisible to cachedBytes()/usage until flushed (eviction
 // flushes first). fill_buffer_mb = 0 restores the legacy immediate path.
 //
+// Cross-process: several processes may hold the same entry open and fill
+// different ranges of it (one job per chunk; several jobs on one node). Page
+// data is idempotent, so the .data writes never conflict. The sidecar is
+// shared state and is COMMITTED, never replaced: every store re-reads the
+// image on disk under the entry lock, applies only the pages this handle set
+// or cleared since its last store (plus a pin it changed), stores the result
+// and adopts it, so a sibling's pages are served here as well. A fresh
+// entry's empty sidecar is stored at open, under the same lock, so a second
+// opener joins the fill instead of truncating it.
+//
 // Thread-safety: fully thread-safe. A single mutex guards bitmap/CRC/meta
 // state AND the two stage maps; data-file pread/pwrite run outside the
 // lock (page writes are idempotent-same-bytes; presence bits only ever
 // transition absent→present under the lock, and present→absent only on
-// CRC failure / clearAll). At most one buffer flush runs at a time
+// CRC failure, a punch, or a commit adopting a sibling's clear). At most one buffer flush runs at a time
 // (flushInProgress_ + condvar); staged pages stay readable during their
 // flush via the flushing_ map.
 #pragma once
@@ -237,6 +247,15 @@ class FileEntry {
   // Legacy immediate write path (fill_buffer_mb = 0), byte-identical to the
   // pre-buffering behavior; also the fallback if staging is disabled at runtime.
   void writePagesDirect(uint64_t off, uint64_t len, const void* buf);
+  // Would open() adopt this sidecar for this origin? Shared by open (both of
+  // its reads) and by the store-time merge, so "same entry" has one meaning.
+  static bool adoptable(const MetaData& m, const Config& cfg, const UrlKey& key,
+                        uint64_t originSize, uint64_t originMtime, uint8_t cksumKind,
+                        uint32_t originCksum);
+  // Presence transitions, under mu_: the bit, its CRC, and the since-last-store
+  // delta the next sidecar commit carries.
+  void publishPage(uint64_t pg, uint32_t crc);
+  void retractPage(uint64_t pg);
 
   IOBackend& io_;
   const Config& cfg_;
@@ -252,6 +271,11 @@ class FileEntry {
   MetaData meta_;
   bool dirty_ = false;
   uint64_t lastFlushS_ = 0; // monotonic-ish seconds of last sidecar persist
+  // What THIS handle changed since its last successful sidecar store — the
+  // only part of the image it may claim when it commits (see flushMeta).
+  PageBitmap setSince_;
+  PageBitmap clearedSince_;
+  bool pinTouched_ = false;
 
   // Fill buffer. Page payloads are immutable once staged; both maps are
   // ordered by page index so a flush walk coalesces naturally.

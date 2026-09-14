@@ -56,49 +56,61 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
   if (e->dataFd_ < 0)
     return nullptr;
 
-  // Full-meta load under shared lock.
+  // Full-meta load under shared lock: the common case, an entry already on
+  // disk, costs one shared read.
   io.flock(e->dataFd_, LOCK_SH);
   auto loaded = MetaFile::load(io, e->metaPath_);
   io.flock(e->dataFd_, LOCK_UN);
 
-  bool metaFileExists = false;
-  {
-    struct ::stat st;
-    metaFileExists = io.stat(e->metaPath_, &st) == 0;
-  }
-
-  bool adopt = false;
-  if (loaded) {
-    const MetaData& m = *loaded;
-    adopt = m.key == key.key && m.fileSize == originSize &&
-            Config::validPageSize(m.pageSize) && m.npages() == m.pageCrcs.size();
-    if (adopt && cfg.validate == ValidateMode::kSizeMtime)
-      adopt = m.originMtime == originMtime;
-    if (adopt && cfg.validate == ValidateMode::kCksum && cksumKind != MetaData::kCksumNone)
-      adopt = m.cksumKind == cksumKind && m.originCksum == originCksum;
+  bool adopt =
+      loaded && adoptable(*loaded, cfg, key, originSize, originMtime, cksumKind, originCksum);
+  if (!adopt) {
+    // Fresh start, under the entry's EXCLUSIVE lock. Another process may have
+    // created this entry between the shared read above and now, and a second
+    // opener that truncated here would zero pages the first one has written
+    // but not yet published. So the sidecar is read again under the lock and
+    // adopted if it can be; only the read that decides is counted.
+    io.flock(e->dataFd_, LOCK_EX);
+    loaded = MetaFile::load(io, e->metaPath_);
+    adopt =
+        loaded && adoptable(*loaded, cfg, key, originSize, originMtime, cksumKind, originCksum);
     if (!adopt) {
-      stats.validationsFailed.fetch_add(1, std::memory_order_relaxed);
-      UCACHE_INFO("validation failed for %s (stale sidecar); starting fresh", key.key.c_str());
+      if (loaded) {
+        stats.validationsFailed.fetch_add(1, std::memory_order_relaxed);
+        UCACHE_INFO("validation failed for %s (stale sidecar); starting fresh",
+                    key.key.c_str());
+      } else {
+        struct ::stat st;
+        if (io.stat(e->metaPath_, &st) == 0) {
+          stats.metaCorrupt.fetch_add(1, std::memory_order_relaxed);
+          UCACHE_WARN("corrupt/torn sidecar for %s; starting fresh", key.key.c_str());
+        }
+      }
+      // Logical size = origin size, sparse.
+      if (io.ftruncate(e->dataFd_, 0) < 0 || io.ftruncate(e->dataFd_, originSize) < 0) {
+        io.flock(e->dataFd_, LOCK_UN);
+        io.close(e->dataFd_);
+        e->dataFd_ = -1; // the destructor closes what is >= 0: this fd is gone
+        return nullptr;
+      }
+      e->meta_ = MetaData::fresh(key.key, originSize, cfg.pageSize);
+      e->meta_.originMtime = originMtime;
+      e->meta_.cksumKind = cksumKind;
+      e->meta_.originCksum = originCksum;
+      // Store the empty sidecar NOW, still under the lock, so every later
+      // opener adopts this generation instead of truncating it again. If the
+      // store fails the entry stays dirty and a later flush retries, as before.
+      if (MetaFile::store(io, e->metaPath_, e->meta_, cfg.fsync == FsyncMode::kAll) != 0) {
+        stats.failopenEvents.fetch_add(1, std::memory_order_relaxed);
+        e->dirty_ = true;
+      }
     }
-  } else if (metaFileExists) {
-    stats.metaCorrupt.fetch_add(1, std::memory_order_relaxed);
-    UCACHE_WARN("corrupt/torn sidecar for %s; starting fresh", key.key.c_str());
+    io.flock(e->dataFd_, LOCK_UN);
   }
-
-  if (adopt) {
+  if (adopt)
     e->meta_ = std::move(*loaded);
-  } else {
-    // Fresh start: logical size = origin size, sparse.
-    if (io.ftruncate(e->dataFd_, 0) < 0 || io.ftruncate(e->dataFd_, originSize) < 0) {
-      io.close(e->dataFd_);
-      return nullptr;
-    }
-    e->meta_ = MetaData::fresh(key.key, originSize, cfg.pageSize);
-    e->meta_.originMtime = originMtime;
-    e->meta_.cksumKind = cksumKind;
-    e->meta_.originCksum = originCksum;
-    e->dirty_ = true;
-  }
+  e->setSince_.reset(e->meta_.npages());
+  e->clearedSince_.reset(e->meta_.npages());
   e->lastFlushS_ = nowS();
   e->lastBufFlushS_ = nowS();
   stats.opens.fetch_add(1, std::memory_order_relaxed);
@@ -116,6 +128,32 @@ std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Sta
   }
   e->noteActivity();
   return e;
+}
+
+bool FileEntry::adoptable(const MetaData& m, const Config& cfg, const UrlKey& key,
+                          uint64_t originSize, uint64_t originMtime, uint8_t cksumKind,
+                          uint32_t originCksum) {
+  bool ok = m.key == key.key && m.fileSize == originSize && Config::validPageSize(m.pageSize) &&
+            m.npages() == m.pageCrcs.size();
+  if (ok && cfg.validate == ValidateMode::kSizeMtime)
+    ok = m.originMtime == originMtime;
+  if (ok && cfg.validate == ValidateMode::kCksum && cksumKind != MetaData::kCksumNone)
+    ok = m.cksumKind == cksumKind && m.originCksum == originCksum;
+  return ok;
+}
+
+void FileEntry::publishPage(uint64_t pg, uint32_t crc) {
+  meta_.bitmap.set(pg);
+  meta_.pageCrcs[pg] = crc;
+  setSince_.set(pg);
+  clearedSince_.clear(pg);
+}
+
+void FileEntry::retractPage(uint64_t pg) {
+  meta_.bitmap.clear(pg);
+  meta_.pageCrcs[pg] = 0;
+  clearedSince_.set(pg);
+  setSince_.clear(pg);
 }
 
 FileEntry::~FileEntry() {
@@ -219,10 +257,8 @@ bool FileEntry::hasRange(uint64_t off, uint64_t len) {
 
 void FileEntry::demoteRun(uint64_t firstPage, uint64_t lastPage, const char* why) {
   std::lock_guard<std::mutex> g(mu_);
-  for (uint64_t i = firstPage; i <= lastPage; ++i) {
-    meta_.bitmap.clear(i);
-    meta_.pageCrcs[i] = 0;
-  }
+  for (uint64_t i = firstPage; i <= lastPage; ++i)
+    retractPage(i);
   meta_.flags &= ~MetaData::kFlagComplete;
   dirty_ = true;
   stats_.crcFailures.fetch_add(1, std::memory_order_relaxed);
@@ -501,10 +537,8 @@ void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
   bool complete = false;
   {
     std::lock_guard<std::mutex> g(mu_);
-    for (auto [pg, crc] : done) {
-      meta_.bitmap.set(pg);
-      meta_.pageCrcs[pg] = crc;
-    }
+    for (auto [pg, crc] : done)
+      publishPage(pg, crc);
     dirty_ = true;
     complete = meta_.bitmap.count() == meta_.npages();
     if (complete)
@@ -601,10 +635,8 @@ void FileEntry::flushBuffer(bool force) {
   bool anyPublished = !published.empty();
   {
     std::lock_guard<std::mutex> g(mu_);
-    for (auto [pg, crc] : published) {
-      meta_.bitmap.set(pg);
-      meta_.pageCrcs[pg] = crc;
-    }
+    for (auto [pg, crc] : published)
+      publishPage(pg, crc);
     if (anyPublished) {
       dirty_ = true;
       if (meta_.bitmap.count() == meta_.npages())
@@ -672,6 +704,8 @@ void FileEntry::touchAtime() {
 
 void FileEntry::flushMeta(bool force) {
   MetaData snapshot;
+  PageBitmap sets, clears;
+  bool pinTouched = false;
   {
     std::lock_guard<std::mutex> g(mu_);
     if (!dirty_)
@@ -680,16 +714,64 @@ void FileEntry::flushMeta(bool force) {
     if (!force && now < lastFlushS_ + static_cast<uint64_t>(cfg_.metaFlushSeconds))
       return;
     snapshot = meta_; // value copy under lock; store happens outside
+    sets = setSince_;
+    clears = clearedSince_;
+    pinTouched = pinTouched_;
+    setSince_.clearAll();
+    clearedSince_.clearAll();
+    pinTouched_ = false;
     dirty_ = false;
     lastFlushS_ = now;
   }
-  // Evicted-while-open: never resurrect the sidecar (see FORMAT.md).
-  struct ::stat st;
-  if (io_.fstat(dataFd_, &st) == 0 && st.st_nlink == 0)
-    return;
   const uint64_t mT0 = nowUsSteady();
   io_.flock(dataFd_, LOCK_EX);
-  int rc = MetaFile::store(io_, metaPath_, snapshot, cfg_.fsync == FsyncMode::kAll);
+  // Evicted-while-open: never resurrect the sidecar (see FORMAT.md). Checked
+  // under the lock, so the answer is current when the store happens.
+  struct ::stat st;
+  if (io_.fstat(dataFd_, &st) == 0 && st.st_nlink == 0) {
+    io_.flock(dataFd_, LOCK_UN);
+    return;
+  }
+  // The image on disk is shared with every other process holding this entry,
+  // and they may have published pages since this handle last looked. Storing
+  // this handle's view whole would erase theirs -- the last process to close
+  // used to decide what the entry contained. So the commit starts from the
+  // image on disk and applies only what THIS handle changed since its last
+  // store: the pages it set (with their CRCs), the pages it cleared, and a pin
+  // it touched. Deltas rather than a union of views, because a union would put
+  // back a bit this handle cleared on purpose -- releaseRanges clears bits and
+  // THEN punches, so a resurrected bit is a bit over a hole -- and would let a
+  // sibling re-add it from a stale full view.
+  MetaData out;
+  bool merged = false;
+  if (auto disk = MetaFile::load(io_, metaPath_);
+      disk && disk->pageSize == snapshot.pageSize &&
+      adoptable(*disk, cfg_, key_, snapshot.fileSize, snapshot.originMtime, snapshot.cksumKind,
+                snapshot.originCksum)) {
+    out = std::move(*disk);
+    const uint64_t n = out.npages();
+    for (uint64_t i = 0; i < n; ++i) {
+      if (clears.get(i)) {
+        out.bitmap.clear(i);
+        out.pageCrcs[i] = 0;
+      } else if (sets.get(i)) {
+        out.bitmap.set(i);
+        out.pageCrcs[i] = snapshot.pageCrcs[i];
+      }
+    }
+    if (pinTouched)
+      out.flags = (out.flags & ~MetaData::kFlagPinned) | (snapshot.flags & MetaData::kFlagPinned);
+    out.flags &= ~MetaData::kFlagComplete;
+    if (n && out.bitmap.count() == n)
+      out.flags |= MetaData::kFlagComplete;
+    out.atime = std::max(out.atime, snapshot.atime);
+    merged = true;
+  } else {
+    // No sidecar, a torn one, or another generation of this key: this view is
+    // the whole truth, as it always was for a lone process.
+    out = std::move(snapshot);
+  }
+  int rc = MetaFile::store(io_, metaPath_, out, cfg_.fsync == FsyncMode::kAll);
   io_.flock(dataFd_, LOCK_UN);
   stats_.metaFlushUs.add(nowUsSteady() - mT0);
   if (stats_.tracer)
@@ -697,8 +779,44 @@ void FileEntry::flushMeta(bool force) {
   if (rc < 0) {
     stats_.failopenEvents.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> g(mu_);
-    dirty_ = true; // retry on a later flush
+    dirty_ = true; // retry on a later flush, with the same changes still pending
+    // Re-arm the deltas -- except where a newer opposite transition has
+    // happened since, which is the one that must win.
+    const uint64_t n = meta_.npages();
+    for (uint64_t i = 0; i < n; ++i) {
+      if (sets.get(i) && !clearedSince_.get(i))
+        setSince_.set(i);
+      if (clears.get(i) && !setSince_.get(i))
+        clearedSince_.set(i);
+    }
+    pinTouched_ = pinTouched_ || pinTouched;
+    return;
   }
+  if (!merged)
+    return;
+  // Adopt the committed image: pages this handle has not touched since the
+  // snapshot take the on-disk state, so a sibling's pages are served here too
+  // (CRC-verified like any other) and are not fetched a second time, and a
+  // sibling's clear is honoured rather than re-published from memory.
+  std::lock_guard<std::mutex> g(mu_);
+  const uint64_t n = meta_.npages();
+  for (uint64_t i = 0; i < n; ++i) {
+    if (setSince_.get(i) || clearedSince_.get(i))
+      continue;
+    if (out.bitmap.get(i)) {
+      meta_.bitmap.set(i);
+      meta_.pageCrcs[i] = out.pageCrcs[i];
+    } else {
+      meta_.bitmap.clear(i);
+      meta_.pageCrcs[i] = 0;
+    }
+  }
+  if (!pinTouched_)
+    meta_.flags = (meta_.flags & ~MetaData::kFlagPinned) | (out.flags & MetaData::kFlagPinned);
+  meta_.flags &= ~MetaData::kFlagComplete;
+  if (n && meta_.bitmap.count() == n)
+    meta_.flags |= MetaData::kFlagComplete;
+  meta_.atime = std::max(meta_.atime, out.atime);
 }
 
 bool FileEntry::pinned() {
@@ -713,6 +831,7 @@ void FileEntry::setPinned(bool p) {
       meta_.flags |= MetaData::kFlagPinned;
     else
       meta_.flags &= ~MetaData::kFlagPinned;
+    pinTouched_ = true;
     dirty_ = true;
   }
   flushMeta(true);
@@ -752,8 +871,7 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
         }
         if (!meta_.bitmap.get(i))
           continue;
-        meta_.bitmap.clear(i);
-        meta_.pageCrcs[i] = 0;
+        retractPage(i);
         res += meta_.pageBytes(i);
         any = true;
       }

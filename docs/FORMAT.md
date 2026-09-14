@@ -56,12 +56,24 @@ reach disk, in keys or file names.
   `flock(LOCK_EX)` on the entry's `.data` fd (stable inode; the sidecar's
   inode changes on every rewrite). Readers take `LOCK_SH` on `.data` for
   full-meta loads at open.
+- A rewrite is a **commit, not a replacement.** Several processes may hold
+  one entry open and fill different ranges of it (one job per chunk, or
+  several jobs on one node). Under the lock the writer re-reads the sidecar
+  and applies only the pages **it** set or cleared since its last store, plus
+  a `pinned` flag it changed; every other bit and CRC is taken from the image
+  on disk. So a sibling's pages survive, and a page one process cleared
+  before punching is not put back by another process's stale view. The writer
+  then adopts the committed image, so it serves its siblings' pages as well.
+- A fresh entry's empty sidecar is stored at open, under the same lock, so a
+  second opener adopts it instead of truncating `.data` under a fill that has
+  not published its pages yet.
 - The whole-image `meta_crc` makes torn sidecar writes detectable: a corrupt
   or truncated sidecar simply fails to load and the entry restarts empty
   (`meta_corrupt` counted). A crash can therefore only lose cached pages —
   never serve wrong bytes.
 - Page writes are idempotent (same origin bytes at the same offsets), so
-  concurrent populators — including other processes — are benign.
+  concurrent populators — including other processes — never conflict on
+  `.data`; their sidecar changes are merged by the commit rule above.
 - An entry unlinked while open (eviction) keeps serving through its open fd;
   the owner detects `st_nlink == 0` before sidecar flushes and skips them so
   the entry is not resurrected.

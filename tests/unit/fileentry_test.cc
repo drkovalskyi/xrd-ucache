@@ -704,3 +704,173 @@ TEST(FileEntry, AnEntryWithNoSharedFootprintOfEitherKindStillRecords) {
   EXPECT_FALSE(e->footprint().sig(fx.src.size()).empty());
   EXPECT_EQ(e->footprint().count(fx.src.size()), 1u);
 }
+
+// ---- Several handles on one entry: several processes sharing a cache dir ----
+//
+// FileEntry keeps no per-process state outside the object, so two handles in
+// one process ARE two processes as far as the sidecar is concerned: each has
+// its own view, and the .data flock serialises them the same way. Until the
+// commit rule existed, the last handle to store decided what the entry held,
+// and everyone else's pages sat in .data with no bit and no CRC.
+
+namespace {
+// The bytes actually in .data at [off, off+len) -- a truncated span reads as
+// zeros, whatever the bitmap claims.
+bool rawDataMatches(const Fixture& fx, uint64_t off, uint64_t len) {
+  int fd = ::open(fx.key.dataPath(fx.cfg.cacheDir).c_str(), O_RDONLY);
+  if (fd < 0)
+    return false;
+  std::vector<uint8_t> buf(len);
+  const bool ok = ::pread(fd, buf.data(), len, static_cast<off_t>(off)) ==
+                      static_cast<ssize_t>(len) &&
+                  memcmp(buf.data(), fx.src.data() + off, len) == 0;
+  ::close(fd);
+  return ok;
+}
+} // namespace
+
+TEST(FileEntry, DisjointFillsFromTwoHandlesBothSurvive) {
+  Fixture fx;
+  auto a = fx.open();
+  auto b = fx.open(); // both hold the entry before either has stored anything
+  a->writePages(4096, 3 * 4096, fx.src.data() + 4096);   // pages 1..3
+  a->flushAll();
+  b->writePages(40960, 3 * 4096, fx.src.data() + 40960); // pages 10..12
+  b->flushAll(); // used to store B's view whole and drop A's pages
+  a.reset();
+  b.reset();
+  auto c = fx.open();
+  ASSERT_TRUE(c);
+  EXPECT_TRUE(c->hasRange(4096, 3 * 4096));
+  EXPECT_TRUE(c->hasRange(40960, 3 * 4096));
+  EXPECT_EQ(c->cachedBytes(), 6u * 4096);
+  std::vector<uint8_t> buf(3 * 4096);
+  ASSERT_TRUE(c->readCached(4096, buf.size(), buf.data()));
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + 4096, buf.size()));
+  ASSERT_TRUE(c->readCached(40960, buf.size(), buf.data()));
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + 40960, buf.size()));
+  EXPECT_EQ(fx.stats.crcFailures.load(), 0u);
+}
+
+TEST(FileEntry, ThreeHandlesCommitInAnyOrder) {
+  Fixture fx(100000, 4096); // 25 pages
+  auto a = fx.open();
+  auto b = fx.open();
+  auto c = fx.open();
+  a->writePages(0, 4 * 4096, fx.src.data());                     // 0..3
+  b->writePages(8 * 4096, 4 * 4096, fx.src.data() + 8 * 4096);   // 8..11
+  c->writePages(16 * 4096, 4 * 4096, fx.src.data() + 16 * 4096); // 16..19
+  c->flushAll();
+  a->flushAll();
+  b->flushAll();
+  a.reset();
+  b.reset();
+  c.reset();
+  auto d = fx.open();
+  EXPECT_EQ(d->cachedBytes(), 12u * 4096);
+  EXPECT_TRUE(d->hasRange(0, 4 * 4096));
+  EXPECT_TRUE(d->hasRange(8 * 4096, 4 * 4096));
+  EXPECT_TRUE(d->hasRange(16 * 4096, 4 * 4096));
+}
+
+TEST(FileEntry, CommitAdoptsSiblingPages) {
+  Fixture fx;
+  auto a = fx.open();
+  auto b = fx.open();
+  b->writePages(40960, 3 * 4096, fx.src.data() + 40960); // pages 10..12
+  b->flushAll();
+  EXPECT_FALSE(a->hasRange(40960, 4096)); // A has not looked since it opened
+  a->writePages(0, 4096, fx.src.data());  // something of A's own to commit
+  a->flushAll();                          // the commit re-reads the image and adopts B's pages
+  EXPECT_TRUE(a->hasRange(40960, 3 * 4096));
+  std::vector<uint8_t> buf(3 * 4096);
+  ASSERT_TRUE(a->readCached(40960, buf.size(), buf.data())); // CRC-verified like any page
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + 40960, buf.size()));
+  // The idempotent-write skip now covers B's pages too: no second write.
+  const uint64_t before = fx.stats.pageWrites.load();
+  a->writePages(40960, 3 * 4096, fx.src.data() + 40960);
+  a->flushBuffer(true);
+  EXPECT_EQ(fx.stats.pageWrites.load(), before);
+}
+
+TEST(FileEntry, ClearedPageIsNotResurrectedBySiblingsStaleView) {
+  Fixture fx;
+  auto a = fx.open();
+  auto b = fx.open();
+  a->writePages(0, 4 * 4096, fx.src.data()); // pages 0..3
+  a->flushAll();
+  b->writePages(5 * 4096, 4096, fx.src.data() + 5 * 4096); // page 5
+  b->flushAll();                                            // B now holds 0..3 as well
+  ASSERT_TRUE(b->hasRange(0, 4 * 4096));
+  // A punches 0..3: bits cleared and committed, then the bytes go.
+  a->releaseRanges({{0, 4 * 4096}});
+  EXPECT_FALSE(a->hasRange(0, 4096));
+  // B commits again from a view that still has 0..3 set. A union of views
+  // would put those bits back over the hole; a delta commit does not -- and
+  // B's own view follows the disk.
+  b->writePages(6 * 4096, 4096, fx.src.data() + 6 * 4096); // page 6
+  b->flushAll();
+  EXPECT_FALSE(b->hasRange(0, 4096));
+  a.reset();
+  b.reset();
+  auto c = fx.open();
+  EXPECT_FALSE(c->hasRange(0, 4 * 4096));
+  EXPECT_TRUE(c->hasRange(5 * 4096, 2 * 4096));
+  EXPECT_EQ(c->cachedBytes(), 2u * 4096);
+  EXPECT_EQ(fx.stats.crcFailures.load(), 0u);
+}
+
+TEST(FileEntry, PinSetThroughOneHandleSurvivesAnothersCommit) {
+  Fixture fx;
+  auto a = fx.open();
+  auto b = fx.open();
+  b->setPinned(true); // stores at once
+  a->writePages(0, 4096, fx.src.data());
+  a->flushAll(); // A never touched the pin: the on-disk value stands, and A adopts it
+  EXPECT_TRUE(a->pinned());
+  a.reset();
+  b.reset();
+  auto c = fx.open();
+  EXPECT_TRUE(c->pinned());
+  EXPECT_TRUE(c->hasRange(0, 4096));
+  // An explicit unpin through one handle wins over a sibling's stale pinned view.
+  auto d = fx.open();
+  c->setPinned(false);
+  d->writePages(4096, 4096, fx.src.data() + 4096);
+  d->flushAll();
+  c.reset();
+  d.reset();
+  EXPECT_FALSE(fx.open()->pinned());
+}
+
+TEST(FileEntry, FreshOpenDoesNotTruncateSiblingsUnpublishedPages) {
+  Fixture fx;
+  fx.cfg.fillBufferMb = 0; // bytes land at once; the sidecar waits for the flush interval
+  auto a = fx.open();
+  a->writePages(0, 4 * 4096, fx.src.data());
+  ASSERT_TRUE(rawDataMatches(fx, 0, 4 * 4096));
+  auto b = fx.open(); // a second process arriving mid-fill
+  EXPECT_TRUE(rawDataMatches(fx, 0, 4 * 4096)) << "the second open truncated the first's pages";
+  b.reset();
+  a->flushAll();
+  a.reset();
+  auto c = fx.open();
+  std::vector<uint8_t> buf(4 * 4096);
+  ASSERT_TRUE(c->readCached(0, buf.size(), buf.data()));
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data(), buf.size()));
+  EXPECT_EQ(fx.stats.crcFailures.load(), 0u);
+  EXPECT_EQ(fx.stats.validationsFailed.load(), 0u);
+}
+
+TEST(FileEntry, FreshOpenStoresTheSidecarAtOnce) {
+  Fixture fx;
+  auto e = fx.open();
+  struct stat st;
+  EXPECT_EQ(::stat(fx.key.metaPath(fx.cfg.cacheDir).c_str(), &st), 0);
+  // ... and a sibling opening now adopts it: no validation failure, no reset.
+  auto f = fx.open();
+  ASSERT_TRUE(f);
+  EXPECT_EQ(fx.stats.validationsFailed.load(), 0u);
+  EXPECT_EQ(fx.stats.metaCorrupt.load(), 0u);
+  EXPECT_EQ(fx.stats.opens.load(), 2u);
+}
