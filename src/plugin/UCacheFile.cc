@@ -2069,17 +2069,27 @@ bool UCacheFile::GetProperty(const std::string& name, std::string& value) const 
   // dies on None), sane readv defaults, and NO follow-up server query — a
   // warm open must never touch the network (an offline-warm leg gates this;
   // synthesizing a real host here hung offline warm reads on the clients'
-  // FileSystem config query). DataServer stays unset for the same reason:
-  // both clients default gracefully on its absence, and any real value
-  // invites contact with an origin that may be down. The path is the URL's
-  // (never the cache's .data file: a sparse page file read directly would
-  // be silent corruption; this path fails loudly if anything opens it).
+  // FileSystem config query). The path is the URL's (never the cache's .data
+  // file: a sparse page file read directly would be silent corruption; this
+  // path fails loudly if anything opens it).
+  //
+  // DataServer is answered with an EMPTY value, never a real host (the same
+  // origin-may-be-down reason) and never "no such property". ROOT and uproot's
+  // own XRootD source take the LastURL branch above and never ask for it;
+  // fsspec-xrootd -- uproot 5's default transport -- asks for nothing else,
+  // and in Python an unset property arrives as None: it takes its no-server
+  // defaults on "" and died in client.URL(None) on the second open of every
+  // cached file. Fail-open means answering what each client can act on.
   if (name == "LastURL") {
     std::lock_guard<std::mutex> g(st_->mu);
     if (!st_->url.empty()) {
       value = "file://localhost" + XrdCl::URL(st_->url).GetPath();
       return true;
     }
+  }
+  if (name == "DataServer") {
+    value.clear();
+    return true;
   }
   return false;
 }

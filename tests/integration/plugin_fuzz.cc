@@ -69,13 +69,31 @@ struct StrictOpenHandler : XrdCl::ResponseHandler {
   }
 };
 
-// Async open through the strict handler; returns false on any failure.
+// Async open through the strict handler; returns false on any failure --
+// including a property-contract violation. After a successful open, cold or
+// cache-served, every property a client routes on must be a STRING: LastURL
+// is what ROOT and uproot's own source branch on; DataServer is what
+// fsspec-xrootd (uproot 5's default transport) asks for, and in Python an
+// unset property arrives as None. A cache-served open used to decline
+// DataServer, and uproot died in client.URL(None) on the second open of every
+// cached file.
 bool strictOpen(XrdCl::File& file, const char* url) {
   StrictOpenHandler oh;
   auto st = file.Open(url, XrdCl::OpenFlags::Read, XrdCl::Access::None, &oh);
   if (!st.IsOK())
     return false;
-  return oh.wait();
+  if (!oh.wait())
+    return false;
+  std::string v;
+  if (!file.GetProperty("LastURL", v) || v.empty()) {
+    std::fprintf(stderr, "LastURL unset after open\n");
+    return false;
+  }
+  if (!file.GetProperty("DataServer", v)) {
+    std::fprintf(stderr, "DataServer unset after open (a Python client sees None)\n");
+    return false;
+  }
+  return true;
 }
 
 struct Source {
