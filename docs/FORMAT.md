@@ -51,7 +51,9 @@ reach disk, in keys or file names.
   cleared, CRC zeroed), refetched from origin, `crc_failures` counted.
 - Write ordering: page data is written (and optionally fdatasync'd per
   `UCACHE_FSYNC`) **before** its bit is set. The bitmap+CRCs are flushed on
-  close and every `UCACHE_META_FLUSH_S` (default 30 s).
+  close and every `UCACHE_META_FLUSH_S` (default 30 s) — by time, not only
+  when a write arrives, so a process that stops writing and exits without
+  running destructors leaves at most one interval of fill behind.
 - Sidecar rewrites are atomic: serialize → `<path>.meta.tmp` → rename, under
   `flock(LOCK_EX)` on the entry's `.data` fd (stable inode; the sidecar's
   inode changes on every rewrite). Readers take `LOCK_SH` on `.data` for

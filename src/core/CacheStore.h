@@ -162,6 +162,17 @@ class CacheStore {
   // per-file records of entries still alive (their destructors may never run;
   // emit-once guard prevents doubles).
   void dumpStats(bool finalDump = false);
+  // Periodic checkpoint for processes that may never exit cleanly. A
+  // multiprocessing worker _exit()s: no destructors, no atexit, so without this
+  // it took every page staged since its last write-driven drain and its whole
+  // counter record with it -- the run looked like it never happened, and the
+  // next pass fetched those pages again. Drains and commits every live entry
+  // on the interval policy (FileEntry::checkpoint), then appends a counter
+  // line; the readers take the last complete line, so nothing double-counts.
+  // The plugin re-arms it every metaFlushSeconds on the executor timer, so a
+  // hard exit is at most one period short. Writes no counter line in a CLI
+  // process (disableStatsDump).
+  void checkpoint();
   // Per-file record for a handle the cache never served (pass-through:
   // UCACHE_DISABLE, write-opened, no store entry). Same companion file and
   // shape as FileEntry's lifetime records, with the bytes under `wire_bytes` —
@@ -287,6 +298,7 @@ class CacheStore {
   std::atomic<bool> blockedWarned_{false}; // WARN once per process, not per entry
   std::string statsPath_;
   bool dumpStatsOnDtor_ = true;
+  std::mutex dumpMu_; // dumpStats: the checkpoint, the destructor and atexit may overlap
   // Distinct keys opened this process (drives stats.filesOpened);
   // the Layer-2 record sink and the optional Layer-3 tracer. The sink is
   // shared with entries so a record can still land after store teardown.

@@ -31,10 +31,15 @@ one process's work is bracketed without any periodic sampling, and the
 should take the file name's `<start_ts>` as the start of the run.
 
 One JSON line is appended to `$UCACHE_DIR/stats/<host>-<pid>-<start_ts>-<seq>.jsonl`
-at every `CacheStore::dumpStats()` (explicit calls, store destruction; the
-plugin adds close/atexit). External tooling consumes these — the
-schema is a correctness surface; changes require updating this file and the
-consumers together.
+at every `CacheStore::dumpStats()`: explicit calls, store destruction, the
+plugin's `atexit`, and **every `meta_flush_seconds` (default 30 s) while the
+process runs**. That periodic line is what keeps a run visible when its
+process exits without running destructors — Python's `multiprocessing` and
+`concurrent.futures` workers `_exit()`, which skips `atexit` too — so such a
+run is at most one period short instead of absent. Counters are cumulative,
+so consumers take the last complete line. External tooling consumes these —
+the schema is a correctness surface; changes require updating this file and
+the consumers together.
 
 ## Line schema
 

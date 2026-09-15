@@ -8,6 +8,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <sys/file.h>
+#include <chrono>
 #include <thread>
 
 using namespace ucache;
@@ -1025,4 +1026,131 @@ TEST(CacheStore, ProtectWindowDefaultIsOneDay) {
   // nothing defends.
   Config cfg;
   EXPECT_EQ(cfg.evictProtectSeconds, 86400u);
+}
+
+// ---- Periodic checkpoint: what a process that never runs its destructors leaves ----
+//
+// A multiprocessing worker _exit()s: no destructors, no atexit. Before the
+// checkpoint existed such a process took every page it had staged since its
+// last write-driven drain with it, and its whole counter record -- a 24 MB
+// read left 0 bytes cached and no run at all.
+
+#include <cstring>
+
+namespace {
+// The counter file (never a companion) of a cache's stats dir, or "".
+std::string counterFile(IOBackend& io, const std::string& dir) {
+  std::vector<std::string> names;
+  if (io.listDir(dir + "/stats", names) != 0)
+    return "";
+  for (const auto& n : names)
+    if (n.size() > 6 && n.compare(n.size() - 6, 6, ".jsonl") == 0 &&
+        n.find(".files.jsonl") == std::string::npos && n.find(".trace.jsonl") == std::string::npos)
+      return dir + "/stats/" + n;
+  return "";
+}
+std::vector<std::string> completeLines(const std::string& path) {
+  std::vector<std::string> out;
+  std::ifstream in(path);
+  std::string line;
+  while (std::getline(in, line))
+    if (!line.empty() && line.back() == '}')
+      out.push_back(line);
+  return out;
+}
+} // namespace
+
+TEST(CacheStore, CheckpointDrainsCommitsAndRecordsWithoutAClose) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  cfg.metaFlushSeconds = 1; // 0 would be due inside writePages itself
+  auto src = test::randomBytes(64 * 4096, 5);
+  CacheStore store(io, cfg);
+  // Open and write within one clock second, so the write-driven drain is NOT
+  // yet due and the pages stay staged; if the second ticks over in between,
+  // that entry may have drained -- use the next key and try again.
+  std::shared_ptr<FileEntry> e;
+  UrlKey key = keyN(1);
+  uint64_t t0 = 0;
+  for (int n = 1; n < 50; ++n) {
+    key = keyN(n);
+    t0 = static_cast<uint64_t>(::time(nullptr));
+    e = store.open(key, src.size());
+    ASSERT_TRUE(e);
+    e->writePages(0, src.size(), src.data()); // staged in RAM: nothing on disk yet
+    if (static_cast<uint64_t>(::time(nullptr)) == t0)
+      break;
+    e.reset();
+  }
+  {
+    CacheStore other(io, cfg); // another process's view of the same cache
+    other.disableStatsDump();
+    auto f = other.open(key, src.size());
+    ASSERT_TRUE(f);
+    EXPECT_EQ(f->cachedBytes(), 0u);
+  }
+  EXPECT_TRUE(completeLines(counterFile(io, td.path())).empty());
+
+  while (static_cast<uint64_t>(::time(nullptr)) < t0 + 1) // the interval elapses...
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  store.checkpoint(); // ...and no write arrives: what the plugin's timer does
+
+  {
+    CacheStore other(io, cfg);
+    other.disableStatsDump();
+    auto f = other.open(key, src.size());
+    ASSERT_TRUE(f);
+    EXPECT_EQ(f->cachedBytes(), src.size()); // drained AND committed
+    std::vector<uint8_t> buf(src.size());
+    ASSERT_TRUE(f->readCached(0, src.size(), buf.data()));
+    EXPECT_EQ(0, memcmp(buf.data(), src.data(), src.size()));
+  }
+  auto lines = completeLines(counterFile(io, td.path()));
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("\"page_writes\":64"), std::string::npos);
+  // A second checkpoint appends; the readers take the last line, so the run
+  // counts exactly once however many checkpoints it lived through.
+  store.checkpoint();
+  EXPECT_EQ(completeLines(counterFile(io, td.path())).size(), 2u);
+  StatsTotals t = aggregateStats(td.path() + "/stats");
+  EXPECT_EQ(t.files, 1u);
+  EXPECT_EQ(t.pageWrites, 64u);
+}
+
+TEST(CacheStore, CheckpointHonoursTheDrainIntervalButRecordsAnyway) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  cfg.metaFlushSeconds = 3600;
+  auto src = test::randomBytes(8 * 4096, 6);
+  CacheStore store(io, cfg);
+  auto e = store.open(keyN(1), src.size());
+  ASSERT_TRUE(e);
+  e->writePages(0, src.size(), src.data());
+  store.checkpoint(); // not due: the pages stay staged, and still serve here
+  {
+    CacheStore other(io, cfg);
+    other.disableStatsDump();
+    auto f = other.open(keyN(1), src.size());
+    ASSERT_TRUE(f);
+    EXPECT_EQ(f->cachedBytes(), 0u);
+  }
+  EXPECT_TRUE(e->hasRange(0, src.size()));
+  // The run record does not wait for the drain.
+  EXPECT_EQ(completeLines(counterFile(io, td.path())).size(), 1u);
+}
+
+TEST(CacheStore, CheckpointWritesNoCounterLineForACliStore) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  cfg.metaFlushSeconds = 0;
+  CacheStore store(io, cfg);
+  store.disableStatsDump(); // a `ucache` invocation, not a job
+  store.checkpoint();
+  EXPECT_TRUE(counterFile(io, td.path()).empty());
 }

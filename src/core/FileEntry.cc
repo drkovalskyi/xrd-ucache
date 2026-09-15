@@ -693,6 +693,19 @@ void FileEntry::flushAll() {
   flushMeta(true);
 }
 
+void FileEntry::checkpoint() {
+  bool due = false;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    due = !buf_.empty() && !flushInProgress_ &&
+          nowS() >= lastBufFlushS_ + static_cast<uint64_t>(cfg_.metaFlushSeconds);
+  }
+  if (due)
+    flushBuffer(true); // drains, then commits: the pages AND their bits land
+  else
+    flushMeta(false); // bits from an earlier drain, on the sidecar's own interval
+}
+
 void FileEntry::touchAtime() {
   uint64_t now = nowS();
   std::lock_guard<std::mutex> g(mu_);

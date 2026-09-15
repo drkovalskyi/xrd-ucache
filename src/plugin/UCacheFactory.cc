@@ -100,6 +100,20 @@ void announceIdentity(const Config& cfg) {
                 informed ? "= 'ucache/...'" : "kept from the environment");
 }
 
+// Re-armed from itself every meta_flush_seconds. A process that _exit()s -- a
+// multiprocessing worker, which is how Python's process pools end -- runs
+// neither destructors nor the atexit dump below, and used to leave the pages
+// it had staged and its whole run record behind in RAM. Captures nothing but
+// the leaked globals, so it is safe for as long as the process lives.
+void scheduleCheckpoint() {
+  const uint64_t periodMs = static_cast<uint64_t>(gConfig->metaFlushSeconds) * 1000;
+  Executor::instance().postAfter(periodMs, [] {
+    if (gStore && *gStore)
+      (*gStore)->checkpoint();
+    scheduleCheckpoint();
+  });
+}
+
 void initGlobals() {
   pinSelfInMemory(); // before any thread exists that could outlive an unload
   // Leaked intentionally: destruction order against XrdCl teardown and the
@@ -117,6 +131,8 @@ void initGlobals() {
           : std::make_shared<CacheStore>(RealIO::instance(), *gConfig));
   Executor::instance(static_cast<unsigned>(
       gConfig->threads > 0 ? gConfig->threads : 0));
+  if (*gStore && gConfig->metaFlushSeconds > 0)
+    scheduleCheckpoint();
   ::atexit([] {
     if (gStore && *gStore)
       (*gStore)->dumpStats(/*finalDump=*/true); // + Layer-2 records of live entries

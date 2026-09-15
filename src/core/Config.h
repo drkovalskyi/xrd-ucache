@@ -57,7 +57,12 @@ struct Config {
   FsyncMode fsync = FsyncMode::kOff;      // UCACHE_FSYNC
   int threads = 0;                        // UCACHE_THREADS; 0 = min(8, hw)
   int maxErrors = 5;                      // UCACHE_MAX_ERRORS per handle
-  int metaFlushSeconds = 30;              // UCACHE_META_FLUSH_S
+  // UCACHE_META_FLUSH_S: the sidecar commit interval, the fill-buffer drain
+  // interval, and the period of the plugin's checkpoint that drives both by
+  // time and appends a counter line -- so a process that exits without running
+  // destructors (a multiprocessing worker) loses at most one period of fill
+  // and never its run record.
+  int metaFlushSeconds = 30;
   // Fill write buffering: miss-fetched pages stage
   // in RAM and flush as offset-sorted large writes; the buffer also serves
   // reads, so a fill never does random IO against the cache disk. 0 = legacy

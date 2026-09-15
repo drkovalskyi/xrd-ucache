@@ -887,7 +887,23 @@ void CacheStore::recordRelayObs(const std::string& url, uint64_t bytes, const ch
   obsSink_->append(os.str());
 }
 
+void CacheStore::checkpoint() {
+  std::vector<std::shared_ptr<FileEntry>> live;
+  {
+    std::lock_guard<std::mutex> g(regMu_);
+    for (auto& [hash, weak] : registry_)
+      if (auto e = weak.lock())
+        live.push_back(e);
+  }
+  for (auto& e : live) // outside regMu_: a drain is a flock and a write
+    e->checkpoint();
+  live.clear();
+  if (dumpStatsOnDtor_)
+    dumpStats(false);
+}
+
 void CacheStore::dumpStats(bool finalDump) {
+  std::lock_guard<std::mutex> dg(dumpMu_);
   if (finalDump) {
     std::lock_guard<std::mutex> g(regMu_);
     for (auto& [hash, weak] : registry_)

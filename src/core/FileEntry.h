@@ -106,6 +106,13 @@ class FileEntry {
   // flushBuffer(true) + flushMeta(true): everything durable. Used by close,
   // eviction, cleanup — anything that needs the on-disk state authoritative.
   void flushAll();
+  // The interval policy, driven by time instead of by writes: drain the fill
+  // buffer if meta_flush_seconds have passed since the last drain, and commit
+  // the sidecar on its own interval. The policy otherwise fires only from
+  // inside writePages and at close, so a process that stopped writing and then
+  // died without running destructors (a multiprocessing worker _exit()s) took
+  // every page it had staged with it. Called by CacheStore::checkpoint.
+  void checkpoint();
 
   bool pinned();
   void setPinned(bool p);
