@@ -110,12 +110,17 @@ This is the file in the diagram above, and each line is doing one job:
 - `dir`, and anything below it, is uCache's own configuration. There is
   deliberately **no default cache directory**: a default would quietly land in
   your home, which at many sites is AFS, and caching network data onto a
-  network filesystem defeats the point.
+  network filesystem defeats the point. If your home is shared across machines
+  that each have their own local disk, leave `dir` out of the file and set
+  `UCACHE_DIR` per machine instead — it overrides the conf, it also tells
+  `ucache status` and `summary` which cache to read, and a machine where you
+  forget it runs uncached and says so rather than caching onto the shared home.
 
-Three syntax rules the client enforces strictly, none of which it explains: a
+Four syntax rules the client enforces strictly, none of which it explains: a
 `#` comment must start in the **first column** — an indented one makes the
 client reject the whole file and load nothing; a comment written after a value
-becomes **part of that value**; and the file must be named `*.conf`.
+becomes **part of that value**; every value is taken **literally**, with no
+`$VAR`, `~` or hostname expanded for you; and the file must be named `*.conf`.
 
 Nothing else takes part. No environment variable, no `LD_PRELOAD`, no ROOT
 configuration, and no shell to reload — a batch job launched tomorrow picks up
