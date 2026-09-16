@@ -93,6 +93,7 @@ lib = /home/you/.local/lib64/libXrdClUCache.so
 enable = true
 
 # the cache itself: a local SSD or NVMe, not AFS or NFS
+# UCACHE_DIR overrides it: one conf, a disk per machine
 dir = /path/to/cache
 ```
 
