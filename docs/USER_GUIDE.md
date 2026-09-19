@@ -89,10 +89,13 @@ Linux with a C++17 compiler, CMake ≥ 3.20, and XRootD client ≥ 5.6 works.
 
 ### Build from source — macOS
 
-There is no prebuilt macOS package, and there will not be one: a downloaded
-dylib carries Gatekeeper quarantine, and quarantine blocks the `dlopen` the
-XRootD client uses to load the plugin. Building it locally avoids that
-entirely.
+There is no prebuilt macOS package yet; build from source. One macOS detail is
+worth knowing while there is no package: Gatekeeper's `com.apple.quarantine`
+attribute is applied by the application that downloads a file — a browser, Mail
+— and a quarantined library cannot be `dlopen`ed, so the XRootD client would
+silently decline to load a plugin obtained that way. `curl`, `git`, `tar` and
+package-manager fetches do not set it, so they are unaffected, and building
+locally never touches it.
 
 The requirements are the same as anywhere else — a C++17 compiler, CMake >= 3.20,
 an XRootD client >= 5.6 — plus one rule that matters more here: **build against
