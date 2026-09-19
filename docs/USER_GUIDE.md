@@ -25,8 +25,8 @@ That's the whole install: `bin/ucache`, `bin/ucache-netbench` and
 not found, add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup
 file (`~/.bashrc`, `~/.zshrc`, …). Any other prefix works too — nothing
 cares where the files live. Continue with §2 (activation — one config
-file). Ask the maintainer for the current tarball until the project has a
-public download page.
+file). The tarball and an EL9 RPM are attached to every release on the
+[Releases page](https://github.com/drkovalskyi/xrd-ucache/releases).
 
 The one runtime dependency is the XRootD 5 client library — and any machine
 that already reads `root://` URLs has it (CMSSW, LCG/CVMFS ROOT, or EPEL's
@@ -34,6 +34,22 @@ that already reads `root://` URLs has it (CMSSW, LCG/CVMFS ROOT, or EPEL's
 **5.6–5.9** the process already uses, and where it can't load (CentOS 7-era
 releases under apptainer, xrootd 6 stacks) it fails open — the job just runs
 uncached.
+
+### Get the source
+
+All three routes below build the same tree, and their `cmake -S .` means this
+directory:
+
+```sh
+git clone https://github.com/drkovalskyi/xrd-ucache.git
+cd xrd-ucache
+git checkout v<version>     # optional — a release rather than the tip of main
+```
+
+A source tarball from the [Releases
+page](https://github.com/drkovalskyi/xrd-ucache/releases) works the same way:
+unpack it and `cd` into it instead. Downloading either with `git` or `curl`
+matters on macOS — see that section.
 
 ### Build from source — AlmaLinux 9 / RHEL 9
 
@@ -89,30 +105,33 @@ Linux with a C++17 compiler, CMake ≥ 3.20, and XRootD client ≥ 5.6 works.
 
 ### Build from source — macOS
 
-There is no prebuilt macOS package yet; build from source. One macOS detail is
-worth knowing while there is no package: Gatekeeper's `com.apple.quarantine`
-attribute is applied by the application that downloads a file — a browser, Mail
-— and a quarantined library cannot be `dlopen`ed, so the XRootD client would
-silently decline to load a plugin obtained that way. `curl`, `git`, `tar` and
-package-manager fetches do not set it, so they are unaffected, and building
-locally never touches it.
+There is no prebuilt macOS package yet. Tested on Apple silicon, macOS 14, with
+MacPorts.
 
-The requirements are the same as anywhere else — a C++17 compiler, CMake >= 3.20,
-an XRootD client >= 5.6 — plus one rule that matters more here: **build against
-the XRootD client your ROOT actually loads.** Check which that is first:
+**1. Prerequisites.** Command Line Tools are enough — Xcode is not required.
+
+```sh
+xcode-select --install                     # clang, linker, SDK
+sudo port install cmake xrootd root6 +xrootd
+sudo port install xz zstd lz4              # codec libs — recompression only, optional
+```
+
+**2. Check which XRootD client your ROOT loads**, and build against that one —
+this matters more on macOS than anywhere else, because a second XRootD
+(Homebrew's, or a ROOT framework build) makes the plugin load and never cache:
 
 ```sh
 root-config --has-xrootd                                       # must say yes
 otool -L "$(root-config --libdir)/libNetxNG.so" | grep -i XrdCl
 ```
 
-MacPorts is the tested route (Apple silicon, macOS 14). Command Line Tools are
-enough — Xcode is not required.
+The prefix flags below assume that path is under `/opt/local`; point them
+elsewhere if it is not.
 
-```sh
-sudo port install xrootd root6 +xrootd
-sudo port install xz zstd lz4          # codec libs — recompression only, optional
-```
+**3. Get the source** — the `git clone` under "Get the source" above. `-S .`
+below is that directory.
+
+**4. Build and install.**
 
 ```sh
 export TMPDIR=/tmp          # do this FIRST — see the note below
@@ -123,6 +142,13 @@ cmake --build build -j"$(sysctl -n hw.ncpu)"
 cmake --install build --prefix ~/.local
 ```
 
+**5. Check what you built.**
+
+```sh
+~/.local/bin/ucache --version
+otool -L ~/.local/lib/libXrdClUCache.so | grep -i XrdCl   # same path as step 2
+```
+
 > **Set `TMPDIR` before building.** With it unset, the compiler is handed a
 > per-session `/var/folders/...` path it may not own, and AppleClang then fails to
 > compile anything at all with "unable to make temporary file". Any writable
@@ -131,6 +157,12 @@ cmake --install build --prefix ~/.local
 > **If both MacPorts and Homebrew are present**, CMake searches `/opt/homebrew`
 > first on Apple silicon. The two prefix flags above are what keep the build on
 > the same XrdCl your ROOT loads — confirm with `otool -L` rather than assuming.
+
+> **On quarantine.** Gatekeeper's `com.apple.quarantine` attribute is applied by
+> the application that downloads a file — a browser, Mail — and a quarantined
+> library cannot be `dlopen`ed, so the XRootD client would silently decline to
+> load a plugin obtained that way. `git`, `curl` and `tar` do not set it, so
+> fetching the source as above is unaffected.
 
 Everything after this is identical to Linux: activate with the same plugin
 configuration file (§2), and point the cache at an ordinary directory on a
