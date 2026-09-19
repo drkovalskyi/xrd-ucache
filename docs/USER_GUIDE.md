@@ -128,6 +128,12 @@ otool -L "$(root-config --libdir)/libNetxNG.so" | grep -i XrdCl
 The prefix flags below assume that path is under `/opt/local`; point them
 elsewhere if it is not.
 
+> uCache does not need ROOT to build — `root-config` comes with ROOT, and this
+> step only identifies the client that will load the plugin at run time. Skip
+> it if ROOT is not installed yet or you read with uproot; with only MacPorts'
+> `xrootd` present, `/opt/local` is the answer. Run it later against whatever
+> ends up loading the plugin, and rebuild if it names a different XrdCl.
+
 **3. Get the source** — the `git clone` under "Get the source" above. `-S .`
 below is that directory.
 
