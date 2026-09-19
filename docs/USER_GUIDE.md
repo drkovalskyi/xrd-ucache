@@ -128,6 +128,11 @@ otool -L "$(root-config --libdir)/libNetxNG.so" | grep -i XrdCl
 The prefix flags below assume that path is under `/opt/local`; point them
 elsewhere if it is not.
 
+> **MacPorts installs ROOT's tools with a `6` suffix** — `root6`,
+> `root-config6` — and the unsuffixed names appear only after
+> `sudo port select --set root root6`. Either run that, or substitute
+> `root-config6` in the two commands above.
+
 > uCache does not need ROOT to build — `root-config` comes with ROOT, and this
 > step only identifies the client that will load the plugin at run time. Skip
 > it if ROOT is not installed yet or you read with uproot; with only MacPorts'
