@@ -160,6 +160,20 @@ cmake --install build --prefix ~/.local
 otool -L ~/.local/lib/libXrdClUCache.so | grep -i XrdCl   # same path as step 2
 ```
 
+The **second** line of that output is the one to read — the `libXrdCl` the
+plugin will load, which must be the path step 2 printed. The first line is the
+library naming itself, and its `compatibility version 0.0.0` is not a version
+of anything: the plugin is `dlopen`ed by absolute path, so it carries no
+Mach-O dylib version. The version XRootD checks at load is separate, and is
+the client release the plugin was compiled against:
+
+```sh
+strings ~/.local/lib/libXrdClUCache.so | grep '@V:'   # e.g. @V:XrdClUCache v5.9.1
+```
+
+It must be less than or equal to the client that loads the plugin; building
+against that same client, as above, satisfies it by construction.
+
 > **Set `TMPDIR` before building.** With it unset, the compiler is handed a
 > per-session `/var/folders/...` path it may not own, and AppleClang then fails to
 > compile anything at all with "unable to make temporary file". Any writable
