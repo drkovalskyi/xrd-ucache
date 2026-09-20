@@ -59,6 +59,7 @@ struct Run {
   uint64_t servedBytes = 0, hitBytes = 0, ramHitBytes = 0, replicaBytesServed = 0;
   uint64_t relayBytes = 0, originBytes = 0, originReads = 0, originReadvs = 0;
   uint64_t prefetchServedBytes = 0; // speculative pages the reader demanded (read-ahead)
+  uint64_t prefetchIssuedBytes = 0; // ... and everything read ahead, used or not
   uint64_t hitDiskReads = 0, hitDiskBytes = 0, replicaReads = 0, replicaReadBytes = 0;
   uint64_t crcFailures = 0, replicaCrcFailures = 0, replicaInvalid = 0;
   uint64_t failopenEvents = 0, metaCorrupt = 0, validationsFailed = 0;
@@ -152,15 +153,22 @@ struct Run {
   static constexpr double kMinOriginShare = 0.95;
   bool baselineQualified() const {
     return originShare() >= kMinOriginShare && servedLessThanFetched() && overheadKnown() &&
-           overhead() <= kMaxOverhead && prefetchServedBytes == 0;
+           overhead() <= kMaxOverhead && prefetchIssuedBytes == 0 && prefetchServedBytes == 0;
   }
   // Read-ahead makes the byte test above pass for a run the cache carried: a
   // cold fill whose next fills were fetched during the reader's compute serves
   // most of its bytes from the speculative stage (they count as hits) while
   // every one of them was also fetched from the origin, so originBytes and
   // cacheBytes come out nearly equal and the run looks like "what no cache
-  // costs" -- which it is not, it is the cache at its most useful. A run with
-  // any prefetched byte served is therefore never a reference.
+  // costs" -- which it is not, it is the cache at its most useful.
+  //
+  // ISSUED, not merely served. Testing what was served covered the harmless
+  // half and missed the harmful one: a run whose prediction was WRONG serves
+  // none of it, keeps prefetch_served_bytes at zero, and still carries every
+  // speculative byte in origin_bytes. That run qualified, with its origin
+  // traffic inflated by the waste -- and then every run measured against it
+  // looked better than it was, which is the sign-flip class of error this
+  // project has refused twice.
   // The origin fetched at least as much as the cache served. This is a BYTE
   // test, and it is here because originShare() is not one: that weights each
   // file by its size AT THE ORIGIN, so a file touched for 5 MB counts the same

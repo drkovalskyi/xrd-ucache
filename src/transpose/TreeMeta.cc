@@ -455,7 +455,11 @@ ContainerMeta parseContainerFrom(Reader& r) {
   const int64_t fsz = r.size;
   fm.fileSize = fsz;
   std::vector<uint8_t> head(static_cast<size_t>(std::clamp<int64_t>(fsz, 0, 512)));
-  if (head.size() < 4 || !r.read(head.data(), head.size(), 0) ||
+  // 20, not 4: the version and fEND below are read at +4 and +12. Sizing the
+  // buffer to the file (right, for a Source that must not read past the end)
+  // removed the slack that a fixed 512-byte buffer used to provide, and a
+  // file of a few bytes starting with "root" then read past the allocation.
+  if (head.size() < 20 || !r.read(head.data(), head.size(), 0) ||
       std::memcmp(head.data(), "root", 4) != 0)
     return fail("not a ROOT file");
   fm.large = beGet<int32_t>(head.data() + 4) > 1000000;
@@ -547,12 +551,17 @@ ContainerMeta parseContainerFrom(Reader& r) {
   return fm;
 }
 
-std::vector<uint8_t> readKeyPayloadFrom(Reader& r, const KeyInfo& k) {
+std::vector<uint8_t> readKeyPayloadFrom(Reader& r, const KeyInfo& k, bool* unreadable = nullptr) {
+  if (unreadable)
+    *unreadable = false;
   if (k.nbytes <= 0 || k.keylen > k.nbytes || k.objlen < 0 || k.seekkey < 0)
     return {};
   std::vector<uint8_t> rec(k.nbytes);
-  if (!r.read(rec.data(), rec.size(), k.seekkey))
+  if (!r.read(rec.data(), rec.size(), k.seekkey)) {
+    if (unreadable) // the source could not vouch for the bytes: try again later
+      *unreadable = true;
     return {};
+  }
   std::vector<uint8_t> out;
   if (k.objlen == k.nbytes - k.keylen)
     out.assign(rec.begin() + k.keylen, rec.end());
@@ -594,12 +603,15 @@ FileMeta parseTreeFrom(Reader& r, const std::string& tree) {
       fm.treeKey.objlen < 0 || fm.treeKey.seekkey < 0 ||
       fm.treeKey.nbytes > fsz - fm.treeKey.seekkey)
     return fail("tree key geometry implausible");
-  {
-    std::vector<uint8_t> rec(fm.treeKey.nbytes);
-    if (!r.read(rec.data(), rec.size(), fm.treeKey.seekkey))
-      return fail("tree record not readable"); // a Source that cannot vouch for it, or a short read
-  }
-  fm.treeBlob = readKeyPayloadFrom(r, fm.treeKey);
+  // One read, not two. Distinguishing "the source cannot vouch for these
+  // bytes" (retryable: the reader has not staged them yet) from "they are not
+  // valid tree metadata" (final) used to cost a whole second read of the
+  // record, which on a large LZMA file is multiple megabytes off the cache
+  // disk, CRC-verified, on every parse and on each of its retries.
+  bool unreadable = false;
+  fm.treeBlob = readKeyPayloadFrom(r, fm.treeKey, &unreadable);
+  if (unreadable)
+    return fail("tree record not readable");
   if (fm.treeBlob.size() != static_cast<size_t>(fm.treeKey.objlen))
     return fail("tree metadata decompression failed");
   if (!parseTreeBlob(fm.treeBlob.data(), fm.treeBlob.size(), fm.treeKey.keylen, fm))

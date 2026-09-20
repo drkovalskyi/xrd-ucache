@@ -578,6 +578,27 @@ TEST(Baseline, AFillServedByReadAheadIsNotAReference) {
   }
 }
 
+// The case the served-only test misses, and the one that actually distorts a
+// gain: a prediction that was WRONG. Nothing is served, so prefetch_served_bytes
+// is zero, but every speculative byte is still in origin_bytes -- so the run
+// reads as an expensive no-cache reference and flatters everything measured
+// against it.
+TEST(Baseline, AFillThatReadAheadAndUsedNoneOfItIsNotAReference) {
+  test::TempDir d;
+  const std::string quiet = fillCounters(kGiB) + ",\"buffer_stall_us\":10000000" + originHist(1000.0);
+  writeRun(d.path(), "h", 3, 3000, 3100,
+           quiet + ",\"prefetch_issued_bytes\":" + std::to_string(kGiB / 4) +
+               ",\"prefetch_served_bytes\":0,\"prefetch_dropped_unread\":" +
+               std::to_string(kGiB / 4),
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_EQ(runs[0].prefetchIssuedBytes, kGiB / 4);
+  EXPECT_EQ(runs[0].prefetchServedBytes, 0u);
+  EXPECT_FALSE(runs[0].baselineQualified())
+      << "it fetched a quarter of a GiB nobody read: its origin bytes are not what no cache costs";
+}
+
 TEST(Baseline, CoresBusyNeedsNoThreadCount) {
   test::TempDir d;
   writeRun(d.path(), "h", 1, 1000, 1100,

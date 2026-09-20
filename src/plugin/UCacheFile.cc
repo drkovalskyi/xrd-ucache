@@ -350,6 +350,16 @@ XrdCl::File* HandleState::acquireInner() {
   return inner;
 }
 
+XrdCl::File* HandleState::acquireInnerIfOpen() {
+  if (cacheOnly && !innerOpened)
+    return nullptr; // would have to open the origin; the caller is speculative
+  std::lock_guard<std::mutex> g(mu);
+  if (!innerValid || !inner->IsOpen())
+    return nullptr;
+  ++innerOps;
+  return inner;
+}
+
 void HandleState::releaseInner() {
   std::lock_guard<std::mutex> g(mu);
   if (--innerOps == 0)
@@ -1187,7 +1197,10 @@ UCacheFile::~UCacheFile() {
     v.swap(st_->view);
   }
 #ifdef UCACHE_HAVE_PREFETCH
-  Prefetcher::instance().onClose(st_, e); // read-ahead never used is dropped here too
+  // Only touch the prefetcher if this process uses it: reaching the singleton
+  // constructs it and starts its thread, which `prefetch = off` should not do.
+  if (globalConfig().prefetch && st_->prefetchSeen.load(std::memory_order_acquire))
+    Prefetcher::instance().onClose(st_, e); // read-ahead never used is dropped here too
 #endif
   if (e)
     e->flushAll(); // synchronous (covers the no-explicit-Close path)
@@ -1576,7 +1589,8 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
     v.swap(st_->view); // releases the overlay fd
   }
 #ifdef UCACHE_HAVE_PREFETCH
-  Prefetcher::instance().onClose(st_, e); // drops what was read ahead and never used
+  if (globalConfig().prefetch && st_->prefetchSeen.load(std::memory_order_acquire))
+    Prefetcher::instance().onClose(st_, e); // drops what was read ahead and never used
 #endif
   if (e)
     e->flushAll(); // synchronous: staged pages + bitmap must hit disk before we may exit
@@ -1952,7 +1966,8 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
 #ifdef UCACHE_HAVE_PREFETCH
   // Read-ahead learns from every fill and, once confirmed, fetches the next
   // one while the reader computes; posted to its own thread, never blocking.
-  Prefetcher::instance().onFill(st_, entry, chunks, !missIdx.empty());
+  if (globalConfig().prefetch)
+    Prefetcher::instance().onFill(st_, entry, chunks, !missIdx.empty());
 #endif
   if (st_->store && !missIdx.empty() && missIdx.size() != chunks.size())
     st_->store->stats().readvMixed.fetch_add(1,

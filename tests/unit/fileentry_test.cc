@@ -963,6 +963,68 @@ TEST(FileEntry, DropSpeculativeLeavesServedPages) {
   EXPECT_FALSE(e->hasRange(2 * 4096, 2 * 4096));
 }
 
+// The cache reading its OWN stage -- what the basket-map parse does, through
+// readCached(account=false) -- must not turn a speculative page into a real
+// one. It used to: the mark was cleared before the accounting flag was
+// consulted, so a page no reader had asked for was written to the cache.
+TEST(FileEntry, CacheInternalReadDoesNotPromoteASpeculativePage) {
+  Fixture fx(16 * 4096, 4096);
+  std::vector<uint8_t> out(2 * 4096);
+  {
+    auto e = fx.open();
+    ASSERT_TRUE(e);
+    ASSERT_EQ(e->stageSpeculative(0, 2 * 4096, fx.src.data()), 2u * 4096);
+    // The cache's own read: it gets the bytes ...
+    EXPECT_TRUE(e->readCached(0, 2 * 4096, out.data(), /*account=*/false));
+    EXPECT_EQ(memcmp(out.data(), fx.src.data(), 2 * 4096), 0);
+    // ... and the pages are still speculative, so a flush must leave them.
+    EXPECT_EQ(e->speculativeBytes(), 2u * 4096);
+    e->flushBuffer(true);
+    EXPECT_EQ(fx.stats.prefetchServedBytes.load(), 0u);
+  }
+  auto r = fx.open();
+  ASSERT_TRUE(r);
+  EXPECT_FALSE(r->hasRange(0, 2 * 4096)) << "nobody demanded these bytes: they must not be cached";
+  EXPECT_EQ(fx.stats.prefetchDroppedUnread.load(), 2u * 4096);
+}
+
+// A read that FAILS serves nothing, so it may not claim the speculative pages
+// it passed over as served -- and it must still move the process-wide pools,
+// or g_bufTotal_ goes under and every later fill drains synchronously.
+TEST(FileEntry, AFailedReadOverSpeculativePagesCreditsNothingAndKeepsPoolsStraight) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  ASSERT_EQ(e->stageSpeculative(0, 4096, fx.src.data()), 4096u);
+  const uint64_t before = FileEntry::speculativeTotal();
+  std::vector<uint8_t> out(2 * 4096);
+  // Page 0 is staged speculatively, page 1 is absent: the request fails.
+  EXPECT_FALSE(e->readCached(0, 2 * 4096, out.data(), /*account=*/true));
+  EXPECT_EQ(fx.stats.prefetchServedBytes.load(), 0u) << "the reader got nothing";
+  EXPECT_EQ(FileEntry::speculativeTotal(), before - 4096)
+      << "the page left the speculative pool and the global total must follow";
+  EXPECT_EQ(e->speculativeBytes(), 0u);
+}
+
+// Reclaim punching a range that holds a speculative page must debit the
+// speculative pools, not the fill pools: crediting the wrong one underflowed
+// both unsigned totals at once.
+TEST(FileEntry, ReleaseRangesOverASpeculativePageDebitsTheSpeculativePool) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 2 * 4096, fx.src.data());          // two real staged pages
+  ASSERT_EQ(e->stageSpeculative(8 * 4096, 2 * 4096, fx.src.data() + 8 * 4096), 2u * 4096);
+  const uint64_t specBefore = FileEntry::speculativeTotal();
+  e->releaseRanges({{8 * 4096, 2 * 4096}});
+  EXPECT_EQ(e->speculativeBytes(), 0u);
+  EXPECT_EQ(FileEntry::speculativeTotal(), specBefore - 2 * 4096);
+  EXPECT_EQ(fx.stats.prefetchDroppedUnread.load(), 2u * 4096);
+  // The two real pages are untouched and still drain.
+  e->flushBuffer(true);
+  EXPECT_TRUE(e->hasRange(0, 2 * 4096));
+}
+
 TEST(FileEntry, SpeculativePagesAtCloseAreDroppedAndCounted) {
   Fixture fx(16 * 4096, 4096);
   {

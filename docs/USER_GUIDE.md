@@ -586,8 +586,10 @@ is fetched (the first prediction is only compared with the next real request),
 what is fetched is bounded by what your job has been drawing per request, and
 a process that finds a quarter of its read-ahead unused switches it off. A
 page fetched ahead reaches the cache only once your job has actually asked
-for it; anything never asked for is dropped from RAM. Readers that fetch once
-per file open (one task per chunk) are left alone at no cost. `UCACHE_PREFETCH=off`
+for it; anything never asked for is dropped from RAM. Read-ahead never opens a
+connection of its own: if your job is being served entirely from the cache, it
+stays that way. Readers that fetch once per file open (one task per chunk)
+never confirm a prediction, so they cost no origin traffic. `UCACHE_PREFETCH=off`
 turns it off for a job; the `prefetch_*` counters in `ucache stats` show what
 it did.
 
@@ -636,7 +638,7 @@ overriding your defaults. Common keys:
 | `trace_sample = 64` | `UCACHE_TRACE_SAMPLE` | record every Nth read-class trace op (`1` = everything; opens/flushes are always recorded) |
 | `prefetch = on`     | `UCACHE_PREFETCH`       | read ahead for TTree readers: the next batch of baskets is predicted from the file's own metadata and fetched while your code computes (default on; see below). `off` = fetch only what is asked for |
 | `prefetch_window_mb = 32` | `UCACHE_PREFETCH_WINDOW_MB` | how far ahead one file handle may read (one fill's worth per branch, up to this) |
-| `prefetch_ram_mb = 512` | `UCACHE_PREFETCH_RAM_MB` | RAM the whole process may hold in read-ahead pages not yet asked for; the window shrinks when it is reached |
+| `prefetch_ram_mb = 512` | `UCACHE_PREFETCH_RAM_MB` | RAM the whole process may hold in read-ahead pages not yet asked for, counting both what has arrived and what is on the wire; the window shrinks as it is approached and reaches zero at the limit |
 | `announce = on`     | `UCACHE_ANNOUNCE`       | name uCache as the application in what the client tells servers at login, so a site can see traffic that comes through a cache (default on; see below). `off` = send your program's own name, as without uCache |
 | `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
 

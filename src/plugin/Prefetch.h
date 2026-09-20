@@ -19,13 +19,21 @@
 //     map is read only from a handle's second fill while the process is
 //     unconfirmed.
 //   * BOUNDED by demand. One window ahead per branch, sized by the largest
-//     share that branch drew in one fill; a process-wide cap on staged
-//     speculative bytes shrinks the window under pressure.
+//     share that branch drew in one fill; a process-wide cap counting both
+//     staged bytes and bytes on the wire shrinks the window under pressure.
 //   * SELF-DISABLING. A speculative page the reader's frontier has passed
 //     without demanding is dropped and counted never-used; when never-used
 //     exceeds a quarter of what was issued (after 64 MB) the process stops.
+//     Never-used is read from the entries themselves, so every route counts:
+//     the frontier, the close, the sweep, a punch, the entry's own death.
+//   * NEVER ITS OWN CONNECTION. Read-ahead uses the origin only if the handle
+//     already has it open; it will not run the lazy open of a trusted handle,
+//     because the application did not ask for this read and must not wait for
+//     it, inherit its failure, or spend its one open attempt on it.
 // A speculative page never reaches the cache: FileEntry writes a page only
-// once the reader has demanded it (FileEntry::stageSpeculative).
+// once the READER has demanded it (FileEntry::stageSpeculative). The cache
+// reading its own stage -- the basket-map parse, through readCached with
+// accounting off -- does not count as demand and does not promote a page.
 //
 // Thread-safety: onFill/onClose copy what they need and post to the
 // prefetcher's own thread, which owns every table and every handle's state;

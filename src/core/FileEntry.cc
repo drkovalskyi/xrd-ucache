@@ -41,6 +41,7 @@ std::string jsonEscapeMin(const std::string& s) {
 
 std::atomic<uint64_t> FileEntry::g_bufTotal_{0};
 std::atomic<uint64_t> FileEntry::g_specTotal_{0};
+std::atomic<uint64_t> FileEntry::g_specDropped_{0};
 
 std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Stats& stats,
                                            const UrlKey& key, uint64_t originSize,
@@ -330,12 +331,26 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
   // Accounted locally, published at every exit — partial work on a
   // miss/CRC-demotion still describes real disk activity.
   uint64_t ramB = 0, ftB = 0, dReads = 0, dBytes = 0, dSeq = 0, specServed = 0;
+  // Pages this request cleared the speculative mark on have already moved
+  // between the per-entry pools under mu_; the process-wide pools must move
+  // with them at EVERY exit, including the two that return false. Leaving it
+  // to the success path drifted both globals permanently, and the direction
+  // that matters is g_bufTotal_ going under: the flush then subtracts bytes it
+  // was never credited, the unsigned counter wraps, and every later fill is
+  // stuck in a synchronous cap drain for the life of the process.
+  bool poolsMoved = false, servedOk = false; // servedOk: set once the whole request is answered
+  auto movePools = [&] {
+    if (!specServed || poolsMoved)
+      return;
+    poolsMoved = true;
+    g_specTotal_.fetch_sub(specServed, std::memory_order_relaxed);
+    g_bufTotal_.fetch_add(specServed, std::memory_order_relaxed);
+  };
   auto publish = [&] {
+    movePools();
     if (!account) // the speculative-mark bookkeeping above is state, not accounting
       return;
-    if (specServed) {
-      g_specTotal_.fetch_sub(specServed, std::memory_order_relaxed);
-      g_bufTotal_.fetch_add(specServed, std::memory_order_relaxed);
+    if (specServed && servedOk) { // a request that failed served nothing (see first_touch below)
       stats_.prefetchServedBytes.fetch_add(specServed, std::memory_order_relaxed);
       obs_.prefetchServed.fetch_add(specServed, std::memory_order_relaxed);
     }
@@ -381,7 +396,11 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
       else if (auto it2 = flushing_.find(i); it2 != flushing_.end())
         staged = &it2->second;
       if (staged) {
-        if (staged->spec) { // a prediction the reader confirmed: it is a real page now
+        // A prediction the READER confirmed is a real page now. The cache
+        // reading its own stage (account = false: the basket-map parse) is not
+        // a reader: promoting there would write a page nobody asked for, which
+        // is the one thing read-ahead promises never to do.
+        if (staged->spec && account) {
           unmarkSpeculative(*staged, meta_.pageBytes(i));
           specServed += meta_.pageBytes(i);
         }
@@ -459,10 +478,7 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) 
           ftB += std::min(off + len, pStart + meta_.pageBytes(i)) - std::max(off, pStart);
         }
   }
-  if (!account && specServed) { // pool moves are state, they happen regardless
-    g_specTotal_.fetch_sub(specServed, std::memory_order_relaxed);
-    g_bufTotal_.fetch_add(specServed, std::memory_order_relaxed);
-  }
+  servedOk = true; // every page of the request is in the caller's buffer
   publish();
   if (!account)
     return true;
@@ -599,10 +615,20 @@ uint64_t FileEntry::dropSpeculative(uint64_t off, uint64_t len) {
   }
   if (dropped) {
     g_specTotal_.fetch_sub(dropped, std::memory_order_relaxed);
-    stats_.prefetchDroppedUnread.fetch_add(dropped, std::memory_order_relaxed);
-    obs_.prefetchDropped.fetch_add(dropped, std::memory_order_relaxed);
+    noteSpeculativeDropped(dropped);
   }
   return dropped;
+}
+
+void FileEntry::noteSpeculativeDropped(uint64_t n) {
+  // Every never-used byte, by whichever route it was dropped: the frontier
+  // passing it, the handle closing, the entry dying, a punch, or a completion
+  // that found its handle gone. The read-ahead breaker weighs never-used
+  // against issued, and the routes it could not see were the ones that made
+  // it fire late or, for baskets smaller than a page, never at all.
+  g_specDropped_.fetch_add(n, std::memory_order_relaxed);
+  stats_.prefetchDroppedUnread.fetch_add(n, std::memory_order_relaxed);
+  obs_.prefetchDropped.fetch_add(n, std::memory_order_relaxed);
 }
 
 uint64_t FileEntry::dropAllSpeculative() { return dropSpeculative(0, meta_.fileSize); }
@@ -613,6 +639,10 @@ uint64_t FileEntry::speculativeBytes() {
 }
 
 uint64_t FileEntry::speculativeTotal() { return g_specTotal_.load(std::memory_order_relaxed); }
+
+uint64_t FileEntry::speculativeDroppedTotal() {
+  return g_specDropped_.load(std::memory_order_relaxed);
+}
 
 std::vector<std::pair<uint64_t, uint64_t>> FileEntry::absentRuns(uint64_t off, uint64_t len) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
@@ -1018,6 +1048,7 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
   std::vector<std::pair<uint64_t, uint64_t>> spans; // (byteOff, byteLen)
   std::vector<uint64_t> resident; // formerly-cached ON-DISK bytes per span
   bool any = false;
+  uint64_t specDropped = 0; // speculative pages inside the released span
   {
     std::lock_guard<std::mutex> g(mu_);
     for (const auto& [off, len] : ranges) {
@@ -1034,8 +1065,14 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
         // cached page again — punch is reclaim, not correctness).
         if (auto bit = buf_.find(i); bit != buf_.end()) {
           uint64_t nb = meta_.pageBytes(i);
-          bufBytes_ -= nb;
-          g_bufTotal_.fetch_sub(nb, std::memory_order_relaxed);
+          if (bit->second.spec) { // a speculative page's bytes live in the OTHER pool
+            specBytes_ -= nb;
+            g_specTotal_.fetch_sub(nb, std::memory_order_relaxed);
+            specDropped += nb;
+          } else {
+            bufBytes_ -= nb;
+            g_bufTotal_.fetch_sub(nb, std::memory_order_relaxed);
+          }
           buf_.erase(bit);
         }
         if (!meta_.bitmap.get(i))
@@ -1051,6 +1088,8 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
     if (any)
       dirty_ = true;
   }
+  if (specDropped)
+    noteSpeculativeDropped(specDropped);
   if (spans.empty())
     return 0;
   // Bits durable BEFORE the bytes vanish (D1 ordering): a reader that loads

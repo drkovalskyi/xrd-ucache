@@ -138,6 +138,14 @@ class FileEntry {
   std::vector<std::pair<uint64_t, uint64_t>> absentRuns(uint64_t off, uint64_t len);
   // Process-wide bytes currently staged speculatively, across entries.
   static uint64_t speculativeTotal();
+  // Process-wide bytes fetched ahead and never used, by every route: the
+  // frontier passed them, the handle closed, the entry died, a punch took
+  // them, or the completion found its handle gone. Read by the read-ahead
+  // breaker, which needs all of them and could previously see only one.
+  static uint64_t speculativeDroppedTotal();
+  // Count n bytes never used without there being a staged page to drop --
+  // a completion whose handle closed while it was on the wire.
+  void noteSpeculativeDropped(uint64_t n);
 
   bool pinned();
   void setPinned(bool p);
@@ -333,7 +341,8 @@ class FileEntry {
   std::condition_variable flushCv_;
   // Process-wide staged total across entries (fill_buffer_total_mb ceiling).
   static std::atomic<uint64_t> g_bufTotal_;
-  static std::atomic<uint64_t> g_specTotal_; // process-wide speculative bytes
+  static std::atomic<uint64_t> g_specTotal_;   // process-wide speculative bytes
+  static std::atomic<uint64_t> g_specDropped_; // process-wide never-used bytes
   // In-flight fetch table: (off,len) -> parked re-dispatch callbacks.
   std::map<std::pair<uint64_t, uint64_t>, std::vector<std::function<void()>>> inflight_;
 

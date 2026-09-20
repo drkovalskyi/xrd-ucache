@@ -201,11 +201,16 @@ reading was re-reading, and what the cache disk was asked to do.
   bytes a demand read had fetched again in the meantime; `prefetch_dropped_unread`
   — bytes read ahead that the reader never asked for, dropped from RAM and
   never written to the cache; `prefetch_late_bytes` — arrived after the demand
-  read had already brought them; `prefetch_parses` — basket maps parsed;
-  `prefetch_disabled` — 1 once the process switched read-ahead off because a
-  quarter of what it fetched went unused; `prefetch_fetch_errors` — read-ahead
-  wire reads that failed (dropped; never a fail-open event). A run with any
-  `prefetch_served_bytes` is never taken as a no-cache baseline by `summary`.
+  read had already brought them; `prefetch_parses` — basket maps parsed
+  (successes; a map is retried while the reader's header pages are still being
+  staged, and those attempts do not count); `prefetch_disabled` — 1 once a
+  process switched read-ahead off, so a total over several processes is a
+  count of how many did; `prefetch_fetch_errors` — read-ahead
+  wire reads that failed (dropped; never a fail-open event). Read-ahead's wire
+  traffic is counted in `origin_bytes` and `origin_readvs`, as any other origin
+  read, but NOT in `hist_origin_rt_us`: that histogram is time a reader waited,
+  and nobody waited for these. A run that read ahead at all is never taken as a
+  no-cache baseline by `summary`, whether or not the prediction was used.
   Per file, `prefetch_issued` / `prefetch_served` / `prefetch_dropped` in the
   `.files.jsonl` record.
 - Histograms are log2 buckets: bucket *i* counts samples with

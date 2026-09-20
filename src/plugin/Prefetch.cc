@@ -16,6 +16,7 @@
 #include <deque>
 #include <list>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -31,6 +32,9 @@ constexpr uint64_t kGateMinIssued = 64ull << 20; // ... once this much has been 
 constexpr size_t kTableCache = 8;          // basket tables kept across handles (RDF opens a file twice)
 constexpr size_t kMaxReadvElems = 1024;    // the readv element cap, per wire request
 constexpr int kParseTries = 3;             // a reader's metadata reads stage asynchronously: try again on a later fill
+constexpr uint32_t kBarrenFills = 4;       // fills matching no basket before a table is given up on
+constexpr uint64_t kTableCacheBytes = 64ull << 20; // ... and a byte ceiling over all of them
+constexpr size_t kNoTableMemo = 64;        // files remembered as having no basket map for us
 
 // The basket map of one file, compacted from the parser's FileMeta: per-branch
 // arrays concatenated by branch (branch b owns [boff[b], boff[b] + nb[b])), and
@@ -42,6 +46,13 @@ struct BasketTable {
   std::vector<int64_t> sortedSeek;     // seek of sortedIdx[k]
   std::vector<uint32_t> sortedIdx;
   int64_t fileSize = 0;
+
+  // Roughly what this table costs in RAM, for the cache's byte ceiling.
+  uint64_t bytes() const {
+    return sizeof(int64_t) * (seek.size() + size.size() + es.size() + sortedSeek.size()) +
+           sizeof(uint32_t) * (sortedIdx.size() + nb.size() + boff.size()) +
+           names.size() * (sizeof(std::string) + 24);
+  }
 
   uint32_t branchOf(uint32_t g) const {
     auto it = std::upper_bound(boff.begin(), boff.end(), g);
@@ -117,12 +128,14 @@ struct EntrySource : transpose::Source {
 
 struct PrefetchHandle {
   std::weak_ptr<HandleState> owner; // the handle this state belongs to; a reused address is not it
+  std::weak_ptr<FileEntry> entry;   // so the sweep can drop what an abandoned handle staged
   std::shared_ptr<const BasketTable> table;
   int parseTries = 0;            // failed parses so far; the metadata may simply not be staged yet
   bool noTable = false;          // the file did not parse after kParseTries: never look again
   std::vector<int64_t> frontier; // per branch: highest basket index demanded, -1 = none
   std::vector<uint64_t> share;   // per branch: largest bytes drawn in one fill by this handle
   uint64_t fills = 0;
+  uint32_t barren = 0;           // consecutive fills whose chunks were no basket of this table
   std::vector<uint32_t> shadow;  // the prediction for the next fill, sorted (shadow or issued)
   struct Issued {
     uint32_t g;
@@ -159,10 +172,11 @@ struct Prefetcher::Impl {
   // ---- process state, owned by the worker thread ---------------------------
   std::atomic<bool> confirmed_{false};
   std::atomic<bool> disabled_{false};
-  uint64_t maxFill_ = 0;
   std::unordered_map<std::string, uint64_t> shareByName_; // the memo across files
-  uint64_t issued_ = 0, dropped_ = 0;
+  uint64_t issued_ = 0;
+  std::atomic<uint64_t> inflight_{0}; // bytes on the wire, not yet staged: RAM the cap must see
   std::list<std::pair<std::string, std::shared_ptr<BasketTable>>> tables_; // LRU, front = newest
+  std::list<std::string> noTables_; // files with no basket map for us, LRU, front = newest
   // Per-handle state, owned HERE and touched only by the worker thread. Keyed
   // by the handle's address and validated through the weak owner, so a handle
   // that went away without a close (or an address reused by a new handle)
@@ -174,6 +188,7 @@ struct Prefetcher::Impl {
 
   void post(Job j) {
     Job superseded; // destroyed outside the lock, on the caller's thread
+    Sync* orphaned = nullptr; // a waiter whose job we are about to throw away
     {
       std::lock_guard<std::mutex> g(qmu_);
       HandleState* k = j.st.get();
@@ -186,6 +201,11 @@ struct Prefetcher::Impl {
         pending_.emplace(k, std::move(j));
       } else if (j.close) {
         superseded = std::move(it->second); // a close supersedes any fill still queued
+        // ... but if what it supersedes is ANOTHER close, that close has a
+        // thread waiting on it. Dropping the job would leave it waiting for a
+        // completion that can never come: a permanent hang of an application
+        // thread. It is woken below, outside the lock.
+        orphaned = superseded.sync;
         it->second = std::move(j);
         order_.erase(std::find(order_.begin(), order_.end(), k));
         order_.push_front(k);
@@ -193,6 +213,12 @@ struct Prefetcher::Impl {
         superseded = std::move(it->second); // a newer fill supersedes an older one
         it->second = std::move(j);
       }
+    }
+    superseded = Job(); // free its references before waking anyone waiting on it
+    if (orphaned) {
+      std::lock_guard<std::mutex> g(orphaned->m);
+      orphaned->done = true;
+      orphaned->cv.notify_all();
     }
     qcv_.notify_one();
   }
@@ -219,7 +245,11 @@ struct Prefetcher::Impl {
             handleFill(job);
         } catch (const std::exception& e) {
           UCACHE_WARN("prefetch: %s; switching off for this process", e.what());
-          disabled_.store(true);
+          switchOff(stats(job)); // the counter too: read-ahead off and prefetch_disabled 0
+                                 // said nothing had happened
+        } catch (...) {
+          UCACHE_WARN("prefetch: unknown failure; switching off for this process");
+          switchOff(stats(job));
         }
       } // the job, and with it the last reference this thread holds, dies here
       if (sync) {
@@ -230,12 +260,45 @@ struct Prefetcher::Impl {
     }
   }
 
-  Stats* stats(const Job& j) { return j.st->store ? &j.st->store->stats() : nullptr; }
+  Stats* stats(const Job& j) { return j.st && j.st->store ? &j.st->store->stats() : nullptr; }
+
+  void switchOff(Stats* s) {
+    disabled_.store(true);
+    if (s)
+      s->prefetchDisabled.store(1, std::memory_order_relaxed);
+  }
+
+  // Never-used bytes, from the entries themselves rather than from what this
+  // thread happened to drop: pages dropped at close, by the sweep, by a punch,
+  // by the entry's own destructor, and by a completion whose handle had gone
+  // were all invisible here, and for a basket smaller than a page EVERY byte
+  // was, because the drop rule only takes pages wholly inside a basket. The
+  // breaker weighed a full numerator against a partial one.
+  uint64_t neverUsed() const { return FileEntry::speculativeDroppedTotal(); }
+
+  // Handles that went away without a close, and closed handles whose owner has
+  // now been destroyed. Anything still marked speculative for them is dropped
+  // here: erasing the state without dropping left the pages staged until the
+  // entry itself died, counted against the process-wide speculative cap the
+  // whole time, so a process that lost enough of them stopped reading ahead
+  // with no counter and no log line to say so.
+  void sweepDeadHandles() {
+    for (auto it = handles_.begin(); it != handles_.end();) {
+      if (!it->second->owner.expired()) {
+        ++it;
+        continue;
+      }
+      PrefetchHandle& h = *it->second;
+      if (auto e = h.entry.lock())
+        for (const auto& i : h.issued)
+          e->dropSpeculative(i.off, i.len);
+      it = handles_.erase(it);
+    }
+  }
 
   std::shared_ptr<PrefetchHandle> handle(const Job& j) {
-    if (++jobs_ % 64 == 0) // handles that vanished without a close
-      for (auto it = handles_.begin(); it != handles_.end();)
-        it = it->second->owner.expired() ? handles_.erase(it) : std::next(it);
+    if (++jobs_ % 64 == 0)
+      sweepDeadHandles();
     auto it = handles_.find(j.st.get());
     if (it != handles_.end() && it->second->owner.lock() == j.st)
       return it->second;
@@ -262,6 +325,14 @@ struct Prefetcher::Impl {
         tables_.splice(tables_.begin(), tables_, it);
         return t;
       }
+    // A file with no basket map for us -- an RNTuple container, a nested tree
+    // -- is remembered as such. `noTable` lives on the handle, so every new
+    // handle on the same file used to pay the full three attempts again: a
+    // 1453-file RNTuple dataset opened twice per file spent thousands of
+    // futile parses on the one thread every Close waits behind.
+    for (const auto& k : noTables_)
+      if (k == key)
+        return nullptr;
     EntrySource src(*j.entry);
     const int64_t size = static_cast<int64_t>(j.entry->fileSize());
     transpose::FileMeta fm = transpose::parseFile(src, size, "Events");
@@ -274,18 +345,39 @@ struct Prefetcher::Impl {
           break;
         }
     }
-    if (Stats* s = stats(j))
-      s->prefetchParses.fetch_add(1, std::memory_order_relaxed);
     if (!fm.error.empty() || fm.branches.empty()) {
       UCACHE_INFO("prefetch: no basket map for %s yet (%s)", j.st->url.c_str(),
                   fm.error.empty() ? "no branches" : fm.error.c_str());
       return nullptr;
     }
+    // Counted on SUCCESS: a basket map parsed, which is what the counter is
+    // documented to mean. Counting attempts made the number depend on how
+    // much of the header happened to be staged when the second fill arrived.
+    if (Stats* s = stats(j))
+      s->prefetchParses.fetch_add(1, std::memory_order_relaxed);
     auto t = BasketTable::build(fm, size);
     tables_.emplace_front(key, t);
-    while (tables_.size() > kTableCache)
-      tables_.pop_back();
+    // Trimmed by BYTES as well as by count: one 1500-branch file's map is
+    // about 21 MB, so eight of them is 170 MB held for the life of the
+    // process, outside every configured cap and reported nowhere.
+    uint64_t held = 0;
+    for (auto it = tables_.begin(); it != tables_.end();) {
+      held += it->second->bytes();
+      if (it != tables_.begin() &&
+          (tables_.size() > kTableCache || held > kTableCacheBytes)) {
+        held -= it->second->bytes();
+        it = tables_.erase(it);
+      } else {
+        ++it;
+      }
+    }
     return t;
+  }
+
+  void rememberNoTable(const std::string& key) {
+    noTables_.push_front(key);
+    while (noTables_.size() > kNoTableMemo)
+      noTables_.pop_back();
   }
 
   void handleClose(const Job& j) {
@@ -296,20 +388,37 @@ struct Prefetcher::Impl {
     h.closed.store(true, std::memory_order_release);
     if (j.entry)
       for (const auto& i : h.issued)
-        dropped_ += j.entry->dropSpeculative(i.off, i.len);
+        j.entry->dropSpeculative(i.off, i.len);
     h.issued.clear();
+    h.issued.shrink_to_fit();
     h.shadow.clear();
-    handles_.erase(j.st.get()); // completions still in flight hold their own reference
+    h.shadow.shrink_to_fit();
+    h.frontier.clear();
+    h.share.clear();
+    h.table.reset(); // the table itself stays in tables_, keyed by the file
+    // The state STAYS in the map as a tombstone until the sweep finds the
+    // handle gone. Erasing it here let a fill that arrived after the close --
+    // or one still queued when it happened -- create fresh state whose
+    // `closed` was false, which is why the guard in handleFill could never
+    // fire. Completions still in flight hold their own reference to it.
   }
 
   void handleFill(const Job& j) {
     const Config& cfg = globalConfig();
     if (!cfg.prefetch || disabled_.load())
       return;
+    // No fill stage, no read-ahead. With fill_buffer_mb = 0 (the legacy
+    // direct-write mode) stageSpeculative can hold nothing, so every predicted
+    // byte was fetched from the origin and thrown away on arrival -- booked as
+    // "late", which is the one outcome the breaker does not weigh, so it ran
+    // for the life of the process.
+    if (cfg.fillBufferMb <= 0)
+      return;
     auto hp = handle(j);
     PrefetchHandle& h = *hp;
     if (h.closed.load())
       return;
+    h.entry = j.entry;
     ++h.fills;
     if (!h.table && !h.noTable) {
       // The parse waits for a handle's second fill while nothing in the
@@ -326,8 +435,10 @@ struct Prefetcher::Impl {
         // The reader's own metadata reads are staged asynchronously after they
         // complete; a fast reader's second fill can arrive before the header is
         // resident. A failed parse is cheap, so it is retried on later fills.
-        if (++h.parseTries >= kParseTries)
+        if (++h.parseTries >= kParseTries) {
           h.noTable = true;
+          rememberNoTable(j.entry->key().key); // every later handle on this file skips it
+        }
         return;
       }
       h.frontier.assign(h.table->nb.size(), -1);
@@ -344,8 +455,22 @@ struct Prefetcher::Impl {
       fillBytes += len;
       t.decompose(off, len, gs);
     }
-    if (gs.empty())
-      return; // the file-open metadata reads: nothing to learn from yet
+    if (gs.empty()) {
+      // The file-open metadata reads look like this, and so does a table built
+      // for the wrong tree: a multi-tree file whose keys list names a small
+      // side tree first parsed fine and then matched nothing the reader ever
+      // asked for, leaving read-ahead inert for that file with a parse counted
+      // and nothing said. Give up after a few fills, and say why.
+      if (h.table && ++h.barren >= kBarrenFills) {
+        UCACHE_INFO("prefetch: the basket map of %s matches nothing this reader asks for "
+                    "(another tree in the same file); not reading ahead for it",
+                    j.st->url.c_str());
+        h.table.reset();
+        h.noTable = true;
+      }
+      return;
+    }
+    h.barren = 0;
     std::sort(gs.begin(), gs.end());
     gs.erase(std::unique(gs.begin(), gs.end()), gs.end());
 
@@ -367,7 +492,6 @@ struct Prefetcher::Impl {
         uint64_t& m = shareByName_[t.names[b]];
         m = std::max(m, perBranch[b]);
       }
-    maxFill_ = std::max(maxFill_, fillBytes);
 
     // Shadow: did the previous prediction cover this fill?
     if (!h.shadow.empty() && fillBytes) {
@@ -393,18 +517,17 @@ struct Prefetcher::Impl {
       for (const auto& i : h.issued) {
         const uint32_t b = t.branchOf(i.g);
         if (static_cast<int64_t>(i.g - t.boff[b]) <= prevFrontier[b])
-          dropped_ += j.entry->dropSpeculative(i.off, i.len);
+          j.entry->dropSpeculative(i.off, i.len);
         else
           keep.push_back(i);
       }
       h.issued.swap(keep);
     }
-    if (issued_ >= kGateMinIssued && static_cast<double>(dropped_) > kGateNeverUsed * issued_) {
-      disabled_.store(true);
-      if (Stats* s = stats(j))
-        s->prefetchDisabled.store(1, std::memory_order_relaxed);
+    const uint64_t never = neverUsed();
+    if (issued_ >= kGateMinIssued && static_cast<double>(never) > kGateNeverUsed * issued_) {
+      switchOff(stats(j));
       UCACHE_WARN("prefetch: %.0f MB of %.0f MB read ahead were never used; switching off "
-                  "for this process", dropped_ / 1e6, issued_ / 1e6);
+                  "for this process", never / 1e6, issued_ / 1e6);
       for (const auto& i : h.issued)
         j.entry->dropSpeculative(i.off, i.len);
       h.issued.clear();
@@ -438,8 +561,13 @@ struct Prefetcher::Impl {
     });
     uint64_t window = static_cast<uint64_t>(std::max(1, cfg.prefetchWindowMb)) << 20;
     const uint64_t ramCap = static_cast<uint64_t>(std::max(1, cfg.prefetchRamMb)) << 20;
-    const uint64_t staged = FileEntry::speculativeTotal();
-    window = std::min(window, ramCap > staged ? ramCap - staged : 0);
+    // Bytes ON THE WIRE count against the cap as well as bytes already staged.
+    // The cap used to see only what had landed, so on a slow origin -- where
+    // nothing lands before the next handle is served -- it read near zero for
+    // every handle in turn, and 32 readers each took a full window: about a
+    // gigabyte of buffers against a stated ceiling of half that.
+    const uint64_t held = FileEntry::speculativeTotal() + inflight_.load(std::memory_order_relaxed);
+    window = std::min(window, ramCap > held ? ramCap - held : 0);
     uint64_t cum = 0;
     size_t take = 0;
     while (take < cand.size() && cum < window) {
@@ -467,10 +595,15 @@ struct Prefetcher::Impl {
   class WireHandler : public XrdCl::ResponseHandler {
    public:
     WireHandler(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
-                std::shared_ptr<PrefetchHandle> h, std::vector<Elem> elems)
+                std::shared_ptr<PrefetchHandle> h, std::vector<Elem> elems, Impl* owner,
+                uint64_t wireBytes)
         : st_(std::move(st)), entry_(std::move(entry)), h_(std::move(h)),
           elems_(std::move(elems)), stats_(st_->store ? &st_->store->stats() : nullptr),
-          inflight_(stats_) {}
+          inflight_(stats_), owner_(owner), wireBytes_(wireBytes) {}
+    // The prefetcher outlives every handler (it is leaked with its thread), so
+    // giving the bytes back here is safe on every exit, including the issue
+    // that XrdCl refused.
+    ~WireHandler() override { owner_->inflight_.fetch_sub(wireBytes_, std::memory_order_relaxed); }
     void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
                                  XrdCl::HostList* hosts) override {
       // Give the inner file back and let go of the handle in the same breath:
@@ -506,11 +639,12 @@ struct Prefetcher::Impl {
         stats->originReadvs.fetch_add(1, std::memory_order_relaxed);
         if (late)
           stats->prefetchLateBytes.fetch_add(late, std::memory_order_relaxed);
-        if (dropped) {
-          stats->prefetchDroppedUnread.fetch_add(dropped, std::memory_order_relaxed);
-          entry_->obs().prefetchDropped.fetch_add(dropped, std::memory_order_relaxed);
-        }
       }
+      // Outside the `if (stats)`: bytes that arrived for a handle which has
+      // gone are never-used whether or not this process has a stats file, and
+      // the breaker reads them from the entry, not from here.
+      if (dropped)
+        entry_->noteSpeculativeDropped(dropped);
       delete this;
     }
 
@@ -521,6 +655,8 @@ struct Prefetcher::Impl {
     std::vector<Elem> elems_;
     Stats* stats_;
     OriginInFlight inflight_;
+    Impl* owner_;
+    uint64_t wireBytes_;
   };
 
   template <typename Cand>
@@ -556,45 +692,71 @@ struct Prefetcher::Impl {
         elems.push_back({at, cut - at, nullptr});
         at = cut;
       }
-    uint64_t issuedBytes = 0;
-    for (const auto& el : elems)
-      issuedBytes += el.len;
-    for (const auto& c : cand)
-      h.issued.push_back({c.g, static_cast<uint64_t>(c.seek), static_cast<uint64_t>(c.size)});
-    issued_ += issuedBytes;
-    if (Stats* s = stats(j))
-      s->prefetchIssuedBytes.fetch_add(issuedBytes, std::memory_order_relaxed);
-    e.obs().prefetchIssued.fetch_add(issuedBytes, std::memory_order_relaxed);
-
+    // Counted per request that the client ACCEPTED, never up front. Counting
+    // the whole prediction and then returning on a failed issue put bytes in
+    // the breaker's denominator that no page was ever staged for, so they
+    // could never come back as never-used: a failing origin made the breaker
+    // harder to trip, which is backwards.
+    uint64_t sent = 0;
     for (size_t at = 0; at < elems.size(); at += kMaxReadvElems) {
       std::vector<Elem> part(elems.begin() + static_cast<long>(at),
                              elems.begin() + static_cast<long>(std::min(elems.size(), at + kMaxReadvElems)));
+      uint64_t partBytes = 0;
       XrdCl::ChunkList wire;
       wire.reserve(part.size());
       for (auto& el : part) {
         el.buf = std::make_shared<std::vector<char>>(el.len);
         wire.emplace_back(el.off, static_cast<uint32_t>(el.len), el.buf->data());
+        partBytes += el.len;
       }
-      XrdCl::File* f = j.st->acquireInner();
+      XrdCl::File* f = j.st->acquireInnerIfOpen();
       if (!f)
-        return; // no origin to read ahead from (cache-only handle): nothing lost
-      auto* wh = new WireHandler(j.st, j.entry, hp, std::move(part));
+        break; // no origin open to read ahead from: the reader's own miss opens it
+      inflight_.fetch_add(partBytes, std::memory_order_relaxed);
+      auto* wh = new WireHandler(j.st, j.entry, hp, std::move(part), this, partBytes);
       XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, wh, 0);
       if (!s.IsOK()) {
-        delete wh;
+        delete wh; // its destructor gives the in-flight bytes back
         j.st->releaseInner();
         if (Stats* st = stats(j))
           st->prefetchFetchErrors.fetch_add(1, std::memory_order_relaxed);
-        return;
+        break;
       }
+      sent += partBytes;
     }
+    if (!sent)
+      return;
+    for (const auto& c : cand)
+      h.issued.push_back({c.g, static_cast<uint64_t>(c.seek), static_cast<uint64_t>(c.size)});
+    issued_ += sent;
+    if (Stats* s = stats(j))
+      s->prefetchIssuedBytes.fetch_add(sent, std::memory_order_relaxed);
+    e.obs().prefetchIssued.fetch_add(sent, std::memory_order_relaxed);
   }
 };
 
 Prefetcher::Prefetcher() : impl_(new Impl()) {}
 
+namespace {
+Prefetcher* gPrefetcher = nullptr;
+} // namespace
+
 Prefetcher& Prefetcher::instance() {
-  static Prefetcher* p = new Prefetcher(); // leaked on purpose: its thread outlives static teardown
+  static Prefetcher* p = [] {
+    auto* q = new Prefetcher(); // leaked on purpose: its thread outlives static teardown
+    gPrefetcher = q;
+    // fork() copies the queue and its mutex but NOT the worker thread, so a
+    // child that inherited an open handle would post a close and wait on a
+    // thread that does not exist -- a permanent hang at file close, in
+    // exactly the Python worker pools that fork. The child starts over with
+    // an empty queue and a live thread; the old state is leaked, since the
+    // only thread that could have been using it is gone.
+    ::pthread_atfork(nullptr, nullptr, [] {
+      if (gPrefetcher)
+        gPrefetcher->impl_ = new Impl();
+    });
+    return q;
+  }();
   return *p;
 }
 
@@ -610,6 +772,16 @@ void Prefetcher::onFill(const std::shared_ptr<HandleState>& st,
   // the speculative stage has no misses, and it is exactly the one to follow).
   if (!anyMiss && !st->prefetchSeen.load(std::memory_order_acquire))
     return;
+  // Mark the handle HERE, on the calling thread, before the job is queued.
+  // The worker used to set it when it first built state for the handle, and
+  // onClose reads it to decide whether there is anything to wait for: a handle
+  // whose first fill was still in the queue therefore closed without posting a
+  // close at all, and the worker then went on to build state for it, see an
+  // open handle, and read ahead for a file the application had let go. Nothing
+  // afterwards could drop those pages -- no further fill, no close, and the
+  // sweep had no way to reach them -- so they sat in the speculative pool for
+  // the life of the entry and shrank every other handle's window.
+  st->prefetchSeen.store(true, std::memory_order_release);
   Impl::Job j;
   j.st = st;
   j.entry = entry;

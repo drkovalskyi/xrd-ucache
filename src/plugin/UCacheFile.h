@@ -121,6 +121,13 @@ struct HandleState {
   XrdCl::XRootDStatus missError();
 
   XrdCl::File* acquireInner();
+  // Like acquireInner, but never OPENS the origin: a trusted cache-only handle
+  // whose inner file is not open yet returns null instead of running the
+  // synchronous lazy open. For work the application did not ask for -- read
+  // ahead -- where blocking a shared thread on a remote open, consuming the
+  // handle's one open attempt, and latching an open failure that the reader's
+  // next real miss would then inherit are all the wrong trade.
+  XrdCl::File* acquireInnerIfOpen();
   void releaseInner();
   void shutdownInner(); // plugin dtor: invalidate + drain + destroy the file
   // Destroy the terminally-failed inner file and install a fresh one; returns
