@@ -21,6 +21,16 @@
 
 namespace ucache::transpose {
 
+// Byte source with presence semantics: `has` says whether a range can be read
+// at all (bitmap-gated for cache images, always true for a plain file), `read`
+// copies it. Shared by the replica builder and the parser's Source-based
+// entry points; the cache-image implementations live with their callers.
+struct Source {
+  virtual ~Source() = default;
+  virtual bool read(void* dst, uint64_t n, uint64_t off) = 0;
+  virtual bool has(uint64_t off, uint64_t n) = 0; // false => range not usable
+};
+
 struct KeyInfo {
   int32_t nbytes = 0;
   uint16_t ver = 0;
@@ -57,19 +67,28 @@ struct ContainerMeta {
   std::string error;         // non-empty => nothing above is meaningful
 };
 
-// Walk an open ROOT file to its keys list. Bounds-checked throughout.
+// Walk an open ROOT file to its keys list. Bounds-checked throughout. The
+// Source form reads through `src` (a range `src` cannot vouch for reads as
+// short, and the walk fails there) and needs the file size the caller knows.
 ContainerMeta parseContainer(int fd);
+ContainerMeta parseContainer(Source& src, int64_t fileSize);
 
 // Read key `k`'s payload, decompressing it when the key says it is compressed.
 // Returns empty on a short read or a failed decompression.
 std::vector<uint8_t> readKeyPayload(int fd, const KeyInfo& k);
+std::vector<uint8_t> readKeyPayload(Source& src, const KeyInfo& k);
 
 struct BranchInfo {
   std::string name;
-  int32_t writeBasket = 0;
+  int32_t writeBasket = 0;  // baskets written; validated 0 <= writeBasket <= maxBaskets
   uint32_t maxBaskets = 0;
+  int64_t entries = 0;              // the branch's fEntries
   std::vector<int64_t> basketSeek;  // [writeBasket]
   std::vector<int32_t> basketBytes; // [writeBasket]
+  // The entry axis: basket i covers entries [basketEntry[i], basketEntry[i+1]).
+  // [writeBasket + 1]; the last value is `entries` when ROOT did not store it
+  // (a branch whose basket count reached fMaxBaskets).
+  std::vector<int64_t> basketEntry;
   std::string leafClass;            // e.g. "TLeafF"
   std::string leafTitle;            // e.g. "Muon_pt[nMuon]/F"
   std::string leafCount;            // counter leaf name ("" = scalar)
@@ -94,6 +113,10 @@ struct FileMeta {
   int dirSeekWidth = 8;    // fSeekDir/fSeekParent/fSeekKeys in the directory
   KeyInfo treeKey;                // the live (highest-cycle) tree key
   std::vector<uint8_t> treeBlob;  // decompressed tree metadata
+  int64_t entries = 0;            // the tree's fEntries
+  int64_t autoFlush = 0;          // fAutoFlush (0 = not set)
+  std::vector<int64_t> clusterRangeEnd; // fClusterRangeEnd[fNClusterRange]
+  std::vector<int64_t> clusterSize;     // fClusterSize[fNClusterRange]
   std::vector<BranchInfo> branches;
   std::string error; // non-empty => parse failed (fail open, no transpose)
 };
@@ -102,5 +125,16 @@ struct FileMeta {
 // decompressed in memory). On any unsupported version/layout, returns a
 // FileMeta with `error` set and no branches.
 FileMeta parseFile(const std::string& path, const std::string& tree = "Events");
+
+// The same walk over a Source: for a caller that holds the bytes itself (a
+// cache image, a staged fill) rather than a path. `fileSize` is the origin
+// size the caller knows. Fails, never guesses, wherever `src.has` is false.
+FileMeta parseFile(Source& src, int64_t fileSize, const std::string& tree = "Events");
+
+// The TTree walk alone, over an already decompressed tree record whose key
+// header was `keylen` bytes: fills entries, cluster fields and branches into
+// `fm`, or sets `fm.error`. Exposed so the walk can be fuzzed and unit-tested
+// on crafted blobs without a container around them.
+bool parseTreeBlob(const uint8_t* blob, size_t n, uint16_t keylen, FileMeta& fm);
 
 } // namespace ucache::transpose

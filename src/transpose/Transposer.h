@@ -23,12 +23,7 @@
 
 namespace ucache::transpose {
 
-// Byte source with presence semantics (bitmap-gated for cache images).
-struct Source {
-  virtual ~Source() = default;
-  virtual bool read(void* dst, uint64_t n, uint64_t off) = 0;
-  virtual bool has(uint64_t off, uint64_t n) = 0; // false => range not usable
-};
+// `Source` (byte source with presence semantics) is declared in TreeMeta.h.
 
 // Σ uncompressed bytes (fObjlen from each basket's key header — NO decode)
 // of the `hot` branches: the estimator's numerator.

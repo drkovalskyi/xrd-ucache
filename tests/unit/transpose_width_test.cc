@@ -256,6 +256,60 @@ TEST(TransposeWidth, NarrowHeaderOverWideDirectoryIsAccepted) {
   EXPECT_EQ(fm.keyslistSeek, 900000);
 }
 
+// A Source over the crafted bytes: the walk the plugin would run on bytes it
+// holds itself (a staged fill) must reach the same verdict and geometry as the
+// path-based walk, and must stop where the Source cannot vouch for a range.
+struct BytesSource : Source {
+  std::vector<uint8_t> bytes;
+  explicit BytesSource(std::vector<uint8_t> b) : bytes(std::move(b)) {}
+  bool has(uint64_t off, uint64_t n) override { return off + n <= bytes.size(); }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    if (!has(off, n))
+      return false;
+    std::memcpy(dst, bytes.data() + off, n);
+    return true;
+  }
+};
+
+TEST(TransposeWidth, SourceWalkMatchesPathWalk) {
+  ucache::test::TempDir td;
+  auto bytes = craftHeader(/*large=*/true, /*wideDir=*/false, kFend, kKeysListSeek);
+  FileMeta viaPath = parseFile(writeTemp(td, bytes));
+  BytesSource src(bytes);
+  FileMeta viaSource = parseFile(src, static_cast<int64_t>(bytes.size()));
+  EXPECT_EQ(viaSource.error, viaPath.error);
+  EXPECT_EQ(viaSource.error, "cannot read keys list");
+  EXPECT_EQ(viaSource.large, viaPath.large);
+  EXPECT_EQ(viaSource.headerSeekWidth, 8);
+  EXPECT_EQ(viaSource.dirSeekWidth, 4);
+  EXPECT_EQ(viaSource.fend, kFend);
+  EXPECT_EQ(viaSource.keyslistSeek, kKeysListSeek);
+  ContainerMeta cm = parseContainer(src, static_cast<int64_t>(bytes.size()));
+  EXPECT_EQ(cm.error, "cannot read keys list");
+  EXPECT_EQ(cm.keyslistSeek, kKeysListSeek);
+}
+
+TEST(TransposeWidth, SourceThatCannotVouchFailsNotGuesses) {
+  // Presence false for every range: the header itself is unavailable, and the
+  // walk must refuse rather than read whatever `read` might hand back.
+  struct Absent : Source {
+    bool has(uint64_t, uint64_t) override { return false; }
+    bool read(void* dst, uint64_t n, uint64_t) override {
+      std::memset(dst, 0, n);
+      return true;
+    }
+  } absent;
+  FileMeta fm = parseFile(absent, 4096);
+  EXPECT_EQ(fm.error, "not a ROOT file");
+  EXPECT_TRUE(fm.branches.empty());
+  // And a blob no tree walk can accept fails the same way, without throwing.
+  std::vector<uint8_t> junk(64, 0xEE);
+  FileMeta blob;
+  EXPECT_FALSE(parseTreeBlob(junk.data(), junk.size(), 40, blob));
+  EXPECT_FALSE(blob.error.empty());
+  EXPECT_TRUE(blob.branches.empty());
+}
+
 // ---------------------------------------------------------------- builder
 
 TEST(TransposeWidth, MixedWidthOverlayLeavesTheDirectoryUntouched) {

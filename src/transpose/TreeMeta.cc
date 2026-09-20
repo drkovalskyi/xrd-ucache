@@ -1,5 +1,7 @@
 #include "TreeMeta.h"
 
+#include <algorithm>
+
 #include <cstring>
 #include <fcntl.h>
 #include <type_traits>
@@ -344,11 +346,15 @@ bool parseBranch(Cur& c, FileMeta& fm,
   }
   c.skipObj("TAttFill");
   c.skip(4 * 4 + 8);         // fCompress..fWriteBasket (i4 x4), fEntryNumber (q)
+  if (c.fail_)
+    return false;
   b.writeBasket = beGet<int32_t>(c.p + c.at - 12);
   c.skipObj("TIOFeatures");
   c.skip(4);                 // fOffset
   b.maxBaskets = c.get<uint32_t>();
-  c.skip(4 + 8 * 4);         // fSplitLevel, fEntries..fZipBytes (q x4)
+  c.skip(4);                 // fSplitLevel
+  b.entries = c.get<int64_t>();
+  c.skip(8 * 3);             // fFirstEntry, fTotBytes, fZipBytes
   if (!objArray(c, classRefs, "fBranches(sub)", [&](const AnyObj&) {
         c.fail_ = true;
         c.why = "sub-branches unsupported (flat trees only)";
@@ -368,20 +374,40 @@ bool parseBranch(Cur& c, FileMeta& fm,
       c.why = "implausible fMaxBaskets";
     return false;
   }
+  // fWriteBasket indexes the three arrays below, each sized fMaxBaskets: a
+  // negative or oversized value would size an allocation from hostile bytes
+  // and read past the arrays. This walk runs on metadata that arrived over
+  // the network, so it is checked here, once, before any of the three loops.
+  if (b.writeBasket < 0 || static_cast<uint32_t>(b.writeBasket) > b.maxBaskets) {
+    c.fail_ = true;
+    c.why = "implausible fWriteBasket";
+    return false;
+  }
+  const size_t nb = static_cast<size_t>(b.writeBasket);
   c.skip(1);
   b.bytesArrayOff = c.at;
-  b.basketBytes.resize(b.writeBasket);
-  for (int32_t i = 0; i < b.writeBasket; ++i)
+  if (!c.need(4ull * b.maxBaskets))
+    return false;
+  b.basketBytes.resize(nb);
+  for (size_t i = 0; i < nb; ++i)
     b.basketBytes[i] = beGet<int32_t>(c.p + c.at + 4 * i);
   c.skip(4ull * b.maxBaskets);
   c.skip(1);
-  c.skip(8ull * b.maxBaskets); // fBasketEntry
+  if (!c.need(8ull * b.maxBaskets)) // fBasketEntry: the entry axis
+    return false;
+  const size_t ne = std::min<size_t>(nb + 1, b.maxBaskets);
+  b.basketEntry.resize(nb + 1, b.entries);
+  for (size_t i = 0; i < ne; ++i)
+    b.basketEntry[i] = beGet<int64_t>(c.p + c.at + 8 * i);
+  if (nb && b.basketEntry[nb] < b.basketEntry[nb - 1])
+    b.basketEntry[nb] = b.entries; // an unflushed last basket ends at the branch's end
+  c.skip(8ull * b.maxBaskets);
   c.skip(1);
   b.seekArrayOff = c.at;
-  b.basketSeek.resize(b.writeBasket);
   if (!c.need(8ull * b.maxBaskets))
     return false;
-  for (int32_t i = 0; i < b.writeBasket; ++i)
+  b.basketSeek.resize(nb);
+  for (size_t i = 0; i < nb; ++i)
     b.basketSeek[i] = beGet<int64_t>(c.p + c.at + 8 * i);
   c.at = end; // fFileName + any tail via the outer byte count
   fm.branches.push_back(std::move(b));
@@ -390,7 +416,35 @@ bool parseBranch(Cur& c, FileMeta& fm,
 
 } // namespace
 
-ContainerMeta parseContainer(int fd) {
+namespace {
+
+// Where the container walk reads from: a descriptor, or a caller's Source.
+// Reads are all-or-nothing; a short read is a failed read, and a Source that
+// cannot vouch for a range (`has` false) fails it too — the walk never guesses.
+struct Reader {
+  virtual ~Reader() = default;
+  virtual bool read(void* dst, size_t n, int64_t off) = 0;
+  int64_t size = 0;
+};
+struct FdReader : Reader {
+  int fd;
+  explicit FdReader(int f) : fd(f) { size = ::lseek(fd, 0, SEEK_END); }
+  bool read(void* dst, size_t n, int64_t off) override {
+    return off >= 0 && ::pread(fd, dst, n, off) == static_cast<ssize_t>(n);
+  }
+};
+struct SourceReader : Reader {
+  Source& src;
+  SourceReader(Source& s, int64_t sz) : src(s) { size = sz; }
+  bool read(void* dst, size_t n, int64_t off) override {
+    if (off < 0)
+      return false;
+    const uint64_t o = static_cast<uint64_t>(off);
+    return src.has(o, n) && src.read(dst, n, o);
+  }
+};
+
+ContainerMeta parseContainerFrom(Reader& r) {
   ContainerMeta fm;
   auto fail = [&](std::string why) {
     fm.error = std::move(why);
@@ -398,10 +452,10 @@ ContainerMeta parseContainer(int fd) {
     return fm;
   };
 
-  off_t fsz = ::lseek(fd, 0, SEEK_END);
+  const int64_t fsz = r.size;
   fm.fileSize = fsz;
-  std::vector<uint8_t> head(512);
-  if (::pread(fd, head.data(), head.size(), 0) < 4 ||
+  std::vector<uint8_t> head(static_cast<size_t>(std::clamp<int64_t>(fsz, 0, 512)));
+  if (head.size() < 4 || !r.read(head.data(), head.size(), 0) ||
       std::memcmp(head.data(), "root", 4) != 0)
     return fail("not a ROOT file");
   fm.large = beGet<int32_t>(head.data() + 4) > 1000000;
@@ -460,11 +514,12 @@ ContainerMeta parseContainer(int fd) {
   // Keys list.
   {
     auto kl = [&]() -> std::optional<KeyInfo> {
-      std::vector<uint8_t> buf(4096);
-      ssize_t r = ::pread(fd, buf.data(), buf.size(), fm.keyslistSeek);
-      if (r < 34)
+      if (fm.keyslistSeek < 0 || fm.keyslistSeek >= fsz)
         return std::nullopt;
-      return parseKey(buf.data(), static_cast<size_t>(r), 0);
+      std::vector<uint8_t> buf(static_cast<size_t>(std::min<int64_t>(4096, fsz - fm.keyslistSeek)));
+      if (buf.size() < 34 || !r.read(buf.data(), buf.size(), fm.keyslistSeek))
+        return std::nullopt;
+      return parseKey(buf.data(), buf.size(), 0);
     }();
     if (!kl)
       return fail("cannot read keys list");
@@ -474,8 +529,7 @@ ContainerMeta parseContainer(int fd) {
         fm.keyslistSeek < 0 || kl->nbytes > fsz - fm.keyslistSeek)
       return fail("keys-list key geometry implausible");
     std::vector<uint8_t> buf(kl->nbytes);
-    if (::pread(fd, buf.data(), buf.size(), fm.keyslistSeek) !=
-        static_cast<ssize_t>(buf.size()))
+    if (!r.read(buf.data(), buf.size(), fm.keyslistSeek))
       return fail("short keys list read");
     size_t at = kl->keylen;
     int32_t nkeys = beGet<int32_t>(buf.data() + at);
@@ -493,11 +547,11 @@ ContainerMeta parseContainer(int fd) {
   return fm;
 }
 
-std::vector<uint8_t> readKeyPayload(int fd, const KeyInfo& k) {
+std::vector<uint8_t> readKeyPayloadFrom(Reader& r, const KeyInfo& k) {
   if (k.nbytes <= 0 || k.keylen > k.nbytes || k.objlen < 0 || k.seekkey < 0)
     return {};
   std::vector<uint8_t> rec(k.nbytes);
-  if (::pread(fd, rec.data(), rec.size(), k.seekkey) != static_cast<ssize_t>(rec.size()))
+  if (!r.read(rec.data(), rec.size(), k.seekkey))
     return {};
   std::vector<uint8_t> out;
   if (k.objlen == k.nbytes - k.keylen)
@@ -509,57 +563,78 @@ std::vector<uint8_t> readKeyPayload(int fd, const KeyInfo& k) {
   return out;
 }
 
-FileMeta parseFile(const std::string& path, const std::string& tree) {
+FileMeta parseTreeFrom(Reader& r, const std::string& tree) {
   FileMeta fm;
   auto fail = [&](std::string why) {
     fm.error = std::move(why);
     fm.branches.clear();
     return fm;
   };
-
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
-    return fail("cannot open " + path);
-  ContainerMeta cm = parseContainer(fd);
+  ContainerMeta cm = parseContainerFrom(r);
   // Geometry is carried over even when the walk failed later on: the detected
   // seek widths stay observable on the error path, which is what makes a
   // width-detection bug diagnosable from a file that does not fully parse.
-  const off_t fsz = cm.fileSize;
+  const int64_t fsz = cm.fileSize;
   fm.large = cm.large;
   fm.headerSeekWidth = cm.headerSeekWidth;
   fm.fend = cm.fend;
   fm.keyslistSeek = cm.keyslistSeek;
   fm.dirSeekKeysOff = cm.dirSeekKeysOff;
   fm.dirSeekWidth = cm.dirSeekWidth;
-  if (!cm.error.empty()) {
-    ::close(fd);
+  if (!cm.error.empty())
     return fail(cm.error);
-  }
 
   // The live (highest-cycle) key named `tree`.
   for (const auto& e : cm.keys)
     if (e.cls == "TTree" && e.name == tree && e.cycle >= fm.treeKey.cycle)
       fm.treeKey = e;
-  if (fm.treeKey.nbytes == 0) {
-    ::close(fd);
+  if (fm.treeKey.nbytes == 0)
     return fail("tree '" + tree + "' not found in keys list");
-  }
   if (fm.treeKey.nbytes < 0 || fm.treeKey.keylen > fm.treeKey.nbytes ||
       fm.treeKey.objlen < 0 || fm.treeKey.seekkey < 0 ||
-      fm.treeKey.nbytes > fsz - fm.treeKey.seekkey) {
-    ::close(fd);
+      fm.treeKey.nbytes > fsz - fm.treeKey.seekkey)
     return fail("tree key geometry implausible");
-  }
-  fm.treeBlob = readKeyPayload(fd, fm.treeKey);
-  ::close(fd);
+  fm.treeBlob = readKeyPayloadFrom(r, fm.treeKey);
   if (fm.treeBlob.size() != static_cast<size_t>(fm.treeKey.objlen))
     return fail("tree metadata decompression failed");
+  if (!parseTreeBlob(fm.treeBlob.data(), fm.treeBlob.size(), fm.treeKey.keylen, fm))
+    return fail(fm.error);
+  return fm;
+}
 
+} // namespace
+
+ContainerMeta parseContainer(int fd) {
+  FdReader r(fd);
+  return parseContainerFrom(r);
+}
+ContainerMeta parseContainer(Source& src, int64_t fileSize) {
+  SourceReader r(src, fileSize);
+  return parseContainerFrom(r);
+}
+std::vector<uint8_t> readKeyPayload(int fd, const KeyInfo& k) {
+  FdReader r(fd);
+  return readKeyPayloadFrom(r, k);
+}
+std::vector<uint8_t> readKeyPayload(Source& src, const KeyInfo& k) {
+  SourceReader r(src, 0); // the size is not consulted for a single key record
+  return readKeyPayloadFrom(r, k);
+}
+
+bool parseTreeBlob(const uint8_t* blob, size_t n, uint16_t keylen, FileMeta& fm) {
   // Streamed TTree v20 walk.
+  fm.branches.clear();
+  fm.clusterRangeEnd.clear();
+  fm.clusterSize.clear();
+  auto fail = [&](std::string why) {
+    fm.error = std::move(why);
+    fm.branches.clear();
+    return false;
+  };
   Cur c;
-  c.p = fm.treeBlob.data();
-  c.n = fm.treeBlob.size();
-  c.keylen = fm.treeKey.keylen;
+  c.p = blob;
+  c.n = n;
+  c.keylen = keylen;
   std::vector<std::pair<uint32_t, std::string>> classRefs;
   std::vector<std::pair<uint32_t, std::string>> leafRegistry;
   uint16_t tver;
@@ -570,13 +645,27 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
   c.skipObj("TAttLine");
   c.skipObj("TAttFill");
   c.skipObj("TAttMarker");
-  c.skip(5 * 8 + 8 + 4 * 4); // fEntries..fFlushedBytes (q x5), fWeight (d), 4x i4
+  fm.entries = c.get<int64_t>();
+  c.skip(4 * 8 + 8 + 4 * 4); // fTotBytes..fFlushedBytes (q x4), fWeight (d), 4x i4
   uint32_t nClusterRange = c.get<uint32_t>();
-  c.skip(6 * 8);             // fMaxEntries..fEstimate (q x6)
+  c.skip(4 * 8);             // fMaxEntries, fMaxEntryLoop, fMaxVirtualSize, fAutoSave
+  fm.autoFlush = c.get<int64_t>();
+  c.skip(8);                 // fEstimate
   if (nClusterRange > (1u << 20))
     return fail("implausible fNClusterRange");
-  c.skip(1 + 8ull * nClusterRange); // fClusterRangeEnd
-  c.skip(1 + 8ull * nClusterRange); // fClusterSize
+  auto clusterArray = [&](std::vector<int64_t>& out) {
+    c.skip(1); // array marker
+    if (!c.need(8ull * nClusterRange))
+      return;
+    out.resize(nClusterRange);
+    for (uint32_t i = 0; i < nClusterRange; ++i)
+      out[i] = beGet<int64_t>(c.p + c.at + 8ull * i);
+    c.skip(8ull * nClusterRange);
+  };
+  clusterArray(fm.clusterRangeEnd); // fClusterRangeEnd
+  clusterArray(fm.clusterSize);     // fClusterSize
+  if (c.fail_)
+    return fail(c.why);
   c.skipObj("TIOFeatures");
   if (!objArray(c, classRefs, "fBranches", [&](const AnyObj& o) {
         return o.cls == "TBranch" ? parseBranch(c, fm, classRefs, leafRegistry)
@@ -586,7 +675,25 @@ FileMeta parseFile(const std::string& path, const std::string& tree) {
     return fail(c.why.empty() ? "branch walk failed" : c.why);
   if (c.fail_)
     return fail(c.why);
+  return true;
+}
+
+FileMeta parseFile(const std::string& path, const std::string& tree) {
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    FileMeta fm;
+    fm.error = "cannot open " + path;
+    return fm;
+  }
+  FdReader r(fd);
+  FileMeta fm = parseTreeFrom(r, tree);
+  ::close(fd);
   return fm;
+}
+
+FileMeta parseFile(Source& src, int64_t fileSize, const std::string& tree) {
+  SourceReader r(src, fileSize);
+  return parseTreeFrom(r, tree);
 }
 
 } // namespace ucache::transpose

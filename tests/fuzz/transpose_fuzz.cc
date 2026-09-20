@@ -193,6 +193,43 @@ int fileFuzz(const char* path, uint64_t iters, uint64_t seed) {
   }
 
   std::mt19937_64 rng(seed);
+
+  // Blob stage: mutate the DECOMPRESSED tree record and walk it directly. File
+  // mutations rarely reach the branch walk's fields (they land in compressed
+  // bytes and fail the frame checks first), so fWriteBasket, fMaxBaskets and
+  // the three per-branch arrays never saw a hostile value from the stage
+  // below. The plugin will run this walk on metadata fetched over the network.
+  {
+    std::vector<Region> blobRegion = {{0, fm0.treeBlob.size()}};
+    uint64_t walked = 0;
+    std::vector<uint8_t> b;
+    for (uint64_t i = 0; i < iters && !failures; ++i) {
+      b = fm0.treeBlob;
+      mutate(b, blobRegion, rng);
+      try {
+        FileMeta fm;
+        if (parseTreeBlob(b.data(), b.size(), fm0.treeKey.keylen, fm)) {
+          ++walked;
+          for (const auto& br : fm.branches) {
+            if (br.writeBasket < 0 || static_cast<uint32_t>(br.writeBasket) > br.maxBaskets)
+              violate("accepted branch with fWriteBasket outside [0, fMaxBaskets]", i, seed);
+            if (br.basketSeek.size() != static_cast<size_t>(br.writeBasket) ||
+                br.basketBytes.size() != static_cast<size_t>(br.writeBasket) ||
+                br.basketEntry.size() != static_cast<size_t>(br.writeBasket) + 1)
+              violate("basket arrays not sized by fWriteBasket", i, seed);
+          }
+        } else if (fm.error.empty()) {
+          violate("blob walk failed without a reason", i, seed);
+        }
+      } catch (const std::exception& e) {
+        violate(e.what(), i, seed); // the walk must not throw (fail open)
+      }
+    }
+    if (!failures)
+      std::printf("transpose-fuzz: blob stage clean (%llu mutants, %llu walked)\n",
+                  (unsigned long long)iters, (unsigned long long)walked);
+  }
+
   uint64_t parsedOk = 0, builtOk = 0;
   std::vector<uint8_t> m;
   for (uint64_t i = 0; i < iters && !failures; ++i) {

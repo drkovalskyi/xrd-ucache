@@ -38,7 +38,14 @@ int main(int argc, char** argv) {
               fm.treeKey.objlen, fm.treeKey.keylen);
   std::printf("\"tree\":{\"name\":");
   jstr(argc > 2 ? argv[2] : "Events");
-  std::printf(",\"n_branches\":%zu,\"branches\":[", fm.branches.size());
+  std::printf(",\"entries\":%lld,\"autoflush\":%lld,\"cluster_range_end\":[",
+              static_cast<long long>(fm.entries), static_cast<long long>(fm.autoFlush));
+  for (size_t i = 0; i < fm.clusterRangeEnd.size(); ++i)
+    std::printf(i ? ",%lld" : "%lld", static_cast<long long>(fm.clusterRangeEnd[i]));
+  std::printf("],\"cluster_size\":[");
+  for (size_t i = 0; i < fm.clusterSize.size(); ++i)
+    std::printf(i ? ",%lld" : "%lld", static_cast<long long>(fm.clusterSize[i]));
+  std::printf("],\"n_branches\":%zu,\"branches\":[", fm.branches.size());
   bool first = true;
   for (const auto& b : fm.branches) {
     if (!first)
@@ -53,6 +60,9 @@ int main(int argc, char** argv) {
     std::printf("],\"basket_bytes\":[");
     for (size_t i = 0; i < b.basketBytes.size(); ++i)
       std::printf(i ? ",%d" : "%d", b.basketBytes[i]);
+    std::printf("],\"entries\":%lld,\"basket_entry\":[", static_cast<long long>(b.entries));
+    for (size_t i = 0; i < b.basketEntry.size(); ++i)
+      std::printf(i ? ",%lld" : "%lld", static_cast<long long>(b.basketEntry[i]));
     std::printf("],\"leaf_class\":");
     jstr(b.leafClass);
     std::printf(",\"leaf_count\":");
