@@ -39,6 +39,15 @@ struct Stats {
   std::atomic<uint64_t> servedBytes{0};
   std::atomic<uint64_t> originReads{0};
   std::atomic<uint64_t> fetchesJoined{0}; // misses that joined an in-flight fetch
+  // Prefetch (docs/STATS.md). Every gate that claims to measure prefetch
+  // asserts these are not all zero.
+  std::atomic<uint64_t> prefetchIssuedBytes{0};    // asked of the origin ahead of demand
+  std::atomic<uint64_t> prefetchServedBytes{0};    // speculative pages the reader demanded
+  std::atomic<uint64_t> prefetchRefetchedBytes{0}; //   ... of which a demand read fetched again
+  std::atomic<uint64_t> prefetchDroppedUnread{0};  // speculative pages dropped never used
+  std::atomic<uint64_t> prefetchLateBytes{0};      // arrived after the demand read had them
+  std::atomic<uint64_t> prefetchParses{0};         // basket tables parsed
+  std::atomic<uint64_t> prefetchDisabled{0};       // 1 once this process switched itself off
   std::atomic<uint64_t> originReadvs{0};
   std::atomic<uint64_t> pageWrites{0};
   std::atomic<uint64_t> crcFailures{0};
@@ -167,6 +176,8 @@ struct Stats {
 // line of each file supersedes earlier ones; totals sum the last line per file.
 struct StatsTotals {
   int files = 0;
+  uint64_t prefetchIssuedBytes = 0, prefetchServedBytes = 0, prefetchRefetchedBytes = 0,
+           prefetchDroppedUnread = 0, prefetchLateBytes = 0, prefetchParses = 0, prefetchDisabled = 0;
   uint64_t opens = 0, validationsFailed = 0, hitBytes = 0, missBytes = 0, originBytes = 0,
            servedBytes = 0, originReads = 0, fetchesJoined = 0, originReadvs = 0, pageWrites = 0, crcFailures = 0,
            metaCorrupt = 0, evictedEntries = 0, evictedBytes = 0, failopenEvents = 0,

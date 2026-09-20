@@ -73,6 +73,13 @@ std::string Stats::toJsonBody() const {
   f("served_bytes", servedBytes);
   f("origin_reads", originReads);
   f("fetches_joined", fetchesJoined);
+  f("prefetch_issued_bytes", prefetchIssuedBytes);
+  f("prefetch_served_bytes", prefetchServedBytes);
+  f("prefetch_refetched_bytes", prefetchRefetchedBytes);
+  f("prefetch_dropped_unread", prefetchDroppedUnread);
+  f("prefetch_late_bytes", prefetchLateBytes);
+  f("prefetch_parses", prefetchParses);
+  f("prefetch_disabled", prefetchDisabled);
   f("origin_readvs", originReadvs);
   f("page_writes", pageWrites);
   f("crc_failures", crcFailures);
@@ -158,6 +165,13 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.servedBytes += extractU64(last, "served_bytes");
     t.originReads += extractU64(last, "origin_reads");
     t.fetchesJoined += extractU64(last, "fetches_joined");
+    t.prefetchIssuedBytes += extractU64(last, "prefetch_issued_bytes");
+    t.prefetchServedBytes += extractU64(last, "prefetch_served_bytes");
+    t.prefetchRefetchedBytes += extractU64(last, "prefetch_refetched_bytes");
+    t.prefetchDroppedUnread += extractU64(last, "prefetch_dropped_unread");
+    t.prefetchLateBytes += extractU64(last, "prefetch_late_bytes");
+    t.prefetchParses += extractU64(last, "prefetch_parses");
+    t.prefetchDisabled += extractU64(last, "prefetch_disabled");
     t.originReadvs += extractU64(last, "origin_readvs");
     t.pageWrites += extractU64(last, "page_writes");
     t.crcFailures += extractU64(last, "crc_failures");

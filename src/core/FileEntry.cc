@@ -40,6 +40,7 @@ std::string jsonEscapeMin(const std::string& s) {
 } // namespace
 
 std::atomic<uint64_t> FileEntry::g_bufTotal_{0};
+std::atomic<uint64_t> FileEntry::g_specTotal_{0};
 
 std::shared_ptr<FileEntry> FileEntry::open(IOBackend& io, const Config& cfg, Stats& stats,
                                            const UrlKey& key, uint64_t originSize,
@@ -158,6 +159,7 @@ void FileEntry::retractPage(uint64_t pg) {
 
 FileEntry::~FileEntry() {
   closing_ = true;
+  dropAllSpeculative(); // never-used at close: counted, never written
   flushAll();
   if (dataFd_ >= 0)
     io_.close(dataFd_);
@@ -214,6 +216,9 @@ void FileEntry::emitObsRecord() {
      << ",\"disk_bytes\":" << v(obs_.diskBytes)
      << ",\"first_touch_bytes\":" << v(obs_.firstTouchBytes)
      << ",\"wire_bytes\":" << v(obs_.wireBytes)
+     << ",\"prefetch_issued\":" << v(obs_.prefetchIssued)
+     << ",\"prefetch_served\":" << v(obs_.prefetchServed)
+     << ",\"prefetch_dropped\":" << v(obs_.prefetchDropped)
      << ",\"span_us\":" << spanUs()
      // The one size that means the same thing on both routes. Bytes SERVED
      // differ by route -- the replica tier hands over decompressed data, the
@@ -323,8 +328,14 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
 
   // Accounted locally, published at every exit — partial work on a
   // miss/CRC-demotion still describes real disk activity.
-  uint64_t ramB = 0, ftB = 0, dReads = 0, dBytes = 0, dSeq = 0;
+  uint64_t ramB = 0, ftB = 0, dReads = 0, dBytes = 0, dSeq = 0, specServed = 0;
   auto publish = [&] {
+    if (specServed) {
+      g_specTotal_.fetch_sub(specServed, std::memory_order_relaxed);
+      g_bufTotal_.fetch_add(specServed, std::memory_order_relaxed);
+      stats_.prefetchServedBytes.fetch_add(specServed, std::memory_order_relaxed);
+      obs_.prefetchServed.fetch_add(specServed, std::memory_order_relaxed);
+    }
     if (ramB) {
       stats_.ramHitBytes.fetch_add(ramB, std::memory_order_relaxed);
       obs_.ramBytes.fetch_add(ramB, std::memory_order_relaxed);
@@ -361,12 +372,16 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
       const uint64_t pStart = i * P;
       const uint64_t cStart = std::max(off, pStart);
       const uint64_t cEnd = std::min(off + len, pStart + meta_.pageBytes(i));
-      const BufPage* staged = nullptr;
+      BufPage* staged = nullptr;
       if (auto it = buf_.find(i); it != buf_.end())
         staged = &it->second;
       else if (auto it2 = flushing_.find(i); it2 != flushing_.end())
         staged = &it2->second;
       if (staged) {
+        if (staged->spec) { // a prediction the reader confirmed: it is a real page now
+          unmarkSpeculative(*staged, meta_.pageBytes(i));
+          specServed += meta_.pageBytes(i);
+        }
         // Staged pages serve straight from RAM — during a fill the cache
         // disk sees no random reads. A RAM page also ends the current run.
         std::memcpy(out + (cStart - off), staged->data.get() + (cStart - pStart),
@@ -463,7 +478,7 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
     return;
 
   // Stage full pages in RAM: no disk IO on this path at all.
-  uint64_t staged = 0;
+  uint64_t staged = 0, covered = 0;
   {
     std::lock_guard<std::mutex> g(mu_);
     for (uint64_t i = (off + P - 1) / P; i * P < end; ++i) {
@@ -471,8 +486,15 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
       uint32_t nbytes = meta_.pageBytes(i);
       if (pStart + nbytes > end)
         break; // partial edge page: leave unstaged
-      if (meta_.bitmap.get(i) || buf_.count(i) || flushing_.count(i))
-        continue; // already present or staged; writes are idempotent
+      if (auto it = buf_.find(i); it != buf_.end()) {
+        if (it->second.spec) { // the demand read fetched what a prediction had: the
+          unmarkSpeculative(it->second, nbytes); // page is real now, the bytes came twice
+          covered += nbytes;
+        }
+        continue; // already staged; writes are idempotent
+      }
+      if (meta_.bitmap.get(i) || flushing_.count(i))
+        continue; // already present or being written; writes are idempotent
       BufPage p;
       p.data = std::make_unique<uint8_t[]>(nbytes);
       std::memcpy(p.data.get(), in + (pStart - off), nbytes);
@@ -482,12 +504,119 @@ void FileEntry::writePages(uint64_t off, uint64_t len, const void* buf) {
       staged += nbytes;
     }
   }
+  if (covered) {
+    g_specTotal_.fetch_sub(covered, std::memory_order_relaxed);
+    g_bufTotal_.fetch_add(covered, std::memory_order_relaxed);
+    stats_.prefetchServedBytes.fetch_add(covered, std::memory_order_relaxed);
+    stats_.prefetchRefetchedBytes.fetch_add(covered, std::memory_order_relaxed);
+    obs_.prefetchServed.fetch_add(covered, std::memory_order_relaxed);
+  }
   if (staged == 0)
     return;
   g_bufTotal_.fetch_add(staged, std::memory_order_relaxed);
   obs_.wireBytes.fetch_add(staged, std::memory_order_relaxed);
   touchAtime(); // an entry being written is in use — keep it LRU-fresh
   flushBuffer(false); // cap/interval policy decides; usually a no-op
+}
+
+void FileEntry::unmarkSpeculative(BufPage& p, uint32_t nbytes) {
+  p.spec = false;
+  specBytes_ -= nbytes;
+  bufBytes_ += nbytes;
+}
+
+uint64_t FileEntry::stageSpeculative(uint64_t off, uint64_t len, const void* buf) {
+  if (len == 0 || cfg_.fillBufferMb <= 0) // no stage to hold a speculative page
+    return 0;
+  const uint32_t P = meta_.pageSize;
+  const auto* in = static_cast<const uint8_t*>(buf);
+  uint64_t end = std::min(off + len, meta_.fileSize);
+  if (off >= end)
+    return 0;
+  uint64_t staged = 0;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    for (uint64_t i = (off + P - 1) / P; i * P < end; ++i) {
+      uint64_t pStart = i * P;
+      uint32_t nbytes = meta_.pageBytes(i);
+      if (pStart + nbytes > end)
+        break;
+      if (meta_.bitmap.get(i) || buf_.count(i) || flushing_.count(i))
+        continue; // the demand read got there first: this page is late, not new
+      BufPage p;
+      p.data = std::make_unique<uint8_t[]>(nbytes);
+      std::memcpy(p.data.get(), in + (pStart - off), nbytes);
+      p.crc = crc32c(p.data.get(), nbytes);
+      p.spec = true;
+      buf_.emplace(i, std::move(p));
+      specBytes_ += nbytes;
+      staged += nbytes;
+    }
+  }
+  if (staged)
+    g_specTotal_.fetch_add(staged, std::memory_order_relaxed);
+  return staged; // no drain trigger: speculative bytes never write themselves
+}
+
+uint64_t FileEntry::dropSpeculative(uint64_t off, uint64_t len) {
+  if (len == 0 || off + len < off)
+    return 0;
+  const uint32_t P = meta_.pageSize;
+  const uint64_t end = std::min(off + len, meta_.fileSize);
+  if (off >= end)
+    return 0;
+  uint64_t dropped = 0;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    for (auto it = buf_.lower_bound(off / P); it != buf_.end() && it->first * P < end;) {
+      if (it->second.spec) {
+        const uint32_t nbytes = meta_.pageBytes(it->first);
+        specBytes_ -= nbytes;
+        dropped += nbytes;
+        it = buf_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (dropped) {
+    g_specTotal_.fetch_sub(dropped, std::memory_order_relaxed);
+    stats_.prefetchDroppedUnread.fetch_add(dropped, std::memory_order_relaxed);
+    obs_.prefetchDropped.fetch_add(dropped, std::memory_order_relaxed);
+  }
+  return dropped;
+}
+
+uint64_t FileEntry::dropAllSpeculative() { return dropSpeculative(0, meta_.fileSize); }
+
+uint64_t FileEntry::speculativeBytes() {
+  std::lock_guard<std::mutex> g(mu_);
+  return specBytes_;
+}
+
+uint64_t FileEntry::speculativeTotal() { return g_specTotal_.load(std::memory_order_relaxed); }
+
+std::vector<std::pair<uint64_t, uint64_t>> FileEntry::absentRuns(uint64_t off, uint64_t len) {
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  if (len == 0 || off + len < off)
+    return runs;
+  const uint32_t P = meta_.pageSize;
+  const uint64_t end = std::min(off + len, meta_.fileSize);
+  if (off >= end)
+    return runs;
+  const uint64_t first = off / P, last = (end - 1) / P;
+  std::lock_guard<std::mutex> g(mu_);
+  for (uint64_t i = first; i <= last; ++i) {
+    if (meta_.bitmap.get(i) || buf_.count(i) || flushing_.count(i))
+      continue;
+    const uint64_t pStart = i * uint64_t(P);
+    const uint64_t pLen = meta_.pageBytes(i);
+    if (!runs.empty() && runs.back().first + runs.back().second == pStart)
+      runs.back().second += pLen;
+    else
+      runs.emplace_back(pStart, pLen);
+  }
+  return runs;
 }
 
 void FileEntry::writePagesDirect(uint64_t off, uint64_t len, const void* buf) {
@@ -562,8 +691,8 @@ void FileEntry::flushBuffer(bool force) {
       flushCv_.wait(lk, [&] { return !flushInProgress_; });
     else if (flushInProgress_)
       return; // staged pages ride the next trigger
-    if (buf_.empty())
-      return;
+    if (bufBytes_ == 0)
+      return; // nothing real staged (speculative pages alone never drain)
     if (!force) {
       const uint64_t capB = uint64_t(cfg_.fillBufferMb) << 20;
       const uint64_t totalCapB = uint64_t(cfg_.fillBufferTotalMb) << 20;
@@ -572,8 +701,17 @@ void FileEntry::flushBuffer(bool force) {
       if (!capStall && nowS() < lastBufFlushS_ + static_cast<uint64_t>(cfg_.metaFlushSeconds))
         return;
     }
+    // Speculative pages stay in the stage: only what the reader demanded is
+    // written. Node extraction, so the payloads never move.
+    std::map<uint64_t, BufPage> keep;
+    for (auto it = buf_.begin(); it != buf_.end();) {
+      if (it->second.spec)
+        keep.insert(buf_.extract(it++));
+      else
+        ++it;
+    }
     flushing_ = std::move(buf_);
-    buf_.clear();
+    buf_ = std::move(keep);
     snapBytes = bufBytes_;
     bufBytes_ = 0;
     flushInProgress_ = true;
@@ -697,7 +835,7 @@ void FileEntry::checkpoint() {
   bool due = false;
   {
     std::lock_guard<std::mutex> g(mu_);
-    due = !buf_.empty() && !flushInProgress_ &&
+    due = bufBytes_ > 0 && !flushInProgress_ &&
           nowS() >= lastBufFlushS_ + static_cast<uint64_t>(cfg_.metaFlushSeconds);
   }
   if (due)

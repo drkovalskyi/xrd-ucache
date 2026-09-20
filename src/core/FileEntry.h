@@ -114,6 +114,28 @@ class FileEntry {
   // every page it had staged with it. Called by CacheStore::checkpoint.
   void checkpoint();
 
+  // ---- speculative (prefetched) pages -----------------------------------
+  // A speculative page is staged in RAM exactly like a fill page and serves
+  // reads the same way, but while it carries its mark it is NEVER written:
+  // flushBuffer, checkpoint and flushAll leave it in the stage. The mark
+  // clears when the page is served (readCached) or when a real fill covers it
+  // (writePages); a page still marked when dropped -- by dropSpeculative when
+  // the reader's frontier has passed it, or at close -- leaves no trace in the
+  // sidecar, the bitmap or the data file. Only full pages inside [off,off+len)
+  // that are neither present nor staged are taken; returns the bytes staged.
+  uint64_t stageSpeculative(uint64_t off, uint64_t len, const void* buf);
+  // Drop the pages of [off, off+len) still marked speculative (never served,
+  // never covered); returns the bytes dropped and counts them never-used.
+  uint64_t dropSpeculative(uint64_t off, uint64_t len);
+  uint64_t dropAllSpeculative();
+  uint64_t speculativeBytes();
+  // Page runs inside [off, off+len) that are neither present nor staged --
+  // what a prefetch would have to fetch. Page-aligned, the tail page clamped
+  // to the file size; empty when everything is already there.
+  std::vector<std::pair<uint64_t, uint64_t>> absentRuns(uint64_t off, uint64_t len);
+  // Process-wide bytes currently staged speculatively, across entries.
+  static uint64_t speculativeTotal();
+
   bool pinned();
   void setPinned(bool p);
   uint64_t cachedBytes();
@@ -158,6 +180,11 @@ class FileEntry {
     std::atomic<uint64_t> diskBytes{0};
     std::atomic<uint64_t> firstTouchBytes{0}; // bytes served for the first time
     std::atomic<uint64_t> wireBytes{0};       // bytes staged/persisted (fills)
+    // Prefetch, per file: bytes the prefetcher asked the origin for, bytes of
+    // speculative pages the reader then demanded, bytes dropped never used.
+    std::atomic<uint64_t> prefetchIssued{0};
+    std::atomic<uint64_t> prefetchServed{0};
+    std::atomic<uint64_t> prefetchDropped{0};
     // Wall span this entry was live and doing work for, in µs of a steady
     // clock: first activity to last. In a slot-based analysis (one worker per
     // file at a time) this is that thread's FULL cost for the file — waits
@@ -289,15 +316,21 @@ class FileEntry {
   struct BufPage {
     std::unique_ptr<uint8_t[]> data; // pageBytes(i) bytes (tail page short)
     uint32_t crc = 0;
+    bool spec = false; // speculative: serve it, never write it while marked
   };
-  std::map<uint64_t, BufPage> buf_;      // staged, awaiting flush
-  std::map<uint64_t, BufPage> flushing_; // snapshot being written (readable)
-  uint64_t bufBytes_ = 0;                // staged bytes in buf_ (not flushing_)
+  std::map<uint64_t, BufPage> buf_;      // staged, awaiting flush (incl. speculative)
+  std::map<uint64_t, BufPage> flushing_; // snapshot being written (readable; never speculative)
+  uint64_t bufBytes_ = 0;                // REAL staged bytes in buf_ (not flushing_, not speculative)
+  uint64_t specBytes_ = 0;               // speculative bytes in buf_
+  // Clears a speculative mark under mu_: the page becomes a real staged page
+  // (accounting moves from the speculative pools to the fill pools).
+  void unmarkSpeculative(BufPage& p, uint32_t nbytes);
   uint64_t lastBufFlushS_ = 0;
   bool flushInProgress_ = false;
   std::condition_variable flushCv_;
   // Process-wide staged total across entries (fill_buffer_total_mb ceiling).
   static std::atomic<uint64_t> g_bufTotal_;
+  static std::atomic<uint64_t> g_specTotal_; // process-wide speculative bytes
   // In-flight fetch table: (off,len) -> parked re-dispatch callbacks.
   std::map<std::pair<uint64_t, uint64_t>, std::vector<std::function<void()>>> inflight_;
 

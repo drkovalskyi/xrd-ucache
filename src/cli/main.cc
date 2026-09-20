@@ -350,6 +350,13 @@ void printStats(const StatsTotals& t) {
   rowB("served_bytes", t.servedBytes);
   row("origin_reads", t.originReads);
   row("fetches_joined", t.fetchesJoined);
+  row("prefetch_issued_bytes", t.prefetchIssuedBytes);
+  row("prefetch_served_bytes", t.prefetchServedBytes);
+  row("prefetch_refetched_bytes", t.prefetchRefetchedBytes);
+  row("prefetch_dropped_unread", t.prefetchDroppedUnread);
+  row("prefetch_late_bytes", t.prefetchLateBytes);
+  row("prefetch_parses", t.prefetchParses);
+  row("prefetch_disabled", t.prefetchDisabled);
   row("origin_readvs", t.originReadvs);
   row("page_writes", t.pageWrites);
   row("crc_failures", t.crcFailures);

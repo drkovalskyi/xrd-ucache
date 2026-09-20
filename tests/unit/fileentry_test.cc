@@ -874,3 +874,162 @@ TEST(FileEntry, FreshOpenStoresTheSidecarAtOnce) {
   EXPECT_EQ(fx.stats.metaCorrupt.load(), 0u);
   EXPECT_EQ(fx.stats.opens.load(), 2u);
 }
+
+// ------------------------------------------------------------ speculative
+// A speculative (prefetched) page serves reads like any staged page but is
+// never written while it carries its mark; the mark clears when the reader
+// demands the page (served) or a real fill covers it. Pages still marked when
+// dropped or at close reach neither sidecar, bitmap nor data file.
+TEST(FileEntry, SpeculativePagesServeButNeverWriteUntilServed) {
+  Fixture fx(64 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  EXPECT_EQ(e->stageSpeculative(4096, 3 * 4096, fx.src.data() + 4096), 3u * 4096); // pages 1..3
+  EXPECT_EQ(e->speculativeBytes(), 3u * 4096);
+  EXPECT_TRUE(e->hasRange(4096, 3 * 4096)); // present to readers
+  e->flushBuffer(true);
+  e->checkpoint();
+  e->flushAll();
+  EXPECT_EQ(fx.stats.pageWrites.load(), 0u); // nothing written by any drain
+  EXPECT_EQ(e->cachedBytes(), 0u);           // nothing published
+  EXPECT_TRUE(e->hasRange(4096, 3 * 4096));  // still served from RAM
+  std::vector<uint8_t> buf(4096);
+  ASSERT_TRUE(e->readCached(2 * 4096, 4096, buf.data())); // page 2 demanded
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + 2 * 4096, 4096));
+  EXPECT_EQ(fx.stats.prefetchServedBytes.load(), 4096u);
+  EXPECT_EQ(e->speculativeBytes(), 2u * 4096);
+  e->flushBuffer(true);
+  EXPECT_EQ(fx.stats.pageWrites.load(), 1u); // page 2 only
+  EXPECT_EQ(e->cachedBytes(), 4096u);
+  EXPECT_TRUE(e->hasRange(4096, 4096)); // 1 and 3 still staged speculatively
+  EXPECT_EQ(e->dropAllSpeculative(), 2u * 4096);
+  EXPECT_FALSE(e->hasRange(4096, 4096));
+  EXPECT_TRUE(e->hasRange(2 * 4096, 4096));
+  EXPECT_EQ(fx.stats.prefetchDroppedUnread.load(), 2u * 4096);
+  e.reset();
+  auto r = fx.open(); // on disk: page 2 and nothing else
+  ASSERT_TRUE(r);
+  EXPECT_TRUE(r->hasRange(2 * 4096, 4096));
+  EXPECT_FALSE(r->hasRange(4096, 4096));
+  EXPECT_FALSE(r->hasRange(3 * 4096, 4096));
+}
+
+TEST(FileEntry, RealFillCoversSpeculativePage) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  EXPECT_EQ(e->stageSpeculative(5 * 4096, 4096, fx.src.data() + 5 * 4096), 4096u);
+  // The demand read fetched the same page (no vector-path dedup): the mark
+  // clears, the bytes count as served AND as fetched twice.
+  e->writePages(5 * 4096, 4096, fx.src.data() + 5 * 4096);
+  EXPECT_EQ(fx.stats.prefetchServedBytes.load(), 4096u);
+  EXPECT_EQ(fx.stats.prefetchRefetchedBytes.load(), 4096u);
+  EXPECT_EQ(e->speculativeBytes(), 0u);
+  e->flushBuffer(true);
+  EXPECT_EQ(fx.stats.pageWrites.load(), 1u);
+}
+
+TEST(FileEntry, SpeculativeStageSkipsPresentAndStagedPages) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 2 * 4096, fx.src.data()); // pages 0,1
+  e->flushBuffer(true);                       //   ... on disk
+  e->writePages(2 * 4096, 4096, fx.src.data() + 2 * 4096); // page 2 staged, real
+  EXPECT_EQ(e->stageSpeculative(0, 5 * 4096, fx.src.data()), 2u * 4096); // only 3,4 taken
+  auto runs = e->absentRuns(0, 8 * 4096); // 5,6,7 absent, one run
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_EQ(runs[0].first, 5u * 4096);
+  EXPECT_EQ(runs[0].second, 3u * 4096);
+  EXPECT_EQ(e->dropAllSpeculative(), 2u * 4096);
+  runs = e->absentRuns(0, 8 * 4096); // 3..7 absent now
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_EQ(runs[0].first, 3u * 4096);
+  EXPECT_EQ(runs[0].second, 5u * 4096);
+  e->flushBuffer(true); // publishes the real page 2 only
+  EXPECT_EQ(fx.stats.pageWrites.load(), 3u);
+}
+
+TEST(FileEntry, DropSpeculativeLeavesServedPages) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  EXPECT_EQ(e->stageSpeculative(0, 4 * 4096, fx.src.data()), 4u * 4096);
+  std::vector<uint8_t> buf(4096);
+  ASSERT_TRUE(e->readCached(4096, 4096, buf.data())); // page 1 served
+  EXPECT_EQ(e->dropSpeculative(0, 4 * 4096), 3u * 4096);
+  EXPECT_TRUE(e->hasRange(4096, 4096));
+  EXPECT_FALSE(e->hasRange(0, 4096));
+  EXPECT_FALSE(e->hasRange(2 * 4096, 2 * 4096));
+}
+
+TEST(FileEntry, SpeculativePagesAtCloseAreDroppedAndCounted) {
+  Fixture fx(16 * 4096, 4096);
+  {
+    auto e = fx.open();
+    ASSERT_TRUE(e);
+    EXPECT_EQ(e->stageSpeculative(0, 4 * 4096, fx.src.data()), 4u * 4096);
+  }
+  EXPECT_EQ(fx.stats.prefetchDroppedUnread.load(), 4u * 4096);
+  EXPECT_EQ(fx.stats.pageWrites.load(), 0u);
+  auto r = fx.open();
+  ASSERT_TRUE(r);
+  EXPECT_FALSE(r->hasRange(0, 4 * 4096));
+}
+
+// Speculative producer racing readers, real fills, droppers and a forced
+// flusher (TSan target). Whatever the interleaving: every byte served is
+// correct, and nothing still marked speculative at the end is on disk.
+TEST(FileEntry, ConcurrentSpeculativeStageServeDrop) {
+  Fixture fx(256 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> ts;
+  for (int w = 0; w < 2; ++w)
+    ts.emplace_back([&, w] {
+      for (int r = 0; r < 300; ++r) {
+        uint64_t page = (w * 300 + r * 11) % 250;
+        e->stageSpeculative(page * 4096, 3 * 4096, fx.src.data() + page * 4096);
+      }
+    });
+  for (int w = 0; w < 2; ++w)
+    ts.emplace_back([&, w] {
+      for (int r = 0; r < 200; ++r) {
+        uint64_t page = (w * 200 + r * 7) % 250;
+        e->writePages(page * 4096, 2 * 4096, fx.src.data() + page * 4096);
+      }
+    });
+  for (int rd = 0; rd < 3; ++rd)
+    ts.emplace_back([&] {
+      std::vector<uint8_t> buf(2 * 4096);
+      while (!stop.load(std::memory_order_relaxed)) {
+        uint64_t page = static_cast<uint64_t>(::rand()) % 250;
+        if (e->readCached(page * 4096, 2 * 4096, buf.data())) {
+          ASSERT_EQ(0, memcmp(buf.data(), fx.src.data() + page * 4096, 2 * 4096));
+        }
+      }
+    });
+  ts.emplace_back([&] {
+    for (int i = 0; i < 100; ++i)
+      e->dropSpeculative(static_cast<uint64_t>(::rand() % 250) * 4096, 4 * 4096);
+  });
+  ts.emplace_back([&] {
+    for (int i = 0; i < 40; ++i)
+      e->flushBuffer(true);
+  });
+  for (size_t i = 0; i < 4; ++i)
+    ts[i].join(); // the two speculative producers and the two fills
+  stop = true;  // readers loop until told; joining one earlier deadlocked this test
+  for (size_t i = 4; i < ts.size(); ++i)
+    ts[i].join();
+  const uint64_t specLeft = e->speculativeBytes();
+  e->dropAllSpeculative();
+  e->flushBuffer(true);
+  EXPECT_EQ(e->speculativeBytes(), 0u);
+  // Every published page is byte-correct; the count matches the disk.
+  auto scrub = e->verifyAll();
+  EXPECT_EQ(scrub.bad, 0u);
+  EXPECT_EQ(scrub.checked * 4096, e->cachedBytes());
+  EXPECT_EQ(fx.stats.prefetchDroppedUnread.load() >= specLeft, true);
+}
