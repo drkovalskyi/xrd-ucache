@@ -555,6 +555,29 @@ TEST(Baseline, AQuietFillQualifiesAndALoudOneDoesNot) {
   }
 }
 
+// Read-ahead makes a cold fill look like a baseline by the byte test: nearly
+// every byte was fetched from the origin AND nearly every byte was served from
+// the speculative stage. The same quiet fill as above, once the plugin reports
+// that any prefetched byte was served, is no reference at all.
+TEST(Baseline, AFillServedByReadAheadIsNotAReference) {
+  test::TempDir d;
+  const std::string quiet = fillCounters(kGiB) + ",\"buffer_stall_us\":10000000" + originHist(1000.0);
+  writeRun(d.path(), "h", 1, 1000, 1100, quiet,
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  writeRun(d.path(), "h", 2, 2000, 2100, quiet + ",\"prefetch_served_bytes\":" + std::to_string(kGiB / 2),
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 2u);
+  for (const auto& r : runs) {
+    if (r.pid == 1) {
+      EXPECT_TRUE(r.baselineQualified()) << "the quiet fill still qualifies";
+    } else {
+      EXPECT_EQ(r.prefetchServedBytes, kGiB / 2);
+      EXPECT_FALSE(r.baselineQualified()) << "read-ahead served half of it: the cache carried this run";
+    }
+  }
+}
+
 TEST(Baseline, CoresBusyNeedsNoThreadCount) {
   test::TempDir d;
   writeRun(d.path(), "h", 1, 1000, 1100,

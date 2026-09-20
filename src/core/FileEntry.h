@@ -94,7 +94,10 @@ class FileEntry {
   const UrlKey& key() const { return key_; }
 
   bool hasRange(uint64_t off, uint64_t len);
-  bool readCached(uint64_t off, uint64_t len, void* buf);
+  // account=false reads for the cache's own purposes (the prefetcher parsing
+  // the metadata the reader fetched): no hit/served/first-touch accounting,
+  // no activity note, so the run's records describe the reader alone.
+  bool readCached(uint64_t off, uint64_t len, void* buf, bool account = true);
   void writePages(uint64_t off, uint64_t len, const void* buf);
 
   // Persist the sidecar if dirty and (force or flush interval elapsed).

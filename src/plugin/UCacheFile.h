@@ -45,6 +45,10 @@ namespace ucache {
 
 // State shared between the plugin object, executor tasks, and wire handlers.
 struct HandleState {
+  // Read-ahead (Prefetch.h) keeps its per-handle state on its own thread, keyed
+  // by this object; the one bit it shares is whether this handle has ever
+  // missed (a handle that never misses is never looked at).
+  std::atomic<bool> prefetchSeen{false};
   // CPU-span evidence for the recompression estimator: rusage
   // user+sys µs snapshotted when the handle opens; the delta at Close is the
   // CPU attributable to this file for sequential access patterns. `blended`

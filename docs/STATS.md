@@ -48,6 +48,9 @@ the consumers together.
  "opens": 0, "validations_failed": 0,
  "hit_bytes": 0, "miss_bytes": 0, "origin_bytes": 0, "served_bytes": 0,
  "origin_reads": 0, "fetches_joined": 0, "origin_readvs": 0, "page_writes": 0,
+ "prefetch_issued_bytes": 0, "prefetch_served_bytes": 0, "prefetch_refetched_bytes": 0,
+ "prefetch_dropped_unread": 0, "prefetch_late_bytes": 0, "prefetch_parses": 0,
+ "prefetch_disabled": 0, "prefetch_fetch_errors": 0,
  "crc_failures": 0, "meta_corrupt": 0,
  "evicted_entries": 0, "evicted_bytes": 0,
  "failopen_events": 0, "admissions_bypassed": 0,
@@ -190,6 +193,21 @@ reading was re-reading, and what the cache disk was asked to do.
   to drain synchronously at the buffer cap, and the wall time lost;
   `fetches_joined` — misses that joined an identical in-flight fetch instead
   of fetching again.
+- Read-ahead (`prefetch`, on by default; the plugin predicts a TTree reader's
+  next fill from the file's own basket map and fetches it while the reader
+  computes, into RAM only): `prefetch_issued_bytes` — asked of the origin ahead
+  of demand; `prefetch_served_bytes` — of those, bytes the reader then
+  demanded (they also count as hits); `prefetch_refetched_bytes` — served
+  bytes a demand read had fetched again in the meantime; `prefetch_dropped_unread`
+  — bytes read ahead that the reader never asked for, dropped from RAM and
+  never written to the cache; `prefetch_late_bytes` — arrived after the demand
+  read had already brought them; `prefetch_parses` — basket maps parsed;
+  `prefetch_disabled` — 1 once the process switched read-ahead off because a
+  quarter of what it fetched went unused; `prefetch_fetch_errors` — read-ahead
+  wire reads that failed (dropped; never a fail-open event). A run with any
+  `prefetch_served_bytes` is never taken as a no-cache baseline by `summary`.
+  Per file, `prefetch_issued` / `prefetch_served` / `prefetch_dropped` in the
+  `.files.jsonl` record.
 - Histograms are log2 buckets: bucket *i* counts samples with
   `floor(log2(v)) == i` (bucket 0 = ≤1); arrays are trimmed of trailing
   zeros, 40 buckets max. The `_us` ones bucket microseconds; the

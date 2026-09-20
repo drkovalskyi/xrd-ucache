@@ -70,6 +70,18 @@ struct Config {
   // (lost cleanly; publish stays flush-then-bitmap).
   int fillBufferMb = 48;                  // UCACHE_FILL_BUFFER_MB, per entry
   int fillBufferTotalMb = 1024;           // UCACHE_FILL_BUFFER_TOTAL_MB, process-wide
+  // Read-ahead for TTree readers (`prefetch`, UCACHE_PREFETCH; on by default):
+  // the next fill is predicted from the file's own basket map and fetched
+  // while the reader computes, into RAM only -- a prefetched page reaches the
+  // cache only once the reader has demanded it. The window is one fill's
+  // worth per branch, capped per handle; the process-wide cap on staged
+  // speculative bytes shrinks the window under pressure. Safety is built in:
+  // nothing is fetched until a prediction has been confirmed against a real
+  // fill, and a process that finds a quarter of what it read ahead never used
+  // switches itself off.
+  bool prefetch = true;                   // UCACHE_PREFETCH
+  int prefetchWindowMb = 32;              // UCACHE_PREFETCH_WINDOW_MB, per handle
+  int prefetchRamMb = 512;                // UCACHE_PREFETCH_RAM_MB, process-wide speculative stage
   // UCACHE_REVALIDATE_S: cache-freshness window (TTL). When a usable local
   // entry was last validated against the origin within this many seconds,
   // TRUST it — skip the remote Open+Stat and serve locally (the origin is

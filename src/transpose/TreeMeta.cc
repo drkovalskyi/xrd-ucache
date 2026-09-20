@@ -594,6 +594,11 @@ FileMeta parseTreeFrom(Reader& r, const std::string& tree) {
       fm.treeKey.objlen < 0 || fm.treeKey.seekkey < 0 ||
       fm.treeKey.nbytes > fsz - fm.treeKey.seekkey)
     return fail("tree key geometry implausible");
+  {
+    std::vector<uint8_t> rec(fm.treeKey.nbytes);
+    if (!r.read(rec.data(), rec.size(), fm.treeKey.seekkey))
+      return fail("tree record not readable"); // a Source that cannot vouch for it, or a short read
+  }
   fm.treeBlob = readKeyPayloadFrom(r, fm.treeKey);
   if (fm.treeBlob.size() != static_cast<size_t>(fm.treeKey.objlen))
     return fail("tree metadata decompression failed");

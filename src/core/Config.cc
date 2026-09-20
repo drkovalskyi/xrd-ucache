@@ -158,6 +158,12 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.fillBufferMb = ::atoi(v.c_str());
   else if (k == "fill_buffer_total_mb")
     c.fillBufferTotalMb = ::atoi(v.c_str());
+  else if (k == "prefetch")
+    c.prefetch = !falsy(v); // default on; see Config.h
+  else if (k == "prefetch_window_mb")
+    c.prefetchWindowMb = ::atoi(v.c_str());
+  else if (k == "prefetch_ram_mb")
+    c.prefetchRamMb = ::atoi(v.c_str());
   else if (k == "revalidate_seconds")
     c.revalidateSeconds = ::atoi(v.c_str());
   else if (k == "open_retries")
@@ -342,6 +348,9 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"meta_flush_seconds", "UCACHE_META_FLUSH_S"},
       {"fill_buffer_mb", "UCACHE_FILL_BUFFER_MB"},
       {"fill_buffer_total_mb", "UCACHE_FILL_BUFFER_TOTAL_MB"},
+      {"prefetch", "UCACHE_PREFETCH"},
+      {"prefetch_window_mb", "UCACHE_PREFETCH_WINDOW_MB"},
+      {"prefetch_ram_mb", "UCACHE_PREFETCH_RAM_MB"},
       {"revalidate_seconds", "UCACHE_REVALIDATE_S"},
       {"open_retries", "UCACHE_OPEN_RETRIES"},
       {"open_retry_base_ms", "UCACHE_OPEN_RETRY_BASE_MS"},
@@ -421,6 +430,12 @@ std::string Config::valueOf(const std::string& key) const {
     return std::to_string(fillBufferMb);
   if (key == "fill_buffer_total_mb")
     return std::to_string(fillBufferTotalMb);
+  if (key == "prefetch")
+    return onoff(prefetch);
+  if (key == "prefetch_window_mb")
+    return std::to_string(prefetchWindowMb);
+  if (key == "prefetch_ram_mb")
+    return std::to_string(prefetchRamMb);
   if (key == "meta_flush_seconds")
     return std::to_string(metaFlushSeconds);
   if (key == "revalidate_seconds")

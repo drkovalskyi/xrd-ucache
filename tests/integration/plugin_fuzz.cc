@@ -11,13 +11,19 @@
 // ops close + reopen a FRESH File), fuzzing the whole plugin open/setup/
 // drain/close lifecycle, not just steady-state reads.
 #include <XrdCl/XrdClFile.hh>
+#ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
+#include "TreeMeta.h"
+#endif
 
+#include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -127,11 +133,56 @@ struct Ctx {
   bool reopen; // single-thread only: cycle the handle through close/open
 };
 
-void worker(Ctx* ctx, const Source& src, uint64_t seed, uint64_t ops, int tid) {
+// A TTree reader's fill stream, from the seed's own basket map: a dozen
+// branches, the next eight baskets of each per fill, in entry order. Random
+// reads never look like this, and read-ahead only engages on it -- without it
+// the plugin's read-ahead path would sit under the sanitizers unexercised.
+struct Walk {
+  std::vector<std::vector<std::pair<uint64_t, uint32_t>>> branches; // (seek, bytes) per basket
+  // What a reader fetches before its first fill: header, keys list, the tree
+  // record. The plugin's read-ahead parses the map out of exactly these bytes.
+  std::vector<std::pair<uint64_t, uint32_t>> meta;
+};
+#ifdef UCACHE_FUZZ_HAVE_TRANSPOSE
+std::unique_ptr<Walk> buildWalk(const char* path) {
+  ucache::transpose::FileMeta fm = ucache::transpose::parseFile(path);
+  if (!fm.error.empty() || fm.branches.size() < 12)
+    return nullptr;
+  auto w = std::make_unique<Walk>();
+  w->meta.emplace_back(0, 4096);
+  {
+    int fd = ::open(path, O_RDONLY);
+    if (fd >= 0) {
+      std::vector<uint8_t> probe(512);
+      if (::pread(fd, probe.data(), probe.size(), fm.keyslistSeek) > 34)
+        if (auto k = ucache::transpose::parseKey(probe.data(), probe.size(), 0))
+          w->meta.emplace_back(static_cast<uint64_t>(fm.keyslistSeek), static_cast<uint32_t>(k->nbytes));
+      ::close(fd);
+    }
+  }
+  w->meta.emplace_back(static_cast<uint64_t>(fm.treeKey.seekkey), static_cast<uint32_t>(fm.treeKey.nbytes));
+  const size_t step = fm.branches.size() / 12;
+  for (size_t b = 0; b < fm.branches.size() && w->branches.size() < 12; b += step) {
+    const auto& br = fm.branches[b];
+    if (br.basketSeek.size() < 16)
+      continue;
+    std::vector<std::pair<uint64_t, uint32_t>> bk;
+    for (size_t i = 0; i < br.basketSeek.size(); ++i)
+      bk.emplace_back(static_cast<uint64_t>(br.basketSeek[i]), static_cast<uint32_t>(br.basketBytes[i]));
+    w->branches.push_back(std::move(bk));
+  }
+  return w->branches.empty() ? nullptr : std::move(w);
+}
+#else
+std::unique_ptr<Walk> buildWalk(const char*) { return nullptr; }
+#endif
+
+void worker(Ctx* ctx, const Source& src, const Walk* walk, uint64_t seed, uint64_t ops, int tid) {
   std::mt19937_64 rng(seed + tid);
   const uint64_t fsize = src.bytes.size();
   std::vector<char> buf(4 * 1024 * 1024);
   std::vector<std::vector<char>> vbufs(16);
+  std::vector<size_t> cursor(walk ? walk->branches.size() : 0, 0);
 
   for (uint64_t i = 0; i < ops; ++i) {
     XrdCl::File* file = ctx->file;
@@ -174,6 +225,59 @@ void worker(Ctx* ctx, const Source& src, uint64_t seed, uint64_t ops, int tid) {
                      "READ MISMATCH tid=%d op=%llu off=%llu len=%u want=%u got=%u ok=%d\n",
                      tid, (unsigned long long)i, (unsigned long long)off, len, want, got,
                      st.IsOK());
+        ++gFailures;
+        return;
+      }
+    } else if (walk && tid == 0 && rng() % 100 < 50) { // a TTree reader's fill (one coherent reader; the other threads race it)
+      XrdCl::ChunkList chunks;
+      size_t n = 0;
+      for (size_t b = 0; b < walk->branches.size(); ++b) {
+        const auto& bk = walk->branches[b];
+        for (int k = 0; k < 8 && cursor[b] < bk.size(); ++k, ++cursor[b]) {
+          const auto [off, len] = bk[cursor[b]];
+          if (vbufs.size() <= n)
+            vbufs.resize(n + 1);
+          vbufs[n].resize(len);
+          chunks.emplace_back(off, len, vbufs[n].data());
+          ++n;
+        }
+      }
+      if (chunks.empty()) { // the reader reached the end: start the file over
+        std::fill(cursor.begin(), cursor.end(), 0);
+        continue;
+      }
+      if (cursor[0] <= 8) { // a pass begins: fetch the metadata a real reader fetches first
+        for (const auto& [moff, mlen] : walk->meta) {
+          const uint32_t want = static_cast<uint32_t>(fsize - moff < mlen ? fsize - moff : mlen);
+          uint32_t got = 0;
+          auto ms = file->Read(moff, mlen, buf.data(), got);
+          if (!ms.IsOK() || got != want ||
+              std::memcmp(buf.data(), src.bytes.data() + moff, want) != 0) {
+            std::fprintf(stderr, "META READ MISMATCH tid=%d op=%llu off=%llu\n", tid,
+                         (unsigned long long)i, (unsigned long long)moff);
+            ++gFailures;
+            return;
+          }
+        }
+        // A reader decodes what it fetched before its first fill (ROOT: ~30 ms
+        // on the AGC files); the fetched pages are staged asynchronously
+        // behind the plugin's other work, and a fill in the same microsecond
+        // is a pattern no reader has.
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      }
+      std::sort(chunks.begin(), chunks.end(),
+                [](const XrdCl::ChunkInfo& a, const XrdCl::ChunkInfo& b) { return a.offset < b.offset; });
+      XrdCl::VectorReadInfo* info = nullptr;
+      auto st = file->VectorRead(chunks, nullptr, info);
+      bool ok = st.IsOK() && info;
+      if (ok)
+        for (const auto& c : chunks)
+          if (std::memcmp(c.buffer, src.bytes.data() + c.offset, c.length) != 0)
+            ok = false;
+      delete info;
+      if (!ok) {
+        std::fprintf(stderr, "FILL MISMATCH tid=%d op=%llu chunks=%zu ok=%d\n", tid,
+                     (unsigned long long)i, chunks.size(), st.IsOK());
         ++gFailures;
         return;
       }
@@ -233,6 +337,9 @@ int main(int argc, char** argv) {
   }
   const char* url = argv[1];
   Source src(argv[2]);
+  std::unique_ptr<Walk> walk = buildWalk(argv[2]);
+  if (walk)
+    std::fprintf(stderr, "plugin-fuzz: TTree fill stream over %zu branches\n", walk->branches.size());
   uint64_t ops = argc > 3 ? ::strtoull(argv[3], nullptr, 10) : 100000;
   int threads = argc > 4 ? ::atoi(argv[4]) : 1;
   uint64_t seed = argc > 5 ? ::strtoull(argv[5], nullptr, 10) : std::random_device{}();
@@ -249,7 +356,7 @@ int main(int argc, char** argv) {
   std::vector<std::thread> ts;
   uint64_t opsPer = ops / threads;
   for (int t = 0; t < threads; ++t)
-    ts.emplace_back(worker, &ctx, std::cref(src), seed, opsPer, t);
+    ts.emplace_back(worker, &ctx, std::cref(src), walk.get(), seed, opsPer, t);
   for (auto& t : ts)
     t.join();
 

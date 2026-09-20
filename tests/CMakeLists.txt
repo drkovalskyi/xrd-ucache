@@ -79,6 +79,10 @@ if(UCACHE_BUILD_PLUGIN)
   add_executable(ucache-plugin-fuzz integration/plugin_fuzz.cc)
   target_include_directories(ucache-plugin-fuzz SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
   target_link_libraries(ucache-plugin-fuzz PRIVATE ${XRDCL_LIBRARY})
+  if (TARGET ucache-transpose) # the seed's basket map drives a TTree-shaped fill stream
+    target_link_libraries(ucache-plugin-fuzz PRIVATE ucache-transpose)
+    target_compile_definitions(ucache-plugin-fuzz PRIVATE UCACHE_FUZZ_HAVE_TRANSPOSE=1)
+  endif()
 endif()
 
 # Transposer mutational fuzz: parser/builder fail-open under hostile

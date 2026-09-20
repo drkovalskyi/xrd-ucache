@@ -576,6 +576,21 @@ Every field, and the JSON schema tooling reads, is in [Metrics](STATS.md).
 
 ## How it works (briefly)
 
+**Read-ahead (on by default).** A ROOT reader fetches a batch of baskets, works
+on it, then fetches the next; on a cold pass it waits for the origin every
+time. uCache reads the tree's own metadata — where every basket of every
+branch is and which entry it starts at — identifies the branches your job
+uses from what it asks for, and fetches the next stretch while your code is
+still computing on the current one. The prediction is checked before anything
+is fetched (the first prediction is only compared with the next real request),
+what is fetched is bounded by what your job has been drawing per request, and
+a process that finds a quarter of its read-ahead unused switches it off. A
+page fetched ahead reaches the cache only once your job has actually asked
+for it; anything never asked for is dropped from RAM. Readers that fetch once
+per file open (one task per chunk) are left alone at no cost. `UCACHE_PREFETCH=off`
+turns it off for a job; the `prefetch_*` counters in `ucache stats` show what
+it did.
+
 - **Page cache, not file cache.** uCache stores the 4 KiB pages your analysis
   actually reads (typically a small fraction of each file), each protected by a
   CRC32C. It never stores data it wasn't asked for beyond page rounding.
@@ -619,6 +634,9 @@ overriding your defaults. Common keys:
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
 | `trace_sample = 64` | `UCACHE_TRACE_SAMPLE` | record every Nth read-class trace op (`1` = everything; opens/flushes are always recorded) |
+| `prefetch = on`     | `UCACHE_PREFETCH`       | read ahead for TTree readers: the next batch of baskets is predicted from the file's own metadata and fetched while your code computes (default on; see below). `off` = fetch only what is asked for |
+| `prefetch_window_mb = 32` | `UCACHE_PREFETCH_WINDOW_MB` | how far ahead one file handle may read (one fill's worth per branch, up to this) |
+| `prefetch_ram_mb = 512` | `UCACHE_PREFETCH_RAM_MB` | RAM the whole process may hold in read-ahead pages not yet asked for; the window shrinks when it is reached |
 | `announce = on`     | `UCACHE_ANNOUNCE`       | name uCache as the application in what the client tells servers at login, so a site can see traffic that comes through a cache (default on; see below). `off` = send your program's own name, as without uCache |
 | `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
 

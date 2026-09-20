@@ -316,8 +316,9 @@ bool FileEntry::readVerifyRun(uint64_t firstPage, uint64_t lastPage, const uint3
   return true;
 }
 
-bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
-  noteActivity();
+bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf, bool account) {
+  if (account)
+    noteActivity();
   if (len == 0)
     return true;
   if (off + len < off || off + len > meta_.fileSize) // wrap, then range
@@ -330,6 +331,8 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
   // miss/CRC-demotion still describes real disk activity.
   uint64_t ramB = 0, ftB = 0, dReads = 0, dBytes = 0, dSeq = 0, specServed = 0;
   auto publish = [&] {
+    if (!account) // the speculative-mark bookkeeping above is state, not accounting
+      return;
     if (specServed) {
       g_specTotal_.fetch_sub(specServed, std::memory_order_relaxed);
       g_bufTotal_.fetch_add(specServed, std::memory_order_relaxed);
@@ -389,7 +392,7 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
         ramB += cEnd - cStart;
         // first_touch: page-granular, at the serving read's width. Marked here
         // because these bytes ARE served, now, under this lock.
-        if (!servedOnce_.get(i)) {
+        if (account && !servedOnce_.get(i)) {
           servedOnce_.set(i);
           ftB += cEnd - cStart;
         }
@@ -446,7 +449,7 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
   // first_touch for the disk pages, once every run has verified: a request
   // that failed served nothing, so it must not consume the attribution (the
   // refetch that follows will). One lock take for the whole request.
-  if (!runs.empty()) {
+  if (!runs.empty() && account) {
     std::lock_guard<std::mutex> g(mu_);
     for (const Run& r : runs)
       for (uint64_t i = r.firstPage; i <= r.lastPage; ++i)
@@ -456,7 +459,13 @@ bool FileEntry::readCached(uint64_t off, uint64_t len, void* buf) {
           ftB += std::min(off + len, pStart + meta_.pageBytes(i)) - std::max(off, pStart);
         }
   }
+  if (!account && specServed) { // pool moves are state, they happen regardless
+    g_specTotal_.fetch_sub(specServed, std::memory_order_relaxed);
+    g_bufTotal_.fetch_add(specServed, std::memory_order_relaxed);
+  }
   publish();
+  if (!account)
+    return true;
   touchAtime();
   stats_.hitBytes.fetch_add(len, std::memory_order_relaxed);
   obs_.servedBytes.fetch_add(len, std::memory_order_relaxed);
@@ -565,10 +574,19 @@ uint64_t FileEntry::dropSpeculative(uint64_t off, uint64_t len) {
   const uint64_t end = std::min(off + len, meta_.fileSize);
   if (off >= end)
     return 0;
+  // Only pages wholly inside [off, end): an edge page is shared with the
+  // neighbouring basket, which may be live speculation the reader is about to
+  // demand -- dropping it turned a hit into a miss on every basket boundary.
+  // Shared edge pages go when their other owner passes, or at close.
+  const uint64_t firstPage = (off + P - 1) / P;
+  const uint64_t endPage = end / P; // exclusive; the file's tail page counts as whole
+  const uint64_t stopPage = end == meta_.fileSize ? (end + P - 1) / P : endPage;
+  if (firstPage >= stopPage)
+    return 0;
   uint64_t dropped = 0;
   {
     std::lock_guard<std::mutex> g(mu_);
-    for (auto it = buf_.lower_bound(off / P); it != buf_.end() && it->first * P < end;) {
+    for (auto it = buf_.lower_bound(firstPage); it != buf_.end() && it->first < stopPage;) {
       if (it->second.spec) {
         const uint32_t nbytes = meta_.pageBytes(it->first);
         specBytes_ -= nbytes;

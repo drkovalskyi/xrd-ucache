@@ -138,6 +138,7 @@ void loadCounters(const std::string& path, Run& r) {
   r.originBytes = fieldU64(last, "origin_bytes");
   r.originReads = fieldU64(last, "origin_reads");
   r.originReadvs = fieldU64(last, "origin_readvs");
+  r.prefetchServedBytes = fieldU64(last, "prefetch_served_bytes");
   r.hitDiskReads = fieldU64(last, "hit_disk_reads");
   r.hitDiskBytes = fieldU64(last, "hit_disk_bytes");
   r.replicaReads = fieldU64(last, "replica_reads");

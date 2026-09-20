@@ -1,4 +1,7 @@
 #include "UCacheFile.h"
+#ifdef UCACHE_HAVE_PREFETCH
+#include "Prefetch.h"
+#endif
 
 #include "HelperPath.h"
 #include "Executor.h"
@@ -1183,6 +1186,9 @@ UCacheFile::~UCacheFile() {
     e.swap(st_->entry);
     v.swap(st_->view);
   }
+#ifdef UCACHE_HAVE_PREFETCH
+  Prefetcher::instance().onClose(st_, e); // read-ahead never used is dropped here too
+#endif
   if (e)
     e->flushAll(); // synchronous (covers the no-explicit-Close path)
   emitRelayObs(st_, e);
@@ -1569,6 +1575,9 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
     e.swap(st_->entry);
     v.swap(st_->view); // releases the overlay fd
   }
+#ifdef UCACHE_HAVE_PREFETCH
+  Prefetcher::instance().onClose(st_, e); // drops what was read ahead and never used
+#endif
   if (e)
     e->flushAll(); // synchronous: staged pages + bitmap must hit disk before we may exit
   emitRelayObs(st_, e);
@@ -1940,6 +1949,11 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     if (!entry->hasRange(chunks[i].offset, chunks[i].length))
       missIdx.push_back(i);
   noteVectorRequest(st_, chunks);
+#ifdef UCACHE_HAVE_PREFETCH
+  // Read-ahead learns from every fill and, once confirmed, fetches the next
+  // one while the reader computes; posted to its own thread, never blocking.
+  Prefetcher::instance().onFill(st_, entry, chunks, !missIdx.empty());
+#endif
   if (st_->store && !missIdx.empty() && missIdx.size() != chunks.size())
     st_->store->stats().readvMixed.fetch_add(1,
                                              std::memory_order_relaxed); // serial hit+wire shape

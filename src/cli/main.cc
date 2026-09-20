@@ -357,6 +357,7 @@ void printStats(const StatsTotals& t) {
   row("prefetch_late_bytes", t.prefetchLateBytes);
   row("prefetch_parses", t.prefetchParses);
   row("prefetch_disabled", t.prefetchDisabled);
+  row("prefetch_fetch_errors", t.prefetchFetchErrors);
   row("origin_readvs", t.originReadvs);
   row("page_writes", t.pageWrites);
   row("crc_failures", t.crcFailures);
