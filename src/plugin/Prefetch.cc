@@ -37,6 +37,9 @@ constexpr int kParseTries = 3;             // a reader's metadata reads stage as
 constexpr uint32_t kBarrenFills = 4;       // fills matching no basket before a table is given up on
 constexpr uint64_t kTableCacheBytes = 64ull << 20; // ... and a byte ceiling over all of them
 constexpr size_t kNoTableMemo = 64;        // files remembered as having no basket map for us
+constexpr uint64_t kPrimeCapBytes = 32ull << 20; // most a priming parse may fetch for one file
+constexpr uint64_t kPrimeReadMax = 16ull << 20;  // ... and in one read of it
+constexpr int kMaxShards = 16;             // prediction worker threads, however many are configured
 
 // The basket map of one file, compacted from the parser's FileMeta: per-branch
 // arrays concatenated by branch (branch b owns [boff[b], boff[b] + nb[b])), and
@@ -126,6 +129,69 @@ struct EntrySource : transpose::Source {
   }
 };
 
+// The same source, but able to FETCH what the reader has not read yet: used
+// once per file at open, to read the basket map before the reader's own
+// metadata reads ask for it. Every byte it brings in is staged speculatively,
+// so those reads are then served from RAM, and it is bounded twice -- one read
+// and the whole parse -- because a hostile or unfamiliar layout must not be
+// able to turn a parse into a download.
+struct OriginSource : transpose::Source {
+  FileEntry& e;
+  XrdCl::File* f;
+  Stats* stats;
+  std::vector<std::pair<uint64_t, uint64_t>>& staged;
+  uint64_t fetched = 0;
+  bool failed = false;
+
+  OriginSource(FileEntry& entry, XrdCl::File* file, Stats* st,
+               std::vector<std::pair<uint64_t, uint64_t>>& out)
+      : e(entry), f(file), stats(st), staged(out) {}
+
+  bool has(uint64_t off, uint64_t n) override {
+    return n != 0 && off + n >= off && off + n <= e.fileSize();
+  }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    if (e.readCached(off, n, dst, /*account=*/false))
+      return true;
+    if (failed || !has(off, n))
+      return false;
+    const auto [s, en] = roundSpan(e.pageSize(), e.fileSize(), off, n);
+    if (en <= s || en - s > kPrimeReadMax || fetched + (en - s) > kPrimeCapBytes) {
+      failed = true;
+      return false;
+    }
+    std::vector<char> buf(en - s);
+    uint32_t got = 0;
+    if (!f->Read(s, static_cast<uint32_t>(en - s), buf.data(), got).IsOK() || got == 0) {
+      failed = true;
+      return false;
+    }
+    fetched += got;
+    if (stats) {
+      stats->originBytes.fetch_add(got, std::memory_order_relaxed);
+      stats->originReads.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (e.stageSpeculative(s, got, buf.data()))
+      staged.emplace_back(s, got);
+    return e.readCached(off, n, dst, /*account=*/false);
+  }
+};
+
+// The tree a reader of this file would be reading: NanoAOD's by name, else
+// the first TTree the keys list names.
+transpose::FileMeta parseTree(transpose::Source& src, int64_t size) {
+  transpose::FileMeta fm = transpose::parseFile(src, size, "Events");
+  if (!fm.error.empty() && fm.error.find("not found") != std::string::npos) {
+    transpose::ContainerMeta cm = transpose::parseContainer(src, size);
+    for (const auto& k : cm.keys)
+      if (k.cls == "TTree") {
+        fm = transpose::parseFile(src, size, k.name);
+        break;
+      }
+  }
+  return fm;
+}
+
 } // namespace
 
 struct PrefetchHandle {
@@ -144,10 +210,101 @@ struct PrefetchHandle {
     uint64_t off, len; // the basket's byte range (page rounding is FileEntry's)
   };
   std::vector<Issued> issued;    // speculative baskets not yet judged served or passed over
+  // Metadata pages a priming parse staged for this file. The reader demands
+  // almost all of them (they are what it reads before its first event), and
+  // whatever it does not is dropped and counted at close like any other
+  // speculative page.
+  std::vector<std::pair<uint64_t, uint64_t>> primed;
   std::atomic<bool> closed{false};
 };
 
-struct Prefetcher::Impl {
+namespace {
+
+// Everything one process shares across its prediction threads: the switches,
+// the byte counters the breaker weighs, and the three tables that are worth
+// having once rather than per thread (a file opened twice must not be parsed
+// twice, and what a branch draws per fill is learned from whichever file saw
+// it first).
+struct Shared {
+  std::atomic<bool> confirmed{false};
+  std::atomic<bool> disabled{false};
+  std::atomic<bool> mapsWork{false}; // one basket map has parsed: priming may start
+  std::atomic<uint64_t> issued{0};   // speculative bytes the client accepted
+  std::atomic<uint64_t> inflight{0}; // bytes on the wire, not yet staged: RAM the cap must see
+
+  std::mutex mu; // guards the three below
+  std::unordered_map<std::string, uint64_t> shareByName;
+  std::list<std::pair<std::string, std::shared_ptr<BasketTable>>> tables; // LRU, front = newest
+  std::list<std::string> noTables; // files with no basket map for us, LRU, front = newest
+
+  std::shared_ptr<BasketTable> lookupTable(const std::string& key) {
+    std::lock_guard<std::mutex> g(mu);
+    for (auto it = tables.begin(); it != tables.end(); ++it)
+      if (it->first == key) {
+        auto t = it->second;
+        tables.splice(tables.begin(), tables, it);
+        return t;
+      }
+    return nullptr;
+  }
+  void insertTable(const std::string& key, std::shared_ptr<BasketTable> t) {
+    std::lock_guard<std::mutex> g(mu);
+    for (const auto& kv : tables)
+      if (kv.first == key)
+        return; // two threads parsed the same file; keep the one already here
+    tables.emplace_front(key, std::move(t));
+    mapsWork.store(true, std::memory_order_relaxed);
+    // Trimmed by BYTES as well as by count: one 1500-branch file's map is
+    // about 21 MB, so eight of them is 170 MB held for the life of the
+    // process, outside every configured cap and reported nowhere.
+    uint64_t held = 0;
+    for (auto it = tables.begin(); it != tables.end();) {
+      held += it->second->bytes();
+      if (it != tables.begin() && (tables.size() > kTableCache || held > kTableCacheBytes)) {
+        held -= it->second->bytes();
+        it = tables.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  bool isNoTable(const std::string& key) {
+    std::lock_guard<std::mutex> g(mu);
+    for (const auto& k : noTables)
+      if (k == key)
+        return true;
+    return false;
+  }
+  void rememberNoTable(const std::string& key) {
+    std::lock_guard<std::mutex> g(mu);
+    noTables.push_front(key);
+    while (noTables.size() > kNoTableMemo)
+      noTables.pop_back();
+  }
+  uint64_t shareOf(const std::string& name) {
+    std::lock_guard<std::mutex> g(mu);
+    auto it = shareByName.find(name);
+    return it == shareByName.end() ? 0 : it->second;
+  }
+  void noteShare(const std::string& name, uint64_t bytes) {
+    std::lock_guard<std::mutex> g(mu);
+    uint64_t& m = shareByName[name];
+    m = std::max(m, bytes);
+  }
+  bool anyShare() {
+    std::lock_guard<std::mutex> g(mu);
+    return !shareByName.empty();
+  }
+};
+
+// One prediction thread and the handles it owns. A handle belongs to exactly
+// one shard for its lifetime, so per-handle state needs no lock; the shard
+// count exists because a single thread cannot both parse a new file's basket
+// map -- a quarter of a second on a 1500-branch file -- and keep up with the
+// fills of thirty-two readers, and a fill predicted after the reader has
+// already asked for it is a fetch thrown away.
+struct Shard {
+  Shared* sh_ = nullptr;
   // ---- the worker and its queue: one pending job per handle, oldest first --
   // The closing thread waits on this until the worker has processed the close
   // AND destroyed the job, so no reference to the handle outlives the plugin
@@ -163,6 +320,10 @@ struct Prefetcher::Impl {
     std::shared_ptr<FileEntry> entry;
     std::vector<std::pair<uint64_t, uint32_t>> chunks;
     bool close = false;
+    bool primed = false; // the map has been read at open: set the state up and predict
+    // Metadata pages a priming parse staged, handed over so that whatever the
+    // reader does not demand is dropped and counted like any other.
+    std::vector<std::pair<uint64_t, uint64_t>> staged;
     Sync* sync = nullptr;
   };
   std::mutex qmu_;
@@ -171,22 +332,17 @@ struct Prefetcher::Impl {
   std::unordered_map<HandleState*, Job> pending_;
   std::thread worker_;
 
-  // ---- process state, owned by the worker thread ---------------------------
-  std::atomic<bool> confirmed_{false};
-  std::atomic<bool> disabled_{false};
-  std::unordered_map<std::string, uint64_t> shareByName_; // the memo across files
-  uint64_t issued_ = 0;
-  std::atomic<uint64_t> inflight_{0}; // bytes on the wire, not yet staged: RAM the cap must see
-  std::list<std::pair<std::string, std::shared_ptr<BasketTable>>> tables_; // LRU, front = newest
-  std::list<std::string> noTables_; // files with no basket map for us, LRU, front = newest
-  // Per-handle state, owned HERE and touched only by the worker thread. Keyed
+  // Per-handle state, owned HERE and touched only by this shard's thread. Keyed
   // by the handle's address and validated through the weak owner, so a handle
   // that went away without a close (or an address reused by a new handle)
   // never inherits another handle's frontier.
   std::unordered_map<HandleState*, std::shared_ptr<PrefetchHandle>> handles_;
   uint64_t jobs_ = 0;
 
-  Impl() { worker_ = std::thread([this] { loop(); }); worker_.detach(); }
+  explicit Shard(Shared* sh) : sh_(sh) {
+    worker_ = std::thread([this] { loop(); });
+    worker_.detach();
+  }
 
   void post(Job j) {
     Job superseded; // destroyed outside the lock, on the caller's thread
@@ -201,8 +357,17 @@ struct Prefetcher::Impl {
         else
           order_.push_back(k);
         pending_.emplace(k, std::move(j));
+      } else if (j.primed) {
+        // Something newer is already queued for this handle -- a fill, or its
+        // close. Either knows more than the prime does, so the prime is
+        // dropped; its staged ranges are not, or nothing would ever drop the
+        // metadata pages it left behind.
+        for (auto& r : j.staged)
+          it->second.staged.push_back(r);
       } else if (j.close) {
         superseded = std::move(it->second); // a close supersedes any fill still queued
+        for (auto& r : superseded.staged)
+          j.staged.push_back(r);
         // ... but if what it supersedes is ANOTHER close, that close has a
         // thread waiting on it. Dropping the job would leave it waiting for a
         // completion that can never come: a permanent hang of an application
@@ -213,6 +378,8 @@ struct Prefetcher::Impl {
         order_.push_front(k);
       } else if (!it->second.close) {
         superseded = std::move(it->second); // a newer fill supersedes an older one
+        for (auto& r : superseded.staged)
+          j.staged.push_back(r);
         it->second = std::move(j);
       }
     }
@@ -223,6 +390,17 @@ struct Prefetcher::Impl {
       orphaned->cv.notify_all();
     }
     qcv_.notify_one();
+  }
+
+  void postPrimed(const std::shared_ptr<HandleState>& st,
+                  const std::shared_ptr<FileEntry>& entry,
+                  std::vector<std::pair<uint64_t, uint64_t>> staged) {
+    Job j;
+    j.st = st;
+    j.entry = entry;
+    j.primed = true;
+    j.staged = std::move(staged);
+    post(std::move(j));
   }
 
   void loop() {
@@ -243,6 +421,8 @@ struct Prefetcher::Impl {
         try {
           if (job.close)
             handleClose(job);
+          else if (job.primed)
+            handlePrimed(job);
           else
             handleFill(job);
         } catch (const std::exception& e) {
@@ -265,7 +445,7 @@ struct Prefetcher::Impl {
   Stats* stats(const Job& j) { return j.st && j.st->store ? &j.st->store->stats() : nullptr; }
 
   void switchOff(Stats* s) {
-    disabled_.store(true);
+    sh_->disabled.store(true);
     if (s)
       s->prefetchDisabled.store(1, std::memory_order_relaxed);
   }
@@ -291,9 +471,12 @@ struct Prefetcher::Impl {
         continue;
       }
       PrefetchHandle& h = *it->second;
-      if (auto e = h.entry.lock())
+      if (auto e = h.entry.lock()) {
         for (const auto& i : h.issued)
           e->dropSpeculative(i.off, i.len);
+        for (const auto& r : h.primed)
+          e->dropSpeculative(r.first, r.second);
+      }
       it = handles_.erase(it);
     }
   }
@@ -317,36 +500,24 @@ struct Prefetcher::Impl {
     return it->second;
   }
 
-  // The file's basket table: from the cache of recently parsed files, else
-  // parsed now from the bytes the reader already fetched into this entry.
+  // The file's basket table: from the process's cache of recently parsed
+  // files, else parsed now from the bytes the reader already fetched into
+  // this entry. (Priming parses the same map earlier, from the origin, on its
+  // own threads; both put the result in the same place.)
   std::shared_ptr<BasketTable> tableFor(const Job& j) {
     const std::string& key = j.entry->key().key;
-    for (auto it = tables_.begin(); it != tables_.end(); ++it)
-      if (it->first == key) {
-        auto t = it->second;
-        tables_.splice(tables_.begin(), tables_, it);
-        return t;
-      }
+    if (auto t = sh_->lookupTable(key))
+      return t;
     // A file with no basket map for us -- an RNTuple container, a nested tree
     // -- is remembered as such. `noTable` lives on the handle, so every new
     // handle on the same file used to pay the full three attempts again: a
     // 1453-file RNTuple dataset opened twice per file spent thousands of
     // futile parses on the one thread every Close waits behind.
-    for (const auto& k : noTables_)
-      if (k == key)
-        return nullptr;
+    if (sh_->isNoTable(key))
+      return nullptr;
     EntrySource src(*j.entry);
     const int64_t size = static_cast<int64_t>(j.entry->fileSize());
-    transpose::FileMeta fm = transpose::parseFile(src, size, "Events");
-    if (!fm.error.empty() && fm.error.find("not found") != std::string::npos) {
-      // Not NanoAOD's tree name: take the first TTree the keys list names.
-      transpose::ContainerMeta cm = transpose::parseContainer(src, size);
-      for (const auto& k : cm.keys)
-        if (k.cls == "TTree") {
-          fm = transpose::parseFile(src, size, k.name);
-          break;
-        }
-    }
+    transpose::FileMeta fm = parseTree(src, size);
     if (!fm.error.empty() || fm.branches.empty()) {
       UCACHE_INFO("prefetch: no basket map for %s yet (%s)", j.st->url.c_str(),
                   fm.error.empty() ? "no branches" : fm.error.c_str());
@@ -358,41 +529,35 @@ struct Prefetcher::Impl {
     if (Stats* s = stats(j))
       s->prefetchParses.fetch_add(1, std::memory_order_relaxed);
     auto t = BasketTable::build(fm, size);
-    tables_.emplace_front(key, t);
-    // Trimmed by BYTES as well as by count: one 1500-branch file's map is
-    // about 21 MB, so eight of them is 170 MB held for the life of the
-    // process, outside every configured cap and reported nowhere.
-    uint64_t held = 0;
-    for (auto it = tables_.begin(); it != tables_.end();) {
-      held += it->second->bytes();
-      if (it != tables_.begin() &&
-          (tables_.size() > kTableCache || held > kTableCacheBytes)) {
-        held -= it->second->bytes();
-        it = tables_.erase(it);
-      } else {
-        ++it;
-      }
-    }
+    sh_->insertTable(key, t);
     return t;
-  }
-
-  void rememberNoTable(const std::string& key) {
-    noTables_.push_front(key);
-    while (noTables_.size() > kNoTableMemo)
-      noTables_.pop_back();
   }
 
   void handleClose(const Job& j) {
     auto hp = existing(j);
-    if (!hp)
+    if (!hp) {
+      // No state, but a prime may still have handed its pages to this job.
+      if (j.entry)
+        for (const auto& r : j.staged)
+          j.entry->dropSpeculative(r.first, r.second);
       return;
+    }
     PrefetchHandle& h = *hp;
     h.closed.store(true, std::memory_order_release);
-    if (j.entry)
+    if (j.entry) {
       for (const auto& i : h.issued)
         j.entry->dropSpeculative(i.off, i.len);
+      // The metadata a priming parse staged: what the reader demanded is
+      // already unmarked, so this drops only what it never looked at.
+      for (const auto& r : h.primed)
+        j.entry->dropSpeculative(r.first, r.second);
+      for (const auto& r : j.staged)
+        j.entry->dropSpeculative(r.first, r.second);
+    }
     h.issued.clear();
     h.issued.shrink_to_fit();
+    h.primed.clear();
+    h.primed.shrink_to_fit();
     h.shadow.clear();
     h.shadow.shrink_to_fit();
     h.frontier.clear();
@@ -405,9 +570,37 @@ struct Prefetcher::Impl {
     // fire. Completions still in flight hold their own reference to it.
   }
 
+  // A priming thread has read this file's basket map (or found there is
+  // none) and staged the metadata it touched. Set the handle up from it and
+  // predict the FIRST fill, which is the one no previous fill could.
+  void handlePrimed(const Job& j) {
+    const Config& cfg = globalConfig();
+    auto hp = handle(j);
+    PrefetchHandle& h = *hp;
+    if (h.closed.load()) {
+      for (const auto& r : j.staged)
+        j.entry->dropSpeculative(r.first, r.second);
+      return;
+    }
+    h.entry = j.entry;
+    for (const auto& r : j.staged)
+      h.primed.push_back(r);
+    if (!cfg.prefetch || sh_->disabled.load() || cfg.fillBufferMb <= 0)
+      return;
+    if (h.table || h.noTable)
+      return; // a fill of this handle got there first and owns the state
+    auto t = sh_->lookupTable(j.entry->key().key);
+    if (!t)
+      return; // no map for this file; the fill path will not retry it either
+    h.table = t;
+    h.frontier.assign(t->nb.size(), -1);
+    h.share.assign(t->nb.size(), 0);
+    predictAndIssue(j, hp);
+  }
+
   void handleFill(const Job& j) {
     const Config& cfg = globalConfig();
-    if (!cfg.prefetch || disabled_.load())
+    if (!cfg.prefetch || sh_->disabled.load())
       return;
     // No fill stage, no read-ahead. With fill_buffer_mb = 0 (the legacy
     // direct-write mode) stageSpeculative can hold nothing, so every predicted
@@ -425,7 +618,7 @@ struct Prefetcher::Impl {
     if (!h.table && !h.noTable) {
       // The parse waits for a handle's second fill while nothing in the
       // process has confirmed: a one-fill-per-open reader never pays for it.
-      if (!confirmed_.load() && h.fills < 2)
+      if (!sh_->confirmed.load() && h.fills < 2)
         return;
       // Nothing to parse from until the reader has fetched the file header;
       // a vector read that arrives before it (another thread's, on a shared
@@ -439,7 +632,7 @@ struct Prefetcher::Impl {
         // resident. A failed parse is cheap, so it is retried on later fills.
         if (++h.parseTries >= kParseTries) {
           h.noTable = true;
-          rememberNoTable(j.entry->key().key); // every later handle on this file skips it
+          sh_->rememberNoTable(j.entry->key().key); // every later handle on this file skips it
         }
         return;
       }
@@ -491,8 +684,7 @@ struct Prefetcher::Impl {
     for (uint32_t b = 0; b < perBranch.size(); ++b)
       if (perBranch[b]) {
         h.share[b] = std::max(h.share[b], perBranch[b]);
-        uint64_t& m = shareByName_[t.names[b]];
-        m = std::max(m, perBranch[b]);
+        sh_->noteShare(t.names[b], perBranch[b]);
       }
 
     // Shadow: did the previous prediction cover this fill?
@@ -503,8 +695,8 @@ struct Prefetcher::Impl {
                             std::back_inserter(both));
       for (uint32_t g : both)
         hit += static_cast<uint64_t>(t.size[g]);
-      if (!confirmed_.load() && static_cast<double>(hit) >= kConfirmCoverage * fillBytes) {
-        confirmed_.store(true);
+      if (!sh_->confirmed.load() && static_cast<double>(hit) >= kConfirmCoverage * fillBytes) {
+        sh_->confirmed.store(true);
         UCACHE_INFO("prefetch: prediction confirmed on %s (%.0f%% of a %.1f MB fill); "
                     "reading ahead from here on", j.st->url.c_str(),
                     100.0 * hit / fillBytes, fillBytes / 1e6);
@@ -526,20 +718,40 @@ struct Prefetcher::Impl {
       h.issued.swap(keep);
     }
     const uint64_t never = neverUsed();
-    if (issued_ >= kGateMinIssued && static_cast<double>(never) > kGateNeverUsed * issued_) {
+    const uint64_t issued = sh_->issued.load(std::memory_order_relaxed);
+    if (issued >= kGateMinIssued && static_cast<double>(never) > kGateNeverUsed * issued) {
       switchOff(stats(j));
       UCACHE_WARN("prefetch: %.0f MB of %.0f MB read ahead were never used; switching off "
-                  "for this process", never / 1e6, issued_ / 1e6);
+                  "for this process", never / 1e6, issued / 1e6);
       for (const auto& i : h.issued)
         j.entry->dropSpeculative(i.off, i.len);
       h.issued.clear();
       return;
     }
 
-    // Predict the next fill: per identified branch, the next baskets until
-    // the largest share that branch has drawn in one fill (by name, so a new
-    // file starts with what the previous file taught), in entry order, inside
-    // the window and the RAM cap.
+    predictAndIssue(j, hp);
+  }
+
+  // Predict the fills the reader has not asked for yet and fetch them.
+  //
+  // DEPTH is why this is not simply "the next fill". A fill-sized origin
+  // request and the decompression it is meant to hide take about the same
+  // time, and requests on one open file are answered one after another, so at
+  // one fill ahead the pipeline is critically loaded: the reader waits for
+  // every read that runs long. Predicting `prefetch_depth` fills gives a slow
+  // read the next fill's compute to finish in, at the price of one more
+  // window of RAM per handle. Nothing else changes -- the frontier, the
+  // passed-over judgement and the breaker all work the same on a deeper
+  // window, and what is already on the wire is not asked for twice.
+  void predictAndIssue(const Job& j, const std::shared_ptr<PrefetchHandle>& hp) {
+    const Config& cfg = globalConfig();
+    PrefetchHandle& h = *hp;
+    const BasketTable& t = *h.table;
+    const uint64_t depth = static_cast<uint64_t>(std::max(1, cfg.prefetchDepth));
+    // Per identified branch, the next baskets until `depth` times the largest
+    // share that branch has drawn in one fill (by name, so a new file starts
+    // with what the previous file taught), in entry order, inside the window
+    // and the RAM cap.
     struct Cand {
       uint32_t g;
       int64_t es, seek, size;
@@ -547,10 +759,10 @@ struct Prefetcher::Impl {
     std::vector<Cand> cand;
     for (uint32_t b = 0; b < t.nb.size(); ++b) {
       uint64_t budget = h.share[b];
-      if (auto it = shareByName_.find(t.names[b]); it != shareByName_.end())
-        budget = std::max(budget, it->second);
+      budget = std::max(budget, sh_->shareOf(t.names[b]));
       if (budget == 0)
         continue;
+      budget *= depth;
       uint64_t cum = 0;
       for (int64_t i = h.frontier[b] + 1; i < static_cast<int64_t>(t.nb[b]) && cum < budget; ++i) {
         const uint32_t g = t.boff[b] + static_cast<uint32_t>(i);
@@ -561,14 +773,15 @@ struct Prefetcher::Impl {
     std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) {
       return a.es != b.es ? a.es < b.es : a.seek < b.seek;
     });
-    uint64_t window = static_cast<uint64_t>(std::max(1, cfg.prefetchWindowMb)) << 20;
+    uint64_t window = (static_cast<uint64_t>(std::max(1, cfg.prefetchWindowMb)) << 20) * depth;
     const uint64_t ramCap = static_cast<uint64_t>(std::max(1, cfg.prefetchRamMb)) << 20;
     // Bytes ON THE WIRE count against the cap as well as bytes already staged.
     // The cap used to see only what had landed, so on a slow origin -- where
     // nothing lands before the next handle is served -- it read near zero for
     // every handle in turn, and 32 readers each took a full window: about a
     // gigabyte of buffers against a stated ceiling of half that.
-    const uint64_t held = FileEntry::speculativeTotal() + inflight_.load(std::memory_order_relaxed);
+    const uint64_t held =
+        FileEntry::speculativeTotal() + sh_->inflight.load(std::memory_order_relaxed);
     window = std::min(window, ramCap > held ? ramCap - held : 0);
     uint64_t cum = 0;
     size_t take = 0;
@@ -581,14 +794,27 @@ struct Prefetcher::Impl {
     for (const auto& c : cand)
       h.shadow.push_back(c.g);
     std::sort(h.shadow.begin(), h.shadow.end());
-    if (cand.empty() || !confirmed_.load())
+    if (cand.empty() || !sh_->confirmed.load())
       return; // shadow only: the prediction is judged when the next fill arrives
     issue(j, hp, cand);
   }
 
+  // One element of a wire request. `off, len` is what crosses the network;
+  // `stage` is the part of it the cache keeps. They differ only when ranges
+  // have been bridged (prefetch_bridge_kb): the padding between two predicted
+  // ranges is paid for in bandwidth to save an element, and then discarded --
+  // it is not a prediction, so it is never staged, never counted never-used,
+  // and can never reach the cache.
   struct Elem {
     uint64_t off, len;
     std::shared_ptr<std::vector<char>> buf;
+    std::vector<std::pair<uint64_t, uint64_t>> stage;
+    uint64_t stageBytes() const {
+      uint64_t n = 0;
+      for (const auto& r : stage)
+        n += r.second;
+      return n;
+    }
   };
 
   // One wire vector read of speculative pages. Completion stages what
@@ -597,7 +823,7 @@ struct Prefetcher::Impl {
   class WireHandler : public XrdCl::ResponseHandler {
    public:
     WireHandler(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
-                std::shared_ptr<PrefetchHandle> h, std::vector<Elem> elems, Impl* owner,
+                std::shared_ptr<PrefetchHandle> h, std::vector<Elem> elems, Shard* owner,
                 uint64_t wireBytes)
         : st_(std::move(st)), entry_(std::move(entry)), h_(std::move(h)),
           elems_(std::move(elems)), stats_(st_->store ? &st_->store->stats() : nullptr),
@@ -612,11 +838,12 @@ struct Prefetcher::Impl {
     // refused. The registry must never keep a range no one is fetching, or a
     // demand read parked behind it waits for a landing that cannot come.
     ~WireHandler() override {
-      owner_->inflight_.fetch_sub(wireBytes_, std::memory_order_relaxed);
+      owner_->sh_->inflight.fetch_sub(wireBytes_, std::memory_order_relaxed);
       std::vector<std::pair<uint64_t, uint64_t>> rs;
       rs.reserve(elems_.size());
       for (const auto& e : elems_)
-        rs.emplace_back(e.off, e.len);
+        for (const auto& r : e.stage)
+          rs.push_back(r);
       entry_->clearFetchInFlight(rs); // one withdrawal, one wake
     }
     void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
@@ -642,12 +869,18 @@ struct Prefetcher::Impl {
       }
       uint64_t late = 0, dropped = 0;
       for (auto& e : elems_) {
-        if (h_->closed.load(std::memory_order_acquire)) {
-          dropped += e.len; // the reader is gone: never used
-          continue;
+        for (const auto& r : e.stage) {
+          if (h_->closed.load(std::memory_order_acquire)) {
+            dropped += r.second; // the reader is gone: never used
+            continue;
+          }
+          // Bridge padding is skipped here and nowhere else: only the kept
+          // sub-ranges are copied out of the element's buffer, so the rest
+          // is freed with the buffer and never touches the entry.
+          const char* at = e.buf->data() + (r.first - e.off);
+          const uint64_t got = entry_->stageSpeculative(r.first, r.second, at);
+          late += r.second - got; // pages a demand read had already brought in
         }
-        const uint64_t got = entry_->stageSpeculative(e.off, e.len, e.buf->data());
-        late += e.len - got; // pages a demand read had already brought in
       }
       if (stats) {
         stats->originBytes.fetch_add(wire, std::memory_order_relaxed);
@@ -681,13 +914,14 @@ struct Prefetcher::Impl {
     std::vector<Elem> elems_;
     Stats* stats_;
     OriginInFlight inflight_;
-    Impl* owner_;
+    Shard* owner_;
     uint64_t wireBytes_;
     uint64_t issuedUs_;
   };
 
   template <typename Cand>
   void issue(const Job& j, const std::shared_ptr<PrefetchHandle>& hp, const std::vector<Cand>& cand) {
+    const Config& cfg = globalConfig();
     PrefetchHandle& h = *hp;
     FileEntry& e = *j.entry;
     // Page-round every predicted basket, merge, keep only what is absent.
@@ -704,47 +938,79 @@ struct Prefetcher::Impl {
       else
         runs.emplace_back(s, en);
     }
-    std::vector<std::pair<uint64_t, uint64_t>> absent; // (off, len)
+    // skipInFlight: at depth > 1 the window issued a moment ago is still on
+    // the wire and is not absent in any useful sense -- asking again would
+    // fetch the same bytes twice, which is the defect the in-flight registry
+    // exists to prevent on the demand side.
+    std::vector<std::pair<uint64_t, uint64_t>> absent; // (off, len), what we keep
     for (auto [s, en] : runs)
-      for (const auto& r : e.absentRuns(s, en - s))
+      for (const auto& r : e.absentRuns(s, en - s, /*skipInFlight=*/true))
         absent.push_back(r);
     if (absent.empty())
       return;
-    // Cut into protocol-legal elements and into requests of at most the
-    // element cap; every request gets its own handler and inner acquire.
+    // What crosses the network: the same ranges, optionally joined across
+    // gaps below the bridge threshold. A request costs far more for its
+    // element count than for its bytes -- this origin answers 16 MB in 630
+    // scattered pieces in 1.1 s and the same bytes in 4 pieces in 0.06 s --
+    // so a gap can be cheaper to read than to skip.
+    const uint64_t bridge = static_cast<uint64_t>(std::max(0, cfg.prefetchBridgeKb)) << 10;
     std::vector<Elem> elems;
-    for (auto [s, len] : absent)
-      for (uint64_t at = s, en = s + len; at < en;) {
-        const uint64_t cut = readvElemEnd(at, en, e.pageSize());
-        elems.push_back({at, cut - at, nullptr});
+    for (size_t i = 0; i < absent.size();) {
+      uint64_t start = absent[i].first, end = absent[i].first + absent[i].second;
+      std::vector<std::pair<uint64_t, uint64_t>> keep{absent[i]};
+      size_t k = i + 1;
+      for (; k < absent.size() && absent[k].first >= end && absent[k].first - end <= bridge &&
+             absent[k].first + absent[k].second - start <= kMaxReadvElem;
+           ++k) {
+        end = absent[k].first + absent[k].second;
+        keep.push_back(absent[k]);
+      }
+      i = k;
+      // Still cut at the protocol ceiling, on page boundaries: a bridged span
+      // can exceed it, and an oversized element fails the whole request.
+      for (uint64_t at = start; at < end;) {
+        const uint64_t cut = readvElemEnd(at, end, e.pageSize());
+        Elem el{at, cut - at, nullptr, {}};
+        for (const auto& r : keep) {
+          const uint64_t s0 = std::max(r.first, at), e0 = std::min(r.first + r.second, cut);
+          if (s0 < e0)
+            el.stage.emplace_back(s0, e0 - s0);
+        }
+        if (!el.stage.empty())
+          elems.push_back(std::move(el));
         at = cut;
       }
+    }
     // Counted per request that the client ACCEPTED, never up front. Counting
     // the whole prediction and then returning on a failed issue put bytes in
     // the breaker's denominator that no page was ever staged for, so they
     // could never come back as never-used: a failing origin made the breaker
     // harder to trip, which is backwards.
-    uint64_t sent = 0;
+    uint64_t sent = 0, wireSent = 0;
     for (size_t at = 0; at < elems.size(); at += kMaxReadvElems) {
       std::vector<Elem> part(elems.begin() + static_cast<long>(at),
                              elems.begin() + static_cast<long>(std::min(elems.size(), at + kMaxReadvElems)));
-      uint64_t partBytes = 0;
+      uint64_t partBytes = 0, partStage = 0;
       XrdCl::ChunkList wire;
       wire.reserve(part.size());
       for (auto& el : part) {
         el.buf = std::make_shared<std::vector<char>>(el.len);
         wire.emplace_back(el.off, static_cast<uint32_t>(el.len), el.buf->data());
         partBytes += el.len;
+        partStage += el.stageBytes();
       }
       XrdCl::File* f = j.st->acquireInnerIfOpen();
       if (!f)
         break; // no origin open to read ahead from: the reader's own miss opens it
-      inflight_.fetch_add(partBytes, std::memory_order_relaxed);
+      sh_->inflight.fetch_add(partBytes, std::memory_order_relaxed);
       // Announce the ranges BEFORE the request goes out, so a demand read that
       // arrives while it is in flight waits for this copy instead of sending
-      // its own. The handler's destructor withdraws them on every path.
+      // its own. The handler's destructor withdraws them on every path. Only
+      // the ranges that will be STAGED are announced: a reader parked on
+      // bridge padding would wait for bytes nobody intends to keep.
       for (const auto& el : part)
-        j.entry->noteFetchInFlight(el.off, el.len);
+        for (const auto& r : el.stage)
+          j.entry->noteFetchInFlight(r.first, r.second);
       auto* wh = new WireHandler(j.st, j.entry, hp, std::move(part), this, partBytes);
       XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, wh, 0);
       if (!s.IsOK()) {
@@ -754,16 +1020,183 @@ struct Prefetcher::Impl {
           st->prefetchFetchErrors.fetch_add(1, std::memory_order_relaxed);
         break;
       }
-      sent += partBytes;
+      sent += partStage;
+      wireSent += partBytes;
     }
     if (!sent)
       return;
     for (const auto& c : cand)
       h.issued.push_back({c.g, static_cast<uint64_t>(c.seek), static_cast<uint64_t>(c.size)});
-    issued_ += sent;
-    if (Stats* s = stats(j))
+    // At depth > 1 each fill re-predicts a window that overlaps the last one,
+    // so the same basket would be recorded once per fill it stays outstanding
+    // and dropped as many times. Harmless but unbounded; one entry per basket.
+    std::sort(h.issued.begin(), h.issued.end(),
+              [](const PrefetchHandle::Issued& a, const PrefetchHandle::Issued& b) {
+                return a.g < b.g;
+              });
+    h.issued.erase(std::unique(h.issued.begin(), h.issued.end(),
+                               [](const PrefetchHandle::Issued& a,
+                                  const PrefetchHandle::Issued& b) { return a.g == b.g; }),
+                   h.issued.end());
+    // The breaker weighs never-used against ISSUED, and only staged bytes can
+    // ever come back as never-used, so bridge padding must not be in the
+    // denominator -- it would make a process harder to switch off the more
+    // padding it read. It is reported on its own line instead.
+    sh_->issued.fetch_add(sent, std::memory_order_relaxed);
+    if (Stats* s = stats(j)) {
       s->prefetchIssuedBytes.fetch_add(sent, std::memory_order_relaxed);
+      if (wireSent > sent)
+        s->prefetchBridgeBytes.fetch_add(wireSent - sent, std::memory_order_relaxed);
+    }
     e.obs().prefetchIssued.fetch_add(sent, std::memory_order_relaxed);
+  }
+};
+
+} // namespace
+
+// The prediction threads and the priming threads, plus the state they share.
+//
+// PRIMING is the answer to the one fill per file that no prediction can
+// cover: the first. The map that says where the next baskets are lives in the
+// file, and read-ahead used to wait for the reader to fetch it, which is the
+// same round trip the reader is about to wait for. Here a priming thread
+// reads the map from the origin as soon as the file is open, stages every
+// byte it touches (so the reader's own metadata reads are then served from
+// RAM), and hands the parsed map to the handle's shard, which predicts fill
+// one from the branch set an earlier file taught. It does nothing until
+// read-ahead has confirmed on some file and parsed some map, so a process
+// that reads no TTree, or reads each file once, never primes anything.
+struct Prefetcher::Impl {
+  Shared shared;
+  std::vector<Shard*> shards; // leaked with their threads, like the executor's
+  struct PrimeJob {
+    std::shared_ptr<HandleState> st;
+    std::shared_ptr<FileEntry> entry;
+    std::string key;
+  };
+  std::mutex pmu;
+  std::condition_variable pcv;
+  std::deque<PrimeJob> pq;
+  std::vector<std::string> busy; // keys a priming thread holds, so two handles on
+                                 // the same file do not both parse it
+
+  Impl() {
+    const int n = std::max(1, std::min(kMaxShards, globalConfig().prefetchThreads));
+    for (int i = 0; i < n; ++i)
+      shards.push_back(new Shard(&shared));
+    for (int i = 0, m = std::max(1, n / 2); i < m; ++i)
+      std::thread([this] { primeLoop(); }).detach();
+  }
+
+  Shard* shardFor(HandleState* st) const {
+    return shards[std::hash<const void*>{}(st) % shards.size()];
+  }
+
+  void postPrime(const std::shared_ptr<HandleState>& st,
+                 const std::shared_ptr<FileEntry>& entry) {
+    const std::string key = entry->key().key;
+    {
+      std::lock_guard<std::mutex> g(pmu);
+      // A queue that outruns the threads draining it would keep handles alive
+      // long after their reader let go; past this depth the file simply is
+      // not primed, which costs one uncovered fill and nothing else.
+      if (pq.size() >= 64)
+        return;
+      for (const auto& b : busy)
+        if (b == key)
+          return;
+      for (const auto& q : pq)
+        if (q.key == key)
+          return;
+      busy.push_back(key);
+      pq.push_back({st, entry, key});
+    }
+    pcv.notify_one();
+  }
+
+  void primeLoop() {
+    for (;;) {
+      PrimeJob j;
+      {
+        std::unique_lock<std::mutex> lk(pmu);
+        pcv.wait(lk, [&] { return !pq.empty(); });
+        j = std::move(pq.front());
+        pq.pop_front();
+      }
+      try {
+        prime(j);
+      } catch (const std::exception& e) {
+        UCACHE_WARN("prefetch: reading a basket map at open failed (%s)", e.what());
+      } catch (...) {
+        UCACHE_WARN("prefetch: reading a basket map at open failed");
+      }
+      {
+        std::lock_guard<std::mutex> g(pmu);
+        auto it = std::find(busy.begin(), busy.end(), j.key);
+        if (it != busy.end())
+          busy.erase(it);
+      }
+    }
+  }
+
+  void prime(PrimeJob& j) {
+    if (shared.disabled.load() || !shared.confirmed.load() || !shared.mapsWork.load())
+      return;
+    Shard* shard = shardFor(j.st.get());
+    if (shared.isNoTable(j.key))
+      return;
+    if (shared.lookupTable(j.key)) {
+      // Parsed for an earlier handle on this file: nothing to read, the
+      // handle just needs the map so its first fill is predicted like the
+      // rest. Counted the same, because that is what the counter is for.
+      if (Stats* s = j.st->store ? &j.st->store->stats() : nullptr)
+        s->prefetchPrimedFiles.fetch_add(1, std::memory_order_relaxed);
+      shard->postPrimed(j.st, j.entry, {});
+      return;
+    }
+    FileEntry& e = *j.entry;
+    // Nothing to read ahead of: a fully cached file needs no origin and the
+    // parse would cost a quarter second for a prediction with no absent
+    // bytes in it. This is what makes a warm pass free.
+    if (e.fileSize() == 0 || e.hasRange(0, e.fileSize()))
+      return;
+    XrdCl::File* f = j.st->acquireInnerIfOpen();
+    if (!f)
+      return; // a trusted warm handle: its origin is not ours to open
+    std::vector<std::pair<uint64_t, uint64_t>> staged;
+    Stats* st = j.st->store ? &j.st->store->stats() : nullptr;
+    transpose::FileMeta fm;
+    bool readFailed = false;
+    {
+      // The parser throws on a hostile or unfamiliar layout. Giving the inner
+      // file back has to survive that: a handle whose in-flight count never
+      // returns to zero can never be closed, and the application thread that
+      // called Close would wait for it forever.
+      struct Held {
+        HandleState* st;
+        ~Held() { st->releaseInner(); }
+      } held{j.st.get()};
+      OriginSource src(e, f, st, staged);
+      fm = parseTree(src, static_cast<int64_t>(e.fileSize()));
+      readFailed = src.failed;
+    }
+    const bool src_failed = readFailed;
+    const bool ok = !src_failed && fm.error.empty() && !fm.branches.empty();
+    if (ok) {
+      if (st) {
+        st->prefetchParses.fetch_add(1, std::memory_order_relaxed);
+        st->prefetchPrimedFiles.fetch_add(1, std::memory_order_relaxed);
+      }
+      shared.insertTable(j.key, BasketTable::build(fm, static_cast<int64_t>(e.fileSize())));
+    } else if (!src_failed) {
+      // A real answer -- no TTree here -- rather than a read that did not
+      // come back. Only the former is worth remembering.
+      shared.rememberNoTable(j.key);
+    }
+    // Either way the handle takes the staged metadata, so what the reader
+    // does not demand is dropped and counted at its close like any other
+    // speculative page.
+    shard->postPrimed(j.st, j.entry, std::move(staged));
   }
 };
 
@@ -771,12 +1204,19 @@ Prefetcher::Prefetcher() : impl_(new Impl()) {}
 
 namespace {
 Prefetcher* gPrefetcher = nullptr;
+// Set once the prefetcher exists, so the OPEN path can ask whether there is
+// anything to prime for without constructing it -- a process that never reads
+// ahead must not start its threads.
+std::atomic<bool> gActive{false};
 } // namespace
+
+bool Prefetcher::active() { return gActive.load(std::memory_order_relaxed); }
 
 Prefetcher& Prefetcher::instance() {
   static Prefetcher* p = [] {
     auto* q = new Prefetcher(); // leaked on purpose: its thread outlives static teardown
     gPrefetcher = q;
+    gActive.store(true, std::memory_order_relaxed);
     // fork() copies the queue and its mutex but NOT the worker thread, so a
     // child that inherited an open handle would post a close and wait on a
     // thread that does not exist -- a permanent hang at file close, in
@@ -797,7 +1237,7 @@ void Prefetcher::onFill(const std::shared_ptr<HandleState>& st,
                         bool anyMiss) {
   if (!st || !entry || chunks.empty())
     return;
-  if (!globalConfig().prefetch || impl_->disabled_.load(std::memory_order_relaxed))
+  if (!globalConfig().prefetch || impl_->shared.disabled.load(std::memory_order_relaxed))
     return;
   // A handle that has never missed is warm: nothing to read ahead of, and no
   // parse to pay. Once it has missed, every fill matters (a fill served from
@@ -814,33 +1254,54 @@ void Prefetcher::onFill(const std::shared_ptr<HandleState>& st,
   // sweep had no way to reach them -- so they sat in the speculative pool for
   // the life of the entry and shrank every other handle's window.
   st->prefetchSeen.store(true, std::memory_order_release);
-  Impl::Job j;
+  Shard::Job j;
   j.st = st;
   j.entry = entry;
   j.chunks.reserve(chunks.size());
   for (const auto& c : chunks)
     j.chunks.emplace_back(c.offset, c.length);
-  impl_->post(std::move(j));
+  impl_->shardFor(st.get())->post(std::move(j));
+}
+
+void Prefetcher::onOpen(const std::shared_ptr<HandleState>& st,
+                        const std::shared_ptr<FileEntry>& entry) {
+  if (!st || !entry)
+    return;
+  const Config& cfg = globalConfig();
+  if (!cfg.prefetch || !cfg.prefetchPrime || cfg.fillBufferMb <= 0)
+    return;
+  // Nothing to prime FROM until some file has confirmed the prediction and
+  // some map has parsed: without a branch set there is no first fill to
+  // guess, and a process reading no TTree would pay a parse per file for it.
+  if (impl_->shared.disabled.load(std::memory_order_relaxed) ||
+      !impl_->shared.confirmed.load(std::memory_order_relaxed) ||
+      !impl_->shared.mapsWork.load(std::memory_order_relaxed))
+    return;
+  // Marked here, on the caller's thread, for the same reason a fill marks it:
+  // onClose reads it to decide whether there is anything to wait for, and the
+  // pages a prime stages need that close to drop them.
+  st->prefetchSeen.store(true, std::memory_order_release);
+  impl_->postPrime(st, entry);
 }
 
 void Prefetcher::onClose(const std::shared_ptr<HandleState>& st,
                          const std::shared_ptr<FileEntry>& entry) {
   if (!st || !st->prefetchSeen.load(std::memory_order_acquire))
     return;
-  Impl::Sync sync;
-  Impl::Job j;
+  Shard::Sync sync;
+  Shard::Job j;
   j.st = st;
   j.entry = entry;
   j.close = true;
   j.sync = &sync;
-  impl_->post(std::move(j));
+  impl_->shardFor(st.get())->post(std::move(j));
   // Closes go to the front of the queue, so this waits for at most the job
   // in progress (a parse, a quarter second on the largest files).
   std::unique_lock<std::mutex> lk(sync.m);
   sync.cv.wait(lk, [&] { return sync.done; });
 }
 
-bool Prefetcher::confirmed() const { return impl_->confirmed_.load(); }
-bool Prefetcher::disabled() const { return impl_->disabled_.load(); }
+bool Prefetcher::confirmed() const { return impl_->shared.confirmed.load(); }
+bool Prefetcher::disabled() const { return impl_->shared.disabled.load(); }
 
 } // namespace ucache

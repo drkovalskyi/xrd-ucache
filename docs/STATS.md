@@ -50,6 +50,7 @@ the consumers together.
  "origin_reads": 0, "fetches_joined": 0, "origin_readvs": 0, "page_writes": 0,
  "prefetch_issued_bytes": 0, "prefetch_served_bytes": 0, "prefetch_refetched_bytes": 0,
  "prefetch_dropped_unread": 0, "prefetch_late_bytes": 0, "prefetch_parses": 0,
+ "prefetch_primed_files": 0, "prefetch_bridge_bytes": 0,
  "prefetch_disabled": 0, "prefetch_fetch_errors": 0,
  "crc_failures": 0, "meta_corrupt": 0,
  "evicted_entries": 0, "evicted_bytes": 0,
@@ -203,7 +204,13 @@ reading was re-reading, and what the cache disk was asked to do.
   never written to the cache; `prefetch_late_bytes` — arrived after the demand
   read had already brought them; `prefetch_parses` — basket maps parsed
   (successes; a map is retried while the reader's header pages are still being
-  staged, and those attempts do not count); `prefetch_disabled` — 1 once a
+  staged, and those attempts do not count); `prefetch_primed_files` — files
+  whose map was read at open, ahead of the reader's own metadata reads, so
+  that their first fill could be predicted too (`prefetch_prime`);
+  `prefetch_bridge_bytes` — padding between two predicted ranges, fetched to
+  save a request element and discarded on arrival (`prefetch_bridge_kb`):
+  bandwidth only, never staged, never cached, and never counted against
+  read-ahead's own accuracy; `prefetch_disabled` — 1 once a
   process switched read-ahead off, so a total over several processes is a
   count of how many did; `prefetch_fetch_errors` — read-ahead
   wire reads that failed (dropped; never a fail-open event). `fetches_joined` counts the reads that waited for a fetch already on the

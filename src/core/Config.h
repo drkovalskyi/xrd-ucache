@@ -81,12 +81,36 @@ struct Config {
   // switches itself off.
   bool prefetch = true;                   // UCACHE_PREFETCH
   int prefetchWindowMb = 32;              // UCACHE_PREFETCH_WINDOW_MB, per handle
-  int prefetchRamMb = 512;
+  // Staged speculative bytes plus bytes on the wire, process-wide. It bounds
+  // read-ahead's whole RAM footprint, and with 32 readers each holding
+  // `prefetch_depth` windows it is what actually sizes the window.
+  int prefetchRamMb = 1024;
   // Let a demand read wait for a read-ahead fetch already on the wire for the
   // same bytes instead of sending its own. Off restores the racing behaviour,
   // which costs the bytes twice; kept switchable because a wait is a latency
   // risk where a refetch is only a bandwidth one.
   bool prefetchJoin = true;                // UCACHE_PREFETCH_JOIN
+  // How many fills ahead to keep in flight. One is critically loaded: a
+  // fill-sized origin request takes about as long as the decompression it is
+  // meant to hide, so any jitter leaves the reader waiting. Two gives the
+  // read two compute periods to arrive in and costs one more window of RAM.
+  int prefetchDepth = 2;                   // UCACHE_PREFETCH_DEPTH
+  // Merge predicted ranges separated by less than this into one wire element.
+  // A request's cost is dominated by its ELEMENT count, not its bytes -- the
+  // origin answers a 16 MB read of 630 scattered pieces in 1.1 s and the same
+  // bytes in 4 pieces in 0.06 s -- so bridging a gap can be cheaper than
+  // leaving it. The bridged bytes are never staged and never reach the cache;
+  // they are transfer padding, paid for in bandwidth. 0 = off.
+  int prefetchBridgeKb = 0;                // UCACHE_PREFETCH_BRIDGE_KB
+  // Prediction worker threads. One thread cannot both parse a new file's
+  // basket map (a quarter second) and keep up with 32 readers' fills.
+  int prefetchThreads = 4;                 // UCACHE_PREFETCH_THREADS
+  // Read a file's basket map as soon as it is opened, instead of waiting for
+  // the reader's second fill: the reader's own metadata reads are then served
+  // from RAM and its FIRST fill is predicted, which is the one fill per file
+  // that nothing could cover before. Needs the branch set of an earlier file,
+  // so it does nothing until read-ahead has confirmed on one.
+  bool prefetchPrime = true;               // UCACHE_PREFETCH_PRIME
   // UCACHE_REVALIDATE_S: cache-freshness window (TTL). When a usable local
   // entry was last validated against the origin within this many seconds,
   // TRUST it — skip the remote Open+Stat and serve locally (the origin is

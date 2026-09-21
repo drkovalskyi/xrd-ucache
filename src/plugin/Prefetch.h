@@ -30,6 +30,19 @@
 //     already has it open; it will not run the lazy open of a trusted handle,
 //     because the application did not ask for this read and must not wait for
 //     it, inherit its failure, or spend its one open attempt on it.
+//
+// Two things follow from what an origin actually charges for. A request costs
+// far more for its ELEMENT COUNT than for its bytes, and a request on one open
+// file is answered strictly after the one before it, so the reader's stream is
+// paced by how long a fill-sized read takes -- which is about how long the
+// decompression it hides takes. Hence `prefetch_depth`, which keeps more than
+// one fill on the wire so a slow one has somewhere to be absorbed, and
+// `prefetch_bridge_kb`, which joins predicted ranges across small gaps to buy
+// element count with bandwidth (the bridged bytes are never staged). And hence
+// PRIMING: the first fill of a file is the one nothing can predict from a
+// previous fill, so the map is read at OPEN instead, from the origin, using
+// the branch set an earlier file taught. That also serves the reader's own
+// metadata reads out of RAM.
 // A speculative page never reaches the cache: FileEntry writes a page only
 // once the READER has demanded it (FileEntry::stageSpeculative). The cache
 // reading its own stage -- the basket-map parse, through readCached with
@@ -66,6 +79,15 @@ class Prefetcher {
   // The handle closed: whatever it had in flight or staged speculatively is
   // dropped and counted; completions that land afterwards stage nothing.
   void onClose(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry);
+  // A handle finished setting its entry up. Read the file's basket map now,
+  // ahead of the reader's own metadata reads, and predict its first fill.
+  // Does nothing until read-ahead has confirmed on an earlier file.
+  void onOpen(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry);
+
+  // True once something has created the prefetcher (a handle missed and read
+  // ahead). Callers on the open path test this so a process that never reads
+  // ahead never starts its threads.
+  static bool active();
 
   // Process state, for tests and diagnostics.
   bool confirmed() const;

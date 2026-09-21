@@ -1072,6 +1072,52 @@ TEST(FileEntry, ADemandRangeReachingPastTheFetchInFlightDoesNotPark) {
   e->clearFetchInFlight(0, 4 * 4096);
 }
 
+// Running more than one fill ahead means predicting a window that overlaps
+// the one still on the wire. absentRuns must be able to leave those pages
+// out, or read-ahead would ask for its own bytes a second time -- the exact
+// defect the in-flight registry was built to stop on the demand side.
+TEST(FileEntry, AbsentRunsCanSkipWhatIsAlreadyOnTheWire) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  // Nothing in flight: both answers are the whole span.
+  EXPECT_EQ(e->absentRuns(0, 8 * 4096).size(), 1u);
+  EXPECT_EQ(e->absentRuns(0, 8 * 4096, true).size(), 1u);
+  e->noteFetchInFlight(2 * 4096, 2 * 4096);
+  // The negative control: without the flag the pages on the wire still read
+  // as absent, which is what a single-window read-ahead wants.
+  auto all = e->absentRuns(0, 8 * 4096);
+  ASSERT_EQ(all.size(), 1u);
+  EXPECT_EQ(all[0].second, 8u * 4096);
+  // With it, the span is cut around them.
+  auto some = e->absentRuns(0, 8 * 4096, true);
+  ASSERT_EQ(some.size(), 2u);
+  EXPECT_EQ(some[0].first, 0u);
+  EXPECT_EQ(some[0].second, 2u * 4096);
+  EXPECT_EQ(some[1].first, 4u * 4096);
+  EXPECT_EQ(some[1].second, 4u * 4096);
+  // Withdrawn, and the hole closes again.
+  e->clearFetchInFlight(2 * 4096, 2 * 4096);
+  EXPECT_EQ(e->absentRuns(0, 8 * 4096, true).size(), 1u);
+}
+
+// Pages that are present are absent to nobody, and a page that is BOTH
+// present and registered in flight must not be returned twice or shift the
+// runs around it.
+TEST(FileEntry, AbsentRunsSkippingTheWireStillHonoursResidency) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->writePages(0, 2 * 4096, fx.src.data());
+  e->flushBuffer(true);
+  e->noteFetchInFlight(0, 4 * 4096);
+  auto runs = e->absentRuns(0, 8 * 4096, true);
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_EQ(runs[0].first, 4u * 4096);
+  EXPECT_EQ(runs[0].second, 4u * 4096);
+  e->clearFetchInFlight(0, 4 * 4096);
+}
+
 TEST(FileEntry, SpeculativePagesAtCloseAreDroppedAndCounted) {
   Fixture fx(16 * 4096, 4096);
   {

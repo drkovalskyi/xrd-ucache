@@ -135,7 +135,11 @@ class FileEntry {
   // Page runs inside [off, off+len) that are neither present nor staged --
   // what a prefetch would have to fetch. Page-aligned, the tail page clamped
   // to the file size; empty when everything is already there.
-  std::vector<std::pair<uint64_t, uint64_t>> absentRuns(uint64_t off, uint64_t len);
+  // skipInFlight also skips pages some wire request is already fetching, so a
+  // read-ahead running more than one fill ahead does not ask twice for the
+  // window it issued a moment ago.
+  std::vector<std::pair<uint64_t, uint64_t>> absentRuns(uint64_t off, uint64_t len,
+                                                        bool skipInFlight = false);
   // Process-wide bytes currently staged speculatively, across entries.
   static uint64_t speculativeTotal();
   // Process-wide bytes fetched ahead and never used, by every route: the
@@ -371,6 +375,7 @@ class FileEntry {
   std::vector<std::pair<uint64_t, uint64_t>> flight_;
   std::vector<std::function<void()>> flightWaiters_;
   bool coveredByFlight(uint64_t firstPage, uint64_t endPage) const; // under mu_
+  bool pageInFlight(uint64_t page) const;                           // under mu_
   bool pageHere(uint64_t i) const;                                  // under mu_
 
   // Observability. servedOnce_ (under mu_): pages served at least

@@ -166,6 +166,14 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.prefetchJoin = !falsy(v);
   else if (k == "prefetch_ram_mb")
     c.prefetchRamMb = ::atoi(v.c_str());
+  else if (k == "prefetch_depth")
+    c.prefetchDepth = ::atoi(v.c_str());
+  else if (k == "prefetch_bridge_kb")
+    c.prefetchBridgeKb = ::atoi(v.c_str());
+  else if (k == "prefetch_threads")
+    c.prefetchThreads = ::atoi(v.c_str());
+  else if (k == "prefetch_prime")
+    c.prefetchPrime = !falsy(v);
   else if (k == "revalidate_seconds")
     c.revalidateSeconds = ::atoi(v.c_str());
   else if (k == "open_retries")
@@ -354,6 +362,10 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"prefetch_window_mb", "UCACHE_PREFETCH_WINDOW_MB"},
       {"prefetch_ram_mb", "UCACHE_PREFETCH_RAM_MB"},
       {"prefetch_join", "UCACHE_PREFETCH_JOIN"},
+      {"prefetch_depth", "UCACHE_PREFETCH_DEPTH"},
+      {"prefetch_bridge_kb", "UCACHE_PREFETCH_BRIDGE_KB"},
+      {"prefetch_threads", "UCACHE_PREFETCH_THREADS"},
+      {"prefetch_prime", "UCACHE_PREFETCH_PRIME"},
       {"revalidate_seconds", "UCACHE_REVALIDATE_S"},
       {"open_retries", "UCACHE_OPEN_RETRIES"},
       {"open_retry_base_ms", "UCACHE_OPEN_RETRY_BASE_MS"},
@@ -441,6 +453,14 @@ std::string Config::valueOf(const std::string& key) const {
     return std::to_string(prefetchRamMb);
   if (key == "prefetch_join")
     return onoff(prefetchJoin);
+  if (key == "prefetch_depth")
+    return std::to_string(prefetchDepth);
+  if (key == "prefetch_bridge_kb")
+    return std::to_string(prefetchBridgeKb);
+  if (key == "prefetch_threads")
+    return std::to_string(prefetchThreads);
+  if (key == "prefetch_prime")
+    return onoff(prefetchPrime);
   if (key == "meta_flush_seconds")
     return std::to_string(metaFlushSeconds);
   if (key == "revalidate_seconds")

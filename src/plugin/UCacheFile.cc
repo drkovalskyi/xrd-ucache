@@ -1441,14 +1441,25 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
       stats.tracer->rec("open", entry->key().key, 0, 0, nowUs() - setupT0,
                         /*sampled=*/false);
   }
-  std::lock_guard<std::mutex> g(st_->mu);
-  st_->setupDone = true;
-  st_->statInfo = std::move(statClone);
-  if (!st_->closed && !st_->tripped) {
-    st_->entry = entry;
-    st_->view = view;
+  std::shared_ptr<FileEntry> ready;
+  {
+    std::lock_guard<std::mutex> g(st_->mu);
+    st_->setupDone = true;
+    st_->statInfo = std::move(statClone);
+    if (!st_->closed && !st_->tripped) {
+      st_->entry = entry;
+      st_->view = view;
+    }
+    ready = st_->entry;
   }
-  return st_->entry;
+  // Read-ahead reads this file's basket map now, before the reader's own
+  // metadata reads ask for it, so its FIRST fill can be predicted too. Only
+  // once something has already started reading ahead in this process --
+  // `active()` keeps a process that never does from starting the threads --
+  // and never for a replica view, whose bytes are not the file's.
+  if (ready && !view && cfg.prefetch && cfg.prefetchPrime && Prefetcher::active())
+    Prefetcher::instance().onOpen(st_, ready);
+  return ready;
 }
 
 std::shared_ptr<ReplicaView> UCacheFile::currentView() const {

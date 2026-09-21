@@ -644,7 +644,8 @@ uint64_t FileEntry::speculativeDroppedTotal() {
   return g_specDropped_.load(std::memory_order_relaxed);
 }
 
-std::vector<std::pair<uint64_t, uint64_t>> FileEntry::absentRuns(uint64_t off, uint64_t len) {
+std::vector<std::pair<uint64_t, uint64_t>> FileEntry::absentRuns(uint64_t off, uint64_t len,
+                                                                 bool skipInFlight) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
   if (len == 0 || off + len < off)
     return runs;
@@ -656,6 +657,8 @@ std::vector<std::pair<uint64_t, uint64_t>> FileEntry::absentRuns(uint64_t off, u
   std::lock_guard<std::mutex> g(mu_);
   for (uint64_t i = first; i <= last; ++i) {
     if (meta_.bitmap.get(i) || buf_.count(i) || flushing_.count(i))
+      continue;
+    if (skipInFlight && pageInFlight(i))
       continue;
     const uint64_t pStart = i * uint64_t(P);
     const uint64_t pLen = meta_.pageBytes(i);
@@ -882,6 +885,13 @@ bool FileEntry::coveredByFlight(uint64_t firstPage, uint64_t endPage) const {
       }
   }
   return at >= endPage;
+}
+
+bool FileEntry::pageInFlight(uint64_t page) const {
+  for (const auto& [a, b] : flight_)
+    if (a <= page && b > page)
+      return true;
+  return false;
 }
 
 void FileEntry::noteFetchInFlight(uint64_t off, uint64_t len) {
