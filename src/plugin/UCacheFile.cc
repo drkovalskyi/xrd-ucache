@@ -1912,6 +1912,106 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
   });
 }
 
+// The plain byte-cache vector-read serve, as a free function so a request that
+// parks behind a fetch already in flight can re-enter it. `mayPark` is false on
+// that second pass: it has already been counted as a fill, and one wait is
+// enough -- whatever is still missing then goes to the origin.
+static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
+                                 const std::shared_ptr<FileEntry>& entry, ChunkList chunks,
+                                 ResponseHandler* handler, bool mayPark) {
+  // Atomic per-chunk classification (§5.2 step 1).
+  std::vector<size_t> missIdx;
+  for (size_t i = 0; i < chunks.size(); ++i)
+    if (!entry->hasRange(chunks[i].offset, chunks[i].length))
+      missIdx.push_back(i);
+  // Once per request, not once per pass: a read that parked and came back is
+  // the same request, and counting it again inflated the chunk total by the
+  // number of parked reads (6.5M -> 9.1M on a full pass).
+  if (mayPark)
+    noteVectorRequest(st, chunks);
+#ifdef UCACHE_HAVE_PREFETCH
+  // Read-ahead learns from every fill and, once confirmed, fetches the next
+  // one while the reader computes; posted to its own thread, never blocking.
+  // Only on the first pass: a re-dispatched request is the same fill, and
+  // counting it twice would move the frontier past baskets nobody asked for.
+  if (mayPark && globalConfig().prefetch)
+    Prefetcher::instance().onFill(st, entry, chunks, !missIdx.empty());
+#endif
+
+  // Are the bytes we are missing already coming? Read-ahead issues page-
+  // rounded runs that a demand read would otherwise request again, and both
+  // copies then cross the network. Wait for the one in flight instead. Only
+  // ever parks once per request, and only when EVERY absent page is covered,
+  // so a read can never wait on a fetch that is not happening.
+  if (mayPark && !missIdx.empty() && globalConfig().prefetchJoin) {
+    std::vector<std::pair<uint64_t, uint64_t>> want;
+    want.reserve(missIdx.size());
+    for (size_t i : missIdx)
+      want.emplace_back(chunks[i].offset, chunks[i].length);
+    ChunkList again = chunks;
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    auto redispatch = [st, entry, again = std::move(again), handler, fired]() mutable {
+      if (fired->exchange(true))
+        return;
+      Executor::instance().post([st, entry, again = std::move(again), handler]() mutable {
+        servePlainVectorRead(st, entry, std::move(again), handler, /*mayPark=*/false);
+      });
+    };
+    if (entry->waitForInFlight(want, redispatch)) {
+      Executor::instance().postAfter(10000, redispatch); // the same insurance the single-read path keeps
+      return;
+    }
+  }
+  if (st->store && !missIdx.empty() && missIdx.size() != chunks.size())
+    st->store->stats().readvMixed.fetch_add(1,
+                                             std::memory_order_relaxed); // serial hit+wire shape
+
+  if (missIdx.size() == chunks.size()) {
+    // All-miss: no disk stage; issue the wire read from this thread.
+    issueMissVRead(st, entry, chunks, std::move(missIdx), handler);
+    return;
+  }
+
+  // Hit stage on the executor; misses (incl. CRC demotions) follow as one
+  // wire vector read.
+  ChunkList userChunks = chunks;
+  Executor::instance().post(
+      [st, entry, userChunks = std::move(userChunks), missIdx = std::move(missIdx),
+       handler]() mutable {
+        uint64_t t0 = nowUs();
+        uint64_t hitBytes = 0;
+        std::vector<size_t> misses = std::move(missIdx);
+        std::vector<bool> isMiss(userChunks.size(), false);
+        for (size_t i : misses)
+          isMiss[i] = true;
+        for (size_t i = 0; i < userChunks.size(); ++i) {
+          if (isMiss[i])
+            continue;
+          const auto& c = userChunks[i];
+          if (entry->readCached(c.offset, c.length, c.buffer)) {
+            hitBytes += c.length;
+          } else {
+            misses.push_back(i); // CRC demotion
+          }
+        }
+        if (st->store && hitBytes)
+          st->store->stats().hitReadUs.add(nowUs() - t0);
+        if (misses.empty()) {
+          if (st->store) {
+            uint64_t total = 0;
+            for (const auto& c : userChunks)
+              total += c.length;
+            st->store->stats().servedBytes.fetch_add(total, std::memory_order_relaxed);
+          }
+          st->noteCacheOk();
+          complete(handler, okStatus(), vreadResponse(userChunks));
+          return;
+        }
+        std::sort(misses.begin(), misses.end());
+        issueMissVRead(st, entry, std::move(userChunks), std::move(misses), handler);
+      });
+  return;}
+
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
   auto entry = ensureEntry();
@@ -1957,69 +2057,10 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
       });
     }
 
-  // Atomic per-chunk classification (§5.2 step 1).
-  std::vector<size_t> missIdx;
-  for (size_t i = 0; i < chunks.size(); ++i)
-    if (!entry->hasRange(chunks[i].offset, chunks[i].length))
-      missIdx.push_back(i);
-  noteVectorRequest(st_, chunks);
-#ifdef UCACHE_HAVE_PREFETCH
-  // Read-ahead learns from every fill and, once confirmed, fetches the next
-  // one while the reader computes; posted to its own thread, never blocking.
-  if (globalConfig().prefetch)
-    Prefetcher::instance().onFill(st_, entry, chunks, !missIdx.empty());
-#endif
-  if (st_->store && !missIdx.empty() && missIdx.size() != chunks.size())
-    st_->store->stats().readvMixed.fetch_add(1,
-                                             std::memory_order_relaxed); // serial hit+wire shape
-
-  if (missIdx.size() == chunks.size()) {
-    // All-miss: no disk stage; issue the wire read from this thread.
-    issueMissVRead(st_, entry, chunks, std::move(missIdx), handler);
-    return XRootDStatus();
-  }
-
-  // Hit stage on the executor; misses (incl. CRC demotions) follow as one
-  // wire vector read.
-  auto st = st_;
-  ChunkList userChunks = chunks;
-  Executor::instance().post(
-      [st, entry, userChunks = std::move(userChunks), missIdx = std::move(missIdx),
-       handler]() mutable {
-        uint64_t t0 = nowUs();
-        uint64_t hitBytes = 0;
-        std::vector<size_t> misses = std::move(missIdx);
-        std::vector<bool> isMiss(userChunks.size(), false);
-        for (size_t i : misses)
-          isMiss[i] = true;
-        for (size_t i = 0; i < userChunks.size(); ++i) {
-          if (isMiss[i])
-            continue;
-          const auto& c = userChunks[i];
-          if (entry->readCached(c.offset, c.length, c.buffer)) {
-            hitBytes += c.length;
-          } else {
-            misses.push_back(i); // CRC demotion
-          }
-        }
-        if (st->store && hitBytes)
-          st->store->stats().hitReadUs.add(nowUs() - t0);
-        if (misses.empty()) {
-          if (st->store) {
-            uint64_t total = 0;
-            for (const auto& c : userChunks)
-              total += c.length;
-            st->store->stats().servedBytes.fetch_add(total, std::memory_order_relaxed);
-          }
-          st->noteCacheOk();
-          complete(handler, okStatus(), vreadResponse(userChunks));
-          return;
-        }
-        std::sort(misses.begin(), misses.end());
-        issueMissVRead(st, entry, std::move(userChunks), std::move(misses), handler);
-      });
+  servePlainVectorRead(st_, entry, chunks, handler, /*mayPark=*/true);
   return XRootDStatus();
 }
+
 
 void UCacheFile::invalidateOnWrite() {
   std::shared_ptr<FileEntry> e;

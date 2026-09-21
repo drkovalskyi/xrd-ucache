@@ -167,6 +167,26 @@ class FileEntry {
   bool beginFetch(uint64_t off, uint64_t len, std::function<void()> onOwnerDone);
   void endFetch(uint64_t off, uint64_t len);
 
+  // ---- ranges already on the wire -----------------------------------------
+  // The gate above dedups EXACT ranges, which is why it only ever served the
+  // single-read path: read-ahead and a demand vector read never ask for the
+  // same span. These work by CONTAINMENT instead, so a demand read whose
+  // missing pages are inside something read-ahead is already fetching can wait
+  // for that copy. Without it the two raced and the bytes crossed the network
+  // twice -- measured at 60 GB, half of everything read ahead, on one pass.
+  void noteFetchInFlight(uint64_t off, uint64_t len);
+  void clearFetchInFlight(uint64_t off, uint64_t len); // must run on EVERY exit
+  // All of one wire request's ranges at once, waking the parked readers only
+  // after the last of them is withdrawn: clearing piecemeal woke readers while
+  // the rest of the same request was still registered, and they went to the
+  // origin for bytes that were about to arrive.
+  void clearFetchInFlight(const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+  // True when every absent page of every range is inside one already on the
+  // wire; cb then fires as those land and the caller re-classifies. False
+  // means something is missing that nobody is fetching: go to the origin.
+  bool waitForInFlight(const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                       std::function<void()> cb);
+
   // Replica punch-and-clear: for each byte range, mark every
   // FULLY-covered page absent (bit cleared, CRC zeroed; partial edge pages
   // stay), force-flush the sidecar, then hole-punch the cleared spans in
@@ -345,6 +365,13 @@ class FileEntry {
   static std::atomic<uint64_t> g_specDropped_; // process-wide never-used bytes
   // In-flight fetch table: (off,len) -> parked re-dispatch callbacks.
   std::map<std::pair<uint64_t, uint64_t>, std::vector<std::function<void()>>> inflight_;
+  // Page ranges read-ahead has on the wire, [firstPage, endPage), one entry
+  // per wire element, and the reads parked behind them. Short: one window's
+  // worth of elements per open handle.
+  std::vector<std::pair<uint64_t, uint64_t>> flight_;
+  std::vector<std::function<void()>> flightWaiters_;
+  bool coveredByFlight(uint64_t firstPage, uint64_t endPage) const; // under mu_
+  bool pageHere(uint64_t i) const;                                  // under mu_
 
   // Observability. servedOnce_ (under mu_): pages served at least
   // once, for first_touch accounting — lazily sized, RAM-only, never stored.

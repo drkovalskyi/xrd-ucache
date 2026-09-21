@@ -860,6 +860,118 @@ bool FileEntry::beginFetch(uint64_t off, uint64_t len, std::function<void()> onO
   return false; // parked behind the owner
 }
 
+bool FileEntry::pageHere(uint64_t i) const {
+  return meta_.bitmap.get(i) || buf_.count(i) || flushing_.count(i);
+}
+
+bool FileEntry::coveredByFlight(uint64_t firstPage, uint64_t endPage) const {
+  // The UNION of what is on the wire, not any single element. A wire request
+  // is cut into protocol-legal pieces at 2 MiB, on page boundaries that know
+  // nothing about baskets, so a basket straddling a cut lies in two elements.
+  // Requiring one element to hold the whole run therefore failed on almost
+  // every request -- a vector read carries hundreds of chunks and one
+  // straddler was enough -- and the parking never engaged at all.
+  uint64_t at = firstPage;
+  for (bool moved = true; at < endPage && moved;) {
+    moved = false;
+    for (const auto& [a, b] : flight_)
+      if (a <= at && b > at) { // strictly advances: b > at, so this terminates
+        at = b;
+        moved = true;
+        break;
+      }
+  }
+  return at >= endPage;
+}
+
+void FileEntry::noteFetchInFlight(uint64_t off, uint64_t len) {
+  if (len == 0 || off + len < off)
+    return;
+  const uint32_t P = meta_.pageSize;
+  const uint64_t end = std::min(off + len, meta_.fileSize);
+  if (off >= end)
+    return;
+  std::lock_guard<std::mutex> g(mu_);
+  flight_.emplace_back(off / P, (end + P - 1) / P);
+}
+
+void FileEntry::clearFetchInFlight(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+  const uint32_t P = meta_.pageSize;
+  std::vector<std::function<void()>> wake;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    for (const auto& [off, len] : ranges) {
+      if (len == 0 || off + len < off)
+        continue;
+      const uint64_t end = std::min(off + len, meta_.fileSize);
+      if (off >= end)
+        continue;
+      auto it = std::find(flight_.begin(), flight_.end(),
+                          std::pair<uint64_t, uint64_t>{off / P, (end + P - 1) / P});
+      if (it != flight_.end())
+        flight_.erase(it);
+    }
+    wake.swap(flightWaiters_);
+  }
+  for (auto& cb : wake)
+    cb();
+}
+
+void FileEntry::clearFetchInFlight(uint64_t off, uint64_t len) {
+  if (len == 0 || off + len < off)
+    return;
+  const uint32_t P = meta_.pageSize;
+  const uint64_t end = std::min(off + len, meta_.fileSize);
+  if (off >= end)
+    return;
+  const std::pair<uint64_t, uint64_t> k{off / P, (end + P - 1) / P};
+  std::vector<std::function<void()>> wake;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = std::find(flight_.begin(), flight_.end(), k);
+    if (it != flight_.end())
+      flight_.erase(it);
+    // Everyone parked is woken on any landing and re-classifies. A reader
+    // woken too early simply parks again or fetches; one left asleep would
+    // hang, so the bias is deliberate.
+    wake.swap(flightWaiters_);
+  }
+  for (auto& cb : wake)
+    cb();
+}
+
+bool FileEntry::waitForInFlight(const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                                std::function<void()> cb) {
+  std::lock_guard<std::mutex> g(mu_);
+  if (flight_.empty())
+    return false;
+  const uint32_t P = meta_.pageSize;
+  bool sawAbsent = false;
+  for (const auto& [off, len] : ranges) {
+    if (len == 0 || off + len > meta_.fileSize)
+      return false;
+    const uint64_t first = off / P, last = (off + len - 1) / P;
+    for (uint64_t i = first; i <= last;) {
+      if (pageHere(i)) {
+        ++i;
+        continue;
+      }
+      uint64_t j = i;
+      while (j <= last && !pageHere(j))
+        ++j;
+      if (!coveredByFlight(i, j))
+        return false;
+      sawAbsent = true;
+      i = j;
+    }
+  }
+  if (!sawAbsent)
+    return false; // nothing missing: the caller's own hit path is quicker
+  flightWaiters_.push_back(std::move(cb));
+  stats_.fetchesJoined.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 void FileEntry::endFetch(uint64_t off, uint64_t len) {
   std::vector<std::function<void()>> cbs;
   {

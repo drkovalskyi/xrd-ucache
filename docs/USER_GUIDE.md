@@ -639,6 +639,7 @@ overriding your defaults. Common keys:
 | `prefetch = on`     | `UCACHE_PREFETCH`       | read ahead for TTree readers: the next batch of baskets is predicted from the file's own metadata and fetched while your code computes (default on; see below). `off` = fetch only what is asked for |
 | `prefetch_window_mb = 32` | `UCACHE_PREFETCH_WINDOW_MB` | how far ahead one file handle may read (one fill's worth per branch, up to this) |
 | `prefetch_ram_mb = 512` | `UCACHE_PREFETCH_RAM_MB` | RAM the whole process may hold in read-ahead pages not yet asked for, counting both what has arrived and what is on the wire; the window shrinks as it is approached and reaches zero at the limit |
+| `prefetch_join = on` | `UCACHE_PREFETCH_JOIN` | when your job asks for bytes read-ahead is already fetching, wait for that copy instead of asking the origin a second time. `off` restores the older behaviour, which fetched them twice |
 | `announce = on`     | `UCACHE_ANNOUNCE`       | name uCache as the application in what the client tells servers at login, so a site can see traffic that comes through a cache (default on; see below). `off` = send your program's own name, as without uCache |
 | `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
 

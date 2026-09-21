@@ -162,6 +162,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.prefetch = !falsy(v); // default on; see Config.h
   else if (k == "prefetch_window_mb")
     c.prefetchWindowMb = ::atoi(v.c_str());
+  else if (k == "prefetch_join")
+    c.prefetchJoin = !falsy(v);
   else if (k == "prefetch_ram_mb")
     c.prefetchRamMb = ::atoi(v.c_str());
   else if (k == "revalidate_seconds")
@@ -351,6 +353,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"prefetch", "UCACHE_PREFETCH"},
       {"prefetch_window_mb", "UCACHE_PREFETCH_WINDOW_MB"},
       {"prefetch_ram_mb", "UCACHE_PREFETCH_RAM_MB"},
+      {"prefetch_join", "UCACHE_PREFETCH_JOIN"},
       {"revalidate_seconds", "UCACHE_REVALIDATE_S"},
       {"open_retries", "UCACHE_OPEN_RETRIES"},
       {"open_retry_base_ms", "UCACHE_OPEN_RETRY_BASE_MS"},
@@ -436,6 +439,8 @@ std::string Config::valueOf(const std::string& key) const {
     return std::to_string(prefetchWindowMb);
   if (key == "prefetch_ram_mb")
     return std::to_string(prefetchRamMb);
+  if (key == "prefetch_join")
+    return onoff(prefetchJoin);
   if (key == "meta_flush_seconds")
     return std::to_string(metaFlushSeconds);
   if (key == "revalidate_seconds")

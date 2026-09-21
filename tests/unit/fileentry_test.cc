@@ -1025,6 +1025,53 @@ TEST(FileEntry, ReleaseRangesOverASpeculativePageDebitsTheSpeculativePool) {
   EXPECT_TRUE(e->hasRange(0, 2 * 4096));
 }
 
+// A demand read whose missing pages are already on the wire waits for that
+// copy instead of sending a second request. This is what the exact-range
+// fetch gate could never do for read-ahead, because a speculative run and a
+// reader's chunk are never the same span.
+TEST(FileEntry, ADemandRangeInsideAFetchInFlightParksAndIsWokenWhenItLands) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  int woke = 0;
+  auto cb = [&woke] { ++woke; };
+  // Nothing in flight: the caller must fetch, not wait.
+  EXPECT_FALSE(e->waitForInFlight({{4096, 2 * 4096}}, cb));
+  e->noteFetchInFlight(0, 8 * 4096);
+  // Inside the range on the wire: park.
+  EXPECT_TRUE(e->waitForInFlight({{4096, 2 * 4096}}, cb));
+  EXPECT_EQ(fx.stats.fetchesJoined.load(), 1u);
+  EXPECT_EQ(woke, 0);
+  e->clearFetchInFlight(0, 8 * 4096);
+  EXPECT_EQ(woke, 1) << "the landing must wake the parked reader";
+  // Withdrawn: back to fetching.
+  EXPECT_FALSE(e->waitForInFlight({{4096, 2 * 4096}}, cb));
+}
+
+// The bias is deliberate: only a range wholly covered waits. A read that
+// reaches past what is coming must go to the origin rather than block on a
+// fetch that will never bring its bytes.
+TEST(FileEntry, ADemandRangeReachingPastTheFetchInFlightDoesNotPark) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  e->noteFetchInFlight(0, 4 * 4096);
+  EXPECT_FALSE(e->waitForInFlight({{2 * 4096, 4 * 4096}}, [] {}));
+  EXPECT_EQ(fx.stats.fetchesJoined.load(), 0u);
+  // ... but two elements that MEET cover the span between them. A wire request
+  // is cut at 2 MiB on page boundaries, so a read that straddles a cut sits in
+  // two elements, and testing each element alone made parking never fire.
+  e->noteFetchInFlight(4 * 4096, 4 * 4096);
+  EXPECT_TRUE(e->waitForInFlight({{2 * 4096, 4 * 4096}}, [] {}));
+  e->clearFetchInFlight(4 * 4096, 4 * 4096);
+  // Pages already present are not "absent", so a range that is half resident
+  // and half coming still parks.
+  e->writePages(0, 2 * 4096, fx.src.data());
+  e->flushBuffer(true);
+  EXPECT_TRUE(e->waitForInFlight({{0, 4 * 4096}}, [] {}));
+  e->clearFetchInFlight(0, 4 * 4096);
+}
+
 TEST(FileEntry, SpeculativePagesAtCloseAreDroppedAndCounted) {
   Fixture fx(16 * 4096, 4096);
   {

@@ -603,7 +603,17 @@ struct Prefetcher::Impl {
     // The prefetcher outlives every handler (it is leaked with its thread), so
     // giving the bytes back here is safe on every exit, including the issue
     // that XrdCl refused.
-    ~WireHandler() override { owner_->inflight_.fetch_sub(wireBytes_, std::memory_order_relaxed); }
+    // Every exit runs this: completion, error status, and an issue XrdCl
+    // refused. The registry must never keep a range no one is fetching, or a
+    // demand read parked behind it waits for a landing that cannot come.
+    ~WireHandler() override {
+      owner_->inflight_.fetch_sub(wireBytes_, std::memory_order_relaxed);
+      std::vector<std::pair<uint64_t, uint64_t>> rs;
+      rs.reserve(elems_.size());
+      for (const auto& e : elems_)
+        rs.emplace_back(e.off, e.len);
+      entry_->clearFetchInFlight(rs); // one withdrawal, one wake
+    }
     void HandleResponseWithHosts(XrdCl::XRootDStatus* status, XrdCl::AnyObject* response,
                                  XrdCl::HostList* hosts) override {
       // Give the inner file back and let go of the handle in the same breath:
@@ -713,6 +723,11 @@ struct Prefetcher::Impl {
       if (!f)
         break; // no origin open to read ahead from: the reader's own miss opens it
       inflight_.fetch_add(partBytes, std::memory_order_relaxed);
+      // Announce the ranges BEFORE the request goes out, so a demand read that
+      // arrives while it is in flight waits for this copy instead of sending
+      // its own. The handler's destructor withdraws them on every path.
+      for (const auto& el : part)
+        j.entry->noteFetchInFlight(el.off, el.len);
       auto* wh = new WireHandler(j.st, j.entry, hp, std::move(part), this, partBytes);
       XrdCl::XRootDStatus s = f->VectorRead(wire, nullptr, wh, 0);
       if (!s.IsOK()) {

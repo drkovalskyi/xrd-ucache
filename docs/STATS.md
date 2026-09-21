@@ -206,7 +206,9 @@ reading was re-reading, and what the cache disk was asked to do.
   staged, and those attempts do not count); `prefetch_disabled` — 1 once a
   process switched read-ahead off, so a total over several processes is a
   count of how many did; `prefetch_fetch_errors` — read-ahead
-  wire reads that failed (dropped; never a fail-open event). Read-ahead's wire
+  wire reads that failed (dropped; never a fail-open event). `fetches_joined` counts the reads that waited for a fetch already on the
+  wire rather than sending their own, which is how read-ahead stops paying
+  for the same bytes twice (`prefetch_join`). Read-ahead's wire
   traffic is counted in `origin_bytes` and `origin_readvs`, as any other origin
   read, but NOT in `hist_origin_rt_us`: that histogram is time a reader waited,
   and nobody waited for these. A run that read ahead at all is never taken as a

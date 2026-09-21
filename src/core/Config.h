@@ -81,7 +81,12 @@ struct Config {
   // switches itself off.
   bool prefetch = true;                   // UCACHE_PREFETCH
   int prefetchWindowMb = 32;              // UCACHE_PREFETCH_WINDOW_MB, per handle
-  int prefetchRamMb = 512;                // UCACHE_PREFETCH_RAM_MB, process-wide speculative stage
+  int prefetchRamMb = 512;
+  // Let a demand read wait for a read-ahead fetch already on the wire for the
+  // same bytes instead of sending its own. Off restores the racing behaviour,
+  // which costs the bytes twice; kept switchable because a wait is a latency
+  // risk where a refetch is only a bandwidth one.
+  bool prefetchJoin = true;                // UCACHE_PREFETCH_JOIN
   // UCACHE_REVALIDATE_S: cache-freshness window (TTL). When a usable local
   // entry was last validated against the origin within this many seconds,
   // TRUST it — skip the remote Open+Stat and serve locally (the origin is
