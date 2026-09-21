@@ -1106,8 +1106,12 @@ struct Prefetcher::Impl {
     const int n = std::max(1, std::min(kMaxShards, globalConfig().prefetchThreads));
     for (int i = 0; i < n; ++i)
       shards.push_back(new Shard(&shared));
-    for (int i = 0, m = std::max(1, n / 2); i < m; ++i)
-      std::thread([this] { primeLoop(); }).detach();
+    // Only where priming is switched on: it is off by default, and two
+    // threads per process waiting on a queue nothing posts to is a cost with
+    // no reader.
+    if (globalConfig().prefetchPrime)
+      for (int i = 0, m = std::max(1, n / 2); i < m; ++i)
+        std::thread([this] { primeLoop(); }).detach();
   }
 
   Shard* shardFor(HandleState* st) const {
