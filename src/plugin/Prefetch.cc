@@ -5,6 +5,7 @@
 #include "Log.h"
 #include "OriginInFlight.h"
 #include "ReadRounding.h"
+#include "Trace.h"
 #include "TreeMeta.h"
 #include "UCacheFile.h"
 
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <list>
@@ -599,7 +601,10 @@ struct Prefetcher::Impl {
                 uint64_t wireBytes)
         : st_(std::move(st)), entry_(std::move(entry)), h_(std::move(h)),
           elems_(std::move(elems)), stats_(st_->store ? &st_->store->stats() : nullptr),
-          inflight_(stats_), owner_(owner), wireBytes_(wireBytes) {}
+          inflight_(stats_), owner_(owner), wireBytes_(wireBytes),
+          issuedUs_(std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count()) {}
     // The prefetcher outlives every handler (it is leaked with its thread), so
     // giving the bytes back here is safe on every exit, including the issue
     // that XrdCl refused.
@@ -647,6 +652,17 @@ struct Prefetcher::Impl {
       if (stats) {
         stats->originBytes.fetch_add(wire, std::memory_order_relaxed);
         stats->originReadvs.fetch_add(1, std::memory_order_relaxed);
+        // The speculative read's own round trip, as trace op "swire": the
+        // demand path's "wire" records never include these, so without it the
+        // origin time read-ahead spends is invisible to any profile.
+        if (stats->tracer) {
+          const uint64_t now = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count());
+          stats->tracer->rec("swire", entry_->key().key, elems_.front().off, wire,
+                             now - issuedUs_, /*sampled=*/false);
+        }
         if (late)
           stats->prefetchLateBytes.fetch_add(late, std::memory_order_relaxed);
       }
@@ -667,6 +683,7 @@ struct Prefetcher::Impl {
     OriginInFlight inflight_;
     Impl* owner_;
     uint64_t wireBytes_;
+    uint64_t issuedUs_;
   };
 
   template <typename Cand>

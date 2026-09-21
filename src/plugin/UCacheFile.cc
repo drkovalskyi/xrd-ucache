@@ -1950,9 +1950,22 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
       want.emplace_back(chunks[i].offset, chunks[i].length);
     ChunkList again = chunks;
     auto fired = std::make_shared<std::atomic<bool>>(false);
-    auto redispatch = [st, entry, again = std::move(again), handler, fired]() mutable {
+    // How long the reader waited for the copy already in flight. This is the
+    // join's whole cost and nothing else records it: the thread sampler sees a
+    // futex either way, the wire trace sees only requests this reader sent.
+    // Recorded unsampled as trace op "join" (off/len = the request's first
+    // missing chunk and its total missing bytes) so every wait is in the trace.
+    const uint64_t parkedAt = nowUs();
+    uint64_t missOff = chunks[missIdx.front()].offset, missLen = 0;
+    for (size_t i : missIdx)
+      missLen += chunks[i].length;
+    auto redispatch = [st, entry, again = std::move(again), handler, fired, parkedAt, missOff,
+                       missLen]() mutable {
       if (fired->exchange(true))
         return;
+      if (st->store && st->store->stats().tracer)
+        st->store->stats().tracer->rec("join", entry->key().key, missOff, missLen,
+                                       nowUs() - parkedAt, /*sampled=*/false);
       Executor::instance().post([st, entry, again = std::move(again), handler]() mutable {
         servePlainVectorRead(st, entry, std::move(again), handler, /*mayPark=*/false);
       });
