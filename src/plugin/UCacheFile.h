@@ -37,6 +37,7 @@
 #include "ReadFootprint.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -85,6 +86,10 @@ struct HandleState {
   std::mutex setupMu;                          // serializes lazy entry setup
   bool setupDone = false;                      // entry setup attempted (ok or not)
   bool closed = false;
+  // The same fact, readable without the lock: read-ahead's priming parse runs
+  // on its own thread and checks it between reads, so a handle the
+  // application has let go stops costing origin round trips at once.
+  std::atomic<bool> closing{false};
   int errors = 0; // consecutive cache-side errors (UCACHE_MAX_ERRORS trip)
   bool tripped = false;
 
@@ -129,7 +134,12 @@ struct HandleState {
   // next real miss would then inherit are all the wrong trade.
   XrdCl::File* acquireInnerIfOpen();
   void releaseInner();
-  void shutdownInner(); // plugin dtor: invalidate + drain + destroy the file
+  void shutdownInner();
+  // Wait, up to `max`, for the cache's own requests on the inner file to
+  // finish. Close must do this: XrdCl refuses to close a file with requests
+  // in flight, and read-ahead's are not the application's to lose a close
+  // over. Bounded, because a hung origin request must not hang a close.
+  void waitInnerIdle(std::chrono::milliseconds max); // plugin dtor: invalidate + drain + destroy the file
   // Destroy the terminally-failed inner file and install a fresh one; returns
   // the new raw pointer. Retry only; precondition innerOps==0.
   XrdCl::File* resetInner();

@@ -31,11 +31,13 @@ namespace {
 constexpr double kConfirmCoverage = 0.90;  // a shadow prediction this good engages the process
 constexpr double kGateNeverUsed = 0.25;    // never-used over issued that switches the process off
 constexpr uint64_t kGateMinIssued = 64ull << 20; // ... once this much has been issued
-constexpr size_t kTableCache = 8;          // basket tables kept across handles (RDF opens a file twice)
+constexpr size_t kTableCache = 64;         // basket tables kept across handles (RDF opens a file twice)
 constexpr size_t kMaxReadvElems = 1024;    // the readv element cap, per wire request
 constexpr int kParseTries = 3;             // a reader's metadata reads stage asynchronously: try again on a later fill
 constexpr uint32_t kBarrenFills = 4;       // fills matching no basket before a table is given up on
-constexpr uint64_t kTableCacheBytes = 64ull << 20; // ... and a byte ceiling over all of them
+// ... under a byte ceiling over all of them (prefetch_map_cache_mb): one
+// 1500-branch map is about 21 MB, so a 64 MB ceiling held three of them and
+// thirty-two readers evicted a map between parsing it and using it.
 constexpr size_t kNoTableMemo = 64;        // files remembered as having no basket map for us
 constexpr uint64_t kPrimeCapBytes = 32ull << 20; // most a priming parse may fetch for one file
 constexpr uint64_t kPrimeReadMax = 16ull << 20;  // ... and in one read of it
@@ -140,12 +142,14 @@ struct OriginSource : transpose::Source {
   XrdCl::File* f;
   Stats* stats;
   std::vector<std::pair<uint64_t, uint64_t>>& staged;
+  const std::atomic<bool>* gone; // the handle closed: stop, mid-parse
   uint64_t fetched = 0;
   bool failed = false;
 
   OriginSource(FileEntry& entry, XrdCl::File* file, Stats* st,
-               std::vector<std::pair<uint64_t, uint64_t>>& out)
-      : e(entry), f(file), stats(st), staged(out) {}
+               std::vector<std::pair<uint64_t, uint64_t>>& out,
+               const std::atomic<bool>* closed)
+      : e(entry), f(file), stats(st), staged(out), gone(closed) {}
 
   bool has(uint64_t off, uint64_t n) override {
     return n != 0 && off + n >= off && off + n <= e.fileSize();
@@ -155,6 +159,12 @@ struct OriginSource : transpose::Source {
       return true;
     if (failed || !has(off, n))
       return false;
+    if (gone && gone->load(std::memory_order_acquire)) {
+      // A reader that opens a file only to look at it closes it at once, and
+      // every further read of ours would be one its Close has to wait for.
+      failed = true;
+      return false;
+    }
     const auto [s, en] = roundSpan(e.pageSize(), e.fileSize(), off, n);
     if (en <= s || en - s > kPrimeReadMax || fetched + (en - s) > kPrimeCapBytes) {
       failed = true;
@@ -248,6 +258,8 @@ struct Shared {
     return nullptr;
   }
   void insertTable(const std::string& key, std::shared_ptr<BasketTable> t) {
+    const uint64_t capBytes =
+        static_cast<uint64_t>(std::max(16, globalConfig().prefetchMapCacheMb)) << 20;
     std::lock_guard<std::mutex> g(mu);
     for (const auto& kv : tables)
       if (kv.first == key)
@@ -260,7 +272,7 @@ struct Shared {
     uint64_t held = 0;
     for (auto it = tables.begin(); it != tables.end();) {
       held += it->second->bytes();
-      if (it != tables.begin() && (tables.size() > kTableCache || held > kTableCacheBytes)) {
+      if (it != tables.begin() && (tables.size() > kTableCache || held > capBytes)) {
         held -= it->second->bytes();
         it = tables.erase(it);
       } else {
@@ -595,7 +607,11 @@ struct Shard {
     h.table = t;
     h.frontier.assign(t->nb.size(), -1);
     h.share.assign(t->nb.size(), 0);
-    predictAndIssue(j, hp);
+    // Having the map early is worth it on its own: the handle's first fill
+    // can predict its second, instead of waiting a fill for the parse.
+    // Predicting the FIRST fill needs the handle to start at entry zero.
+    if (cfg.prefetchPrimeFirstFill)
+      predictAndIssue(j, hp);
   }
 
   void handleFill(const Job& j) {
@@ -614,6 +630,11 @@ struct Shard {
     if (h.closed.load())
       return;
     h.entry = j.entry;
+    // A prime for this handle was superseded by this fill, and its staged
+    // metadata pages came with it. Record them here or nothing ever drops
+    // what the reader does not demand.
+    for (const auto& r : j.staged)
+      h.primed.push_back(r);
     ++h.fills;
     if (!h.table && !h.noTable) {
       // The parse waits for a handle's second fill while nothing in the
@@ -1077,8 +1098,9 @@ struct Prefetcher::Impl {
   std::mutex pmu;
   std::condition_variable pcv;
   std::deque<PrimeJob> pq;
-  std::vector<std::string> busy; // keys a priming thread holds, so two handles on
-                                 // the same file do not both parse it
+  std::condition_variable bcv;   // a key stopped being parsed
+  std::vector<std::string> busy; // keys a priming thread is parsing, so two handles
+                                 // on the same file do not both parse it
 
   Impl() {
     const int n = std::max(1, std::min(kMaxShards, globalConfig().prefetchThreads));
@@ -1100,15 +1122,11 @@ struct Prefetcher::Impl {
       // A queue that outruns the threads draining it would keep handles alive
       // long after their reader let go; past this depth the file simply is
       // not primed, which costs one uncovered fill and nothing else.
-      if (pq.size() >= 64)
+      if (pq.size() >= 128)
         return;
-      for (const auto& b : busy)
-        if (b == key)
-          return;
       for (const auto& q : pq)
-        if (q.key == key)
-          return;
-      busy.push_back(key);
+        if (q.st == st)
+          return; // this HANDLE is already queued
       pq.push_back({st, entry, key});
     }
     pcv.notify_one();
@@ -1130,12 +1148,6 @@ struct Prefetcher::Impl {
       } catch (...) {
         UCACHE_WARN("prefetch: reading a basket map at open failed");
       }
-      {
-        std::lock_guard<std::mutex> g(pmu);
-        auto it = std::find(busy.begin(), busy.end(), j.key);
-        if (it != busy.end())
-          busy.erase(it);
-      }
     }
   }
 
@@ -1145,6 +1157,28 @@ struct Prefetcher::Impl {
     Shard* shard = shardFor(j.st.get());
     if (shared.isNoTable(j.key))
       return;
+    // A reader opens the same file more than once, so two handles reach here
+    // for one map. Wait for whichever thread is parsing it rather than give
+    // up: giving up cost the second handle its prediction AND left it to
+    // parse the file again from its own fill.
+    {
+      std::unique_lock<std::mutex> lk(pmu);
+      bcv.wait(lk, [&] { return std::find(busy.begin(), busy.end(), j.key) == busy.end(); });
+      busy.push_back(j.key);
+    }
+    struct Done {
+      Impl* self;
+      const std::string& key;
+      ~Done() {
+        {
+          std::lock_guard<std::mutex> g(self->pmu);
+          auto it = std::find(self->busy.begin(), self->busy.end(), key);
+          if (it != self->busy.end())
+            self->busy.erase(it);
+        }
+        self->bcv.notify_all();
+      }
+    } done{this, j.key};
     if (shared.lookupTable(j.key)) {
       // Parsed for an earlier handle on this file: nothing to read, the
       // handle just needs the map so its first fill is predicted like the
@@ -1176,7 +1210,7 @@ struct Prefetcher::Impl {
         HandleState* st;
         ~Held() { st->releaseInner(); }
       } held{j.st.get()};
-      OriginSource src(e, f, st, staged);
+      OriginSource src(e, f, st, staged, &j.st->closing);
       fm = parseTree(src, static_cast<int64_t>(e.fileSize()));
       readFailed = src.failed;
     }

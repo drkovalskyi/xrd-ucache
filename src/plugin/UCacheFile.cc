@@ -576,6 +576,11 @@ static XrdCl::XRootDStatus relayToInner(const std::shared_ptr<HandleState>& st,
   return st->missError(); // the origin's own error when the lazy open failed
 }
 
+void HandleState::waitInnerIdle(std::chrono::milliseconds max) {
+  std::unique_lock<std::mutex> lk(mu);
+  innerCv.wait_for(lk, max, [this] { return innerOps == 0; });
+}
+
 void HandleState::shutdownInner() {
   std::unique_ptr<XrdCl::File> dead;
   {
@@ -1587,6 +1592,7 @@ void queueRecompress(const std::string& url, const Config& cfg) {
 }
 
 XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeout timeout) {
+  st_->closing.store(true, std::memory_order_release); // stop a priming parse now
   // Wait for queued page persists before flushing meta, so the cache is
   // complete on disk when the process (which may exit right after Close)
   // goes away. This blocks Close, never a read (§5.2 step 4).
@@ -1622,6 +1628,13 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
     std::string url = st_->url;
     Executor::instance().post([url] { queueRecompress(url, globalConfig()); });
   }
+  // Read-ahead's own requests -- a speculative vector read, or the priming
+  // parse -- may still be on the origin. XrdCl answers a Close with requests
+  // in flight errInvalidOp, and the application then reports a failed close
+  // of a file it read perfectly well. onClose above has already stopped new
+  // ones being issued for this handle, so this is a bounded wait for what
+  // was already sent.
+  st_->waitInnerIdle(std::chrono::seconds(10));
   // A trusted cache-only handle that never hit a miss never opened the origin;
   // there is nothing to close remotely (UCACHE_REVALIDATE_S).
   if (!st_->inner->IsOpen()) {
