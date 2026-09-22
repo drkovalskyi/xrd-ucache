@@ -11,6 +11,10 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+## v1.2.0 — 2026-09-22
+- Added `prefetch`: read-ahead for TTree reads, so a first pass waits less on
+  the origin; off by default, on with `prefetch = on`.
+
 ### v1.1.1 — 2026-09-16
 - Multi-process readers such as coffea now fill the cache and appear in
   `ucache summary` and `ucache history` the same way a single process does.
