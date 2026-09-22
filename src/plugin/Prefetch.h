@@ -45,10 +45,13 @@
 // reading its own stage -- the basket-map parse, through readCached with
 // accounting off -- does not count as demand and does not promote a page.
 //
-// Thread-safety: onFill/onClose copy what they need and post to the
-// prefetcher's own thread, which owns every table and every handle's state;
-// wire completions run on XrdCl threads and touch only the entry (itself
-// thread-safe) and atomics. Nothing here runs on the hit-serving executor.
+// Thread-safety: onFill/onClose copy what they need and post to one of
+// `prefetch_threads` prediction threads, chosen by handle, so a handle's
+// state belongs to exactly one of them for its life and needs no lock. What
+// they share -- the switches, the byte counters and the cache of parsed
+// basket maps -- is either atomic or under one mutex. Wire completions run on
+// XrdCl threads and touch only the entry (itself thread-safe) and atomics.
+// Nothing here runs on the hit-serving executor.
 #pragma once
 
 #include <XrdCl/XrdClXRootDResponses.hh>

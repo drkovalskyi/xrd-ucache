@@ -1986,7 +1986,10 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
       return;
     }
   }
-  if (st->store && !missIdx.empty() && missIdx.size() != chunks.size())
+  // Guarded like noteVectorRequest and onFill above, and for the same reason:
+  // a request that parked and came back is the SAME request. Without this it
+  // was counted once per pass.
+  if (mayPark && st->store && !missIdx.empty() && missIdx.size() != chunks.size())
     st->store->stats().readvMixed.fetch_add(1,
                                              std::memory_order_relaxed); // serial hit+wire shape
 
@@ -2034,7 +2037,8 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
         std::sort(misses.begin(), misses.end());
         issueMissVRead(st, entry, std::move(userChunks), std::move(misses), handler);
       });
-  return;}
+  return;
+}
 
 XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer,
                                            ResponseHandler* handler, ucache::XrdTimeout timeout) {
@@ -2084,7 +2088,6 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
   servePlainVectorRead(st_, entry, chunks, handler, /*mayPark=*/true);
   return XRootDStatus();
 }
-
 
 void UCacheFile::invalidateOnWrite() {
   std::shared_ptr<FileEntry> e;

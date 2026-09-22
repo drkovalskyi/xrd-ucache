@@ -135,7 +135,7 @@ struct HandleState {
   // finish. Close must do this: XrdCl refuses to close a file with requests
   // in flight, and read-ahead's are not the application's to lose a close
   // over. Bounded, because a hung origin request must not hang a close.
-  void waitInnerIdle(std::chrono::milliseconds max); // plugin dtor: invalidate + drain + destroy the file
+  void waitInnerIdle(std::chrono::milliseconds max);
   // Destroy the terminally-failed inner file and install a fresh one; returns
   // the new raw pointer. Retry only; precondition innerOps==0.
   XrdCl::File* resetInner();

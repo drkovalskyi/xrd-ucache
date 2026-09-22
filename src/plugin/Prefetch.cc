@@ -175,7 +175,6 @@ namespace {
 struct Shared {
   std::atomic<bool> confirmed{false};
   std::atomic<bool> disabled{false};
-  std::atomic<bool> mapsWork{false}; // one basket map has parsed: priming may start
   std::atomic<uint64_t> issued{0};   // speculative bytes the client accepted
   std::atomic<uint64_t> inflight{0}; // bytes on the wire, not yet staged: RAM the cap must see
 
@@ -202,7 +201,6 @@ struct Shared {
       if (kv.first == key)
         return; // two threads parsed the same file; keep the one already here
     tables.emplace_front(key, std::move(t));
-    mapsWork.store(true, std::memory_order_relaxed);
     // Trimmed by BYTES as well as by count: one 1500-branch file's map is
     // about 21 MB, so eight of them is 170 MB held for the life of the
     // process, outside every configured cap and reported nowhere.
@@ -239,10 +237,6 @@ struct Shared {
     std::lock_guard<std::mutex> g(mu);
     uint64_t& m = shareByName[name];
     m = std::max(m, bytes);
-  }
-  bool anyShare() {
-    std::lock_guard<std::mutex> g(mu);
-    return !shareByName.empty();
   }
 };
 
@@ -420,8 +414,9 @@ struct Shard {
 
   // The file's basket table: from the process's cache of recently parsed
   // files, else parsed now from the bytes the reader already fetched into
-  // this entry. (Priming parses the same map earlier, from the origin, on its
-  // own threads; both put the result in the same place.)
+  // this entry. Two shards can parse the same file at once -- the two handles
+  // a reader opens per file usually land on different ones -- and the loser's
+  // copy is discarded; the cache makes that rare rather than impossible.
   std::shared_ptr<BasketTable> tableFor(const Job& j) {
     const std::string& key = j.entry->key().key;
     if (auto t = sh_->lookupTable(key))
