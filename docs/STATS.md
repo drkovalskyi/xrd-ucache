@@ -194,7 +194,7 @@ reading was re-reading, and what the cache disk was asked to do.
   to drain synchronously at the buffer cap, and the wall time lost;
   `fetches_joined` — misses that joined an identical in-flight fetch instead
   of fetching again.
-- Read-ahead (`prefetch`, on by default; the plugin predicts a TTree reader's
+- Read-ahead (`prefetch`, OFF by default; when switched on the plugin predicts a TTree reader's
   next fill from the file's own basket map and fetches it while the reader
   computes, into RAM only): `prefetch_issued_bytes` — asked of the origin ahead
   of demand; `prefetch_served_bytes` — of those, bytes the reader then

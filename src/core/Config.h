@@ -70,16 +70,23 @@ struct Config {
   // (lost cleanly; publish stays flush-then-bitmap).
   int fillBufferMb = 48;                  // UCACHE_FILL_BUFFER_MB, per entry
   int fillBufferTotalMb = 1024;           // UCACHE_FILL_BUFFER_TOTAL_MB, process-wide
-  // Read-ahead for TTree readers (`prefetch`, UCACHE_PREFETCH; on by default):
-  // the next fill is predicted from the file's own basket map and fetched
-  // while the reader computes, into RAM only -- a prefetched page reaches the
-  // cache only once the reader has demanded it. The window is one fill's
-  // worth per branch, capped per handle; the process-wide cap on staged
+  // Read-ahead for TTree readers (`prefetch`, UCACHE_PREFETCH; OFF by
+  // default): the next fill is predicted from the file's own basket map and
+  // fetched while the reader computes, into RAM only -- a prefetched page
+  // reaches the cache only once the reader has demanded it. The window is one
+  // fill's worth per branch, capped per handle; the process-wide cap on staged
   // speculative bytes shrinks the window under pressure. Safety is built in:
   // nothing is fetched until a prediction has been confirmed against a real
   // fill, and a process that finds a quarter of what it read ahead never used
   // switches itself off.
-  bool prefetch = true;                   // UCACHE_PREFETCH
+  //
+  // OFF because what it returns is worth having but narrow, and it is not
+  // free: it is a cold-pass effect (a warm pass has nothing to hide), it is
+  // measured at 1.21x on one dataset, one origin and one thread count, it
+  // costs about 1% more origin traffic, and it is the newest and largest
+  // moving part in the plugin. A user who wants it turns it on; nobody gets
+  // it by surprise.
+  bool prefetch = false;                  // UCACHE_PREFETCH
   int prefetchWindowMb = 32;              // UCACHE_PREFETCH_WINDOW_MB, per handle
   // Staged speculative bytes plus bytes on the wire, process-wide. It bounds
   // read-ahead's whole RAM footprint, and with 32 readers each holding

@@ -576,9 +576,9 @@ Every field, and the JSON schema tooling reads, is in [Metrics](STATS.md).
 
 ## How it works (briefly)
 
-**Read-ahead (on by default).** A ROOT reader fetches a batch of baskets, works
-on it, then fetches the next; on a cold pass it waits for the origin every
-time. uCache reads the tree's own metadata — where every basket of every
+**Read-ahead (off by default; `ucache set prefetch on`).** A ROOT reader
+fetches a batch of baskets, works on it, then fetches the next; on a cold pass
+it waits for the origin every time. uCache reads the tree's own metadata — where every basket of every
 branch is and which entry it starts at — identifies the branches your job
 uses from what it asks for, and fetches the next stretch while your code is
 still computing on the current one. The prediction is checked before anything
@@ -589,9 +589,22 @@ page fetched ahead reaches the cache only once your job has actually asked
 for it; anything never asked for is dropped from RAM. Read-ahead never opens a
 connection of its own: if your job is being served entirely from the cache, it
 stays that way. Readers that fetch once per file open (one task per chunk)
-never confirm a prediction, so they cost no origin traffic. `UCACHE_PREFETCH=off`
-turns it off for a job; the `prefetch_*` counters in `ucache stats` show what
+never confirm a prediction, so they cost no origin traffic. `UCACHE_PREFETCH=on`
+turns it on for one job; the `prefetch_*` counters in `ucache stats` show what
 it did.
+
+**When it is worth switching on.** It returns time your job spends waiting for
+the origin, so it helps exactly where that wait is a large share of the run
+and nowhere else. On the workload it is best measured on — a full analysis
+over 1453 TTree files from a CERN-LAN origin at 32 threads, first pass — it
+reads **about 1.2x faster for roughly 1% more origin traffic**. On a warm pass
+it does nothing by design. It is largest when the time your job spends
+fetching and the time it spends decompressing are about equal, and it falls
+away in both directions: on a much slower origin you are bandwidth-bound and
+the cache itself is what helps, and on a much faster one there was little wait
+to remove. It is off by default because that gain is real but narrow, and
+nobody should acquire a new moving part in their read path without choosing
+it.
 
 - **Page cache, not file cache.** uCache stores the 4 KiB pages your analysis
   actually reads (typically a small fraction of each file), each protected by a
@@ -636,7 +649,7 @@ overriding your defaults. Common keys:
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
 | `trace_sample = 64` | `UCACHE_TRACE_SAMPLE` | record every Nth read-class trace op (`1` = everything; opens/flushes are always recorded) |
-| `prefetch = on`     | `UCACHE_PREFETCH`       | read ahead for TTree readers: the next batch of baskets is predicted from the file's own metadata and fetched while your code computes (default on; see below). `off` = fetch only what is asked for |
+| `prefetch = off`    | `UCACHE_PREFETCH`       | read ahead for TTree readers: the next batch of baskets is predicted from the file's own metadata and fetched while your code computes (default **off**; see below). `on` = try to stay a batch ahead of your code |
 | `prefetch_window_mb = 32` | `UCACHE_PREFETCH_WINDOW_MB` | how far ahead one file handle may read (one fill's worth per branch, up to this) |
 | `prefetch_ram_mb = 1024` | `UCACHE_PREFETCH_RAM_MB` | RAM the whole process may hold in read-ahead pages not yet asked for, counting both what has arrived and what is on the wire; the window shrinks as it is approached and reaches zero at the limit. With many reader threads this, not the window, is what sizes how far ahead each one gets |
 | `prefetch_depth = 1` | `UCACHE_PREFETCH_DEPTH` | how many batches ahead to keep fetching. Measured and left at one: a second batch queued behind the first does not arrive any sooner (an origin answers one open file's requests one at a time) and guessing further ahead is less accurate, so on a full pass depth 2 fetched 6.6% more and read 6% slower. Raise it only for an origin that overlaps one file's requests |

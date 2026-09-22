@@ -11,7 +11,7 @@
 // been drawing per fill. Nothing is guessed except that the reader continues
 // where it left off.
 //
-// Safe by construction, and on by default:
+// Off by default, and safe by construction when switched on:
 //   * SHADOW before fetch. A handle predicts, fetches nothing, and compares the
 //     prediction with the next fill; the process fetches only once a
 //     prediction has covered >= 90% of a fill. A reader whose handles issue one
