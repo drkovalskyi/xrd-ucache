@@ -47,7 +47,6 @@ struct Stats {
   std::atomic<uint64_t> prefetchDroppedUnread{0};  // speculative pages dropped never used
   std::atomic<uint64_t> prefetchLateBytes{0};      // arrived after the demand read had them
   std::atomic<uint64_t> prefetchParses{0};         // basket tables parsed
-  std::atomic<uint64_t> prefetchPrimedFiles{0};    // files whose map was read at open, before the reader asked
   std::atomic<uint64_t> prefetchBridgeBytes{0};    // padding fetched to join elements; never staged, never cached
   std::atomic<uint64_t> prefetchDisabled{0};       // 1 once this process switched itself off
   std::atomic<uint64_t> prefetchFetchErrors{0};    // read-ahead wire reads that failed (dropped, no breaker)
@@ -181,7 +180,7 @@ struct StatsTotals {
   int files = 0;
   uint64_t prefetchIssuedBytes = 0, prefetchServedBytes = 0, prefetchRefetchedBytes = 0,
            prefetchDroppedUnread = 0, prefetchLateBytes = 0, prefetchParses = 0,
-           prefetchPrimedFiles = 0, prefetchBridgeBytes = 0, prefetchDisabled = 0,
+           prefetchBridgeBytes = 0, prefetchDisabled = 0,
            prefetchFetchErrors = 0;
   uint64_t opens = 0, validationsFailed = 0, hitBytes = 0, missBytes = 0, originBytes = 0,
            servedBytes = 0, originReads = 0, fetchesJoined = 0, originReadvs = 0, pageWrites = 0, crcFailures = 0,

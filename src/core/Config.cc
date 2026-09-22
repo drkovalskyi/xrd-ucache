@@ -174,10 +174,6 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.prefetchThreads = ::atoi(v.c_str());
   else if (k == "prefetch_map_cache_mb")
     c.prefetchMapCacheMb = ::atoi(v.c_str());
-  else if (k == "prefetch_prime")
-    c.prefetchPrime = !falsy(v);
-  else if (k == "prefetch_prime_first_fill")
-    c.prefetchPrimeFirstFill = !falsy(v);
   else if (k == "revalidate_seconds")
     c.revalidateSeconds = ::atoi(v.c_str());
   else if (k == "open_retries")
@@ -370,8 +366,6 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"prefetch_bridge_kb", "UCACHE_PREFETCH_BRIDGE_KB"},
       {"prefetch_threads", "UCACHE_PREFETCH_THREADS"},
       {"prefetch_map_cache_mb", "UCACHE_PREFETCH_MAP_CACHE_MB"},
-      {"prefetch_prime", "UCACHE_PREFETCH_PRIME"},
-      {"prefetch_prime_first_fill", "UCACHE_PREFETCH_PRIME_FIRST_FILL"},
       {"revalidate_seconds", "UCACHE_REVALIDATE_S"},
       {"open_retries", "UCACHE_OPEN_RETRIES"},
       {"open_retry_base_ms", "UCACHE_OPEN_RETRY_BASE_MS"},
@@ -467,10 +461,6 @@ std::string Config::valueOf(const std::string& key) const {
     return std::to_string(prefetchThreads);
   if (key == "prefetch_map_cache_mb")
     return std::to_string(prefetchMapCacheMb);
-  if (key == "prefetch_prime")
-    return onoff(prefetchPrime);
-  if (key == "prefetch_prime_first_fill")
-    return onoff(prefetchPrimeFirstFill);
   if (key == "meta_flush_seconds")
     return std::to_string(metaFlushSeconds);
   if (key == "revalidate_seconds")

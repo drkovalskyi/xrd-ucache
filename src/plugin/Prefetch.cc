@@ -39,8 +39,6 @@ constexpr uint32_t kBarrenFills = 4;       // fills matching no basket before a 
 // 1500-branch map is about 21 MB, so a 64 MB ceiling held three of them and
 // thirty-two readers evicted a map between parsing it and using it.
 constexpr size_t kNoTableMemo = 64;        // files remembered as having no basket map for us
-constexpr uint64_t kPrimeCapBytes = 32ull << 20; // most a priming parse may fetch for one file
-constexpr uint64_t kPrimeReadMax = 16ull << 20;  // ... and in one read of it
 constexpr int kMaxShards = 16;             // prediction worker threads, however many are configured
 
 // The basket map of one file, compacted from the parser's FileMeta: per-branch
@@ -131,62 +129,6 @@ struct EntrySource : transpose::Source {
   }
 };
 
-// The same source, but able to FETCH what the reader has not read yet: used
-// once per file at open, to read the basket map before the reader's own
-// metadata reads ask for it. Every byte it brings in is staged speculatively,
-// so those reads are then served from RAM, and it is bounded twice -- one read
-// and the whole parse -- because a hostile or unfamiliar layout must not be
-// able to turn a parse into a download.
-struct OriginSource : transpose::Source {
-  FileEntry& e;
-  XrdCl::File* f;
-  Stats* stats;
-  std::vector<std::pair<uint64_t, uint64_t>>& staged;
-  const std::atomic<bool>* gone; // the handle closed: stop, mid-parse
-  uint64_t fetched = 0;
-  bool failed = false;
-
-  OriginSource(FileEntry& entry, XrdCl::File* file, Stats* st,
-               std::vector<std::pair<uint64_t, uint64_t>>& out,
-               const std::atomic<bool>* closed)
-      : e(entry), f(file), stats(st), staged(out), gone(closed) {}
-
-  bool has(uint64_t off, uint64_t n) override {
-    return n != 0 && off + n >= off && off + n <= e.fileSize();
-  }
-  bool read(void* dst, uint64_t n, uint64_t off) override {
-    if (e.readCached(off, n, dst, /*account=*/false))
-      return true;
-    if (failed || !has(off, n))
-      return false;
-    if (gone && gone->load(std::memory_order_acquire)) {
-      // A reader that opens a file only to look at it closes it at once, and
-      // every further read of ours would be one its Close has to wait for.
-      failed = true;
-      return false;
-    }
-    const auto [s, en] = roundSpan(e.pageSize(), e.fileSize(), off, n);
-    if (en <= s || en - s > kPrimeReadMax || fetched + (en - s) > kPrimeCapBytes) {
-      failed = true;
-      return false;
-    }
-    std::vector<char> buf(en - s);
-    uint32_t got = 0;
-    if (!f->Read(s, static_cast<uint32_t>(en - s), buf.data(), got).IsOK() || got == 0) {
-      failed = true;
-      return false;
-    }
-    fetched += got;
-    if (stats) {
-      stats->originBytes.fetch_add(got, std::memory_order_relaxed);
-      stats->originReads.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (e.stageSpeculative(s, got, buf.data()))
-      staged.emplace_back(s, got);
-    return e.readCached(off, n, dst, /*account=*/false);
-  }
-};
-
 // The tree a reader of this file would be reading: NanoAOD's by name, else
 // the first TTree the keys list names.
 transpose::FileMeta parseTree(transpose::Source& src, int64_t size) {
@@ -220,11 +162,6 @@ struct PrefetchHandle {
     uint64_t off, len; // the basket's byte range (page rounding is FileEntry's)
   };
   std::vector<Issued> issued;    // speculative baskets not yet judged served or passed over
-  // Metadata pages a priming parse staged for this file. The reader demands
-  // almost all of them (they are what it reads before its first event), and
-  // whatever it does not is dropped and counted at close like any other
-  // speculative page.
-  std::vector<std::pair<uint64_t, uint64_t>> primed;
   std::atomic<bool> closed{false};
 };
 
@@ -332,10 +269,6 @@ struct Shard {
     std::shared_ptr<FileEntry> entry;
     std::vector<std::pair<uint64_t, uint32_t>> chunks;
     bool close = false;
-    bool primed = false; // the map has been read at open: set the state up and predict
-    // Metadata pages a priming parse staged, handed over so that whatever the
-    // reader does not demand is dropped and counted like any other.
-    std::vector<std::pair<uint64_t, uint64_t>> staged;
     Sync* sync = nullptr;
   };
   std::mutex qmu_;
@@ -369,17 +302,8 @@ struct Shard {
         else
           order_.push_back(k);
         pending_.emplace(k, std::move(j));
-      } else if (j.primed) {
-        // Something newer is already queued for this handle -- a fill, or its
-        // close. Either knows more than the prime does, so the prime is
-        // dropped; its staged ranges are not, or nothing would ever drop the
-        // metadata pages it left behind.
-        for (auto& r : j.staged)
-          it->second.staged.push_back(r);
       } else if (j.close) {
         superseded = std::move(it->second); // a close supersedes any fill still queued
-        for (auto& r : superseded.staged)
-          j.staged.push_back(r);
         // ... but if what it supersedes is ANOTHER close, that close has a
         // thread waiting on it. Dropping the job would leave it waiting for a
         // completion that can never come: a permanent hang of an application
@@ -390,8 +314,6 @@ struct Shard {
         order_.push_front(k);
       } else if (!it->second.close) {
         superseded = std::move(it->second); // a newer fill supersedes an older one
-        for (auto& r : superseded.staged)
-          j.staged.push_back(r);
         it->second = std::move(j);
       }
     }
@@ -402,17 +324,6 @@ struct Shard {
       orphaned->cv.notify_all();
     }
     qcv_.notify_one();
-  }
-
-  void postPrimed(const std::shared_ptr<HandleState>& st,
-                  const std::shared_ptr<FileEntry>& entry,
-                  std::vector<std::pair<uint64_t, uint64_t>> staged) {
-    Job j;
-    j.st = st;
-    j.entry = entry;
-    j.primed = true;
-    j.staged = std::move(staged);
-    post(std::move(j));
   }
 
   void loop() {
@@ -433,8 +344,6 @@ struct Shard {
         try {
           if (job.close)
             handleClose(job);
-          else if (job.primed)
-            handlePrimed(job);
           else
             handleFill(job);
         } catch (const std::exception& e) {
@@ -483,12 +392,9 @@ struct Shard {
         continue;
       }
       PrefetchHandle& h = *it->second;
-      if (auto e = h.entry.lock()) {
+      if (auto e = h.entry.lock())
         for (const auto& i : h.issued)
           e->dropSpeculative(i.off, i.len);
-        for (const auto& r : h.primed)
-          e->dropSpeculative(r.first, r.second);
-      }
       it = handles_.erase(it);
     }
   }
@@ -547,29 +453,15 @@ struct Shard {
 
   void handleClose(const Job& j) {
     auto hp = existing(j);
-    if (!hp) {
-      // No state, but a prime may still have handed its pages to this job.
-      if (j.entry)
-        for (const auto& r : j.staged)
-          j.entry->dropSpeculative(r.first, r.second);
+    if (!hp)
       return;
-    }
     PrefetchHandle& h = *hp;
     h.closed.store(true, std::memory_order_release);
-    if (j.entry) {
+    if (j.entry)
       for (const auto& i : h.issued)
         j.entry->dropSpeculative(i.off, i.len);
-      // The metadata a priming parse staged: what the reader demanded is
-      // already unmarked, so this drops only what it never looked at.
-      for (const auto& r : h.primed)
-        j.entry->dropSpeculative(r.first, r.second);
-      for (const auto& r : j.staged)
-        j.entry->dropSpeculative(r.first, r.second);
-    }
     h.issued.clear();
     h.issued.shrink_to_fit();
-    h.primed.clear();
-    h.primed.shrink_to_fit();
     h.shadow.clear();
     h.shadow.shrink_to_fit();
     h.frontier.clear();
@@ -580,38 +472,6 @@ struct Shard {
     // or one still queued when it happened -- create fresh state whose
     // `closed` was false, which is why the guard in handleFill could never
     // fire. Completions still in flight hold their own reference to it.
-  }
-
-  // A priming thread has read this file's basket map (or found there is
-  // none) and staged the metadata it touched. Set the handle up from it and
-  // predict the FIRST fill, which is the one no previous fill could.
-  void handlePrimed(const Job& j) {
-    const Config& cfg = globalConfig();
-    auto hp = handle(j);
-    PrefetchHandle& h = *hp;
-    if (h.closed.load()) {
-      for (const auto& r : j.staged)
-        j.entry->dropSpeculative(r.first, r.second);
-      return;
-    }
-    h.entry = j.entry;
-    for (const auto& r : j.staged)
-      h.primed.push_back(r);
-    if (!cfg.prefetch || sh_->disabled.load() || cfg.fillBufferMb <= 0)
-      return;
-    if (h.table || h.noTable)
-      return; // a fill of this handle got there first and owns the state
-    auto t = sh_->lookupTable(j.entry->key().key);
-    if (!t)
-      return; // no map for this file; the fill path will not retry it either
-    h.table = t;
-    h.frontier.assign(t->nb.size(), -1);
-    h.share.assign(t->nb.size(), 0);
-    // Having the map early is worth it on its own: the handle's first fill
-    // can predict its second, instead of waiting a fill for the parse.
-    // Predicting the FIRST fill needs the handle to start at entry zero.
-    if (cfg.prefetchPrimeFirstFill)
-      predictAndIssue(j, hp);
   }
 
   void handleFill(const Job& j) {
@@ -630,11 +490,6 @@ struct Shard {
     if (h.closed.load())
       return;
     h.entry = j.entry;
-    // A prime for this handle was superseded by this fill, and its staged
-    // metadata pages came with it. Record them here or nothing ever drops
-    // what the reader does not demand.
-    for (const auto& r : j.staged)
-      h.primed.push_back(r);
     ++h.fills;
     if (!h.table && !h.noTable) {
       // The parse waits for a handle's second fill while nothing in the
@@ -1075,166 +930,19 @@ struct Shard {
 
 } // namespace
 
-// The prediction threads and the priming threads, plus the state they share.
-//
-// PRIMING is the answer to the one fill per file that no prediction can
-// cover: the first. The map that says where the next baskets are lives in the
-// file, and read-ahead used to wait for the reader to fetch it, which is the
-// same round trip the reader is about to wait for. Here a priming thread
-// reads the map from the origin as soon as the file is open, stages every
-// byte it touches (so the reader's own metadata reads are then served from
-// RAM), and hands the parsed map to the handle's shard, which predicts fill
-// one from the branch set an earlier file taught. It does nothing until
-// read-ahead has confirmed on some file and parsed some map, so a process
-// that reads no TTree, or reads each file once, never primes anything.
+// The prediction threads and the state they share.
 struct Prefetcher::Impl {
   Shared shared;
   std::vector<Shard*> shards; // leaked with their threads, like the executor's
-  struct PrimeJob {
-    std::shared_ptr<HandleState> st;
-    std::shared_ptr<FileEntry> entry;
-    std::string key;
-  };
-  std::mutex pmu;
-  std::condition_variable pcv;
-  std::deque<PrimeJob> pq;
-  std::condition_variable bcv;   // a key stopped being parsed
-  std::vector<std::string> busy; // keys a priming thread is parsing, so two handles
-                                 // on the same file do not both parse it
 
   Impl() {
     const int n = std::max(1, std::min(kMaxShards, globalConfig().prefetchThreads));
     for (int i = 0; i < n; ++i)
       shards.push_back(new Shard(&shared));
-    // Only where priming is switched on: it is off by default, and two
-    // threads per process waiting on a queue nothing posts to is a cost with
-    // no reader.
-    if (globalConfig().prefetchPrime)
-      for (int i = 0, m = std::max(1, n / 2); i < m; ++i)
-        std::thread([this] { primeLoop(); }).detach();
   }
 
   Shard* shardFor(HandleState* st) const {
     return shards[std::hash<const void*>{}(st) % shards.size()];
-  }
-
-  void postPrime(const std::shared_ptr<HandleState>& st,
-                 const std::shared_ptr<FileEntry>& entry) {
-    const std::string key = entry->key().key;
-    {
-      std::lock_guard<std::mutex> g(pmu);
-      // A queue that outruns the threads draining it would keep handles alive
-      // long after their reader let go; past this depth the file simply is
-      // not primed, which costs one uncovered fill and nothing else.
-      if (pq.size() >= 128)
-        return;
-      for (const auto& q : pq)
-        if (q.st == st)
-          return; // this HANDLE is already queued
-      pq.push_back({st, entry, key});
-    }
-    pcv.notify_one();
-  }
-
-  void primeLoop() {
-    for (;;) {
-      PrimeJob j;
-      {
-        std::unique_lock<std::mutex> lk(pmu);
-        pcv.wait(lk, [&] { return !pq.empty(); });
-        j = std::move(pq.front());
-        pq.pop_front();
-      }
-      try {
-        prime(j);
-      } catch (const std::exception& e) {
-        UCACHE_WARN("prefetch: reading a basket map at open failed (%s)", e.what());
-      } catch (...) {
-        UCACHE_WARN("prefetch: reading a basket map at open failed");
-      }
-    }
-  }
-
-  void prime(PrimeJob& j) {
-    if (shared.disabled.load() || !shared.confirmed.load() || !shared.mapsWork.load())
-      return;
-    Shard* shard = shardFor(j.st.get());
-    if (shared.isNoTable(j.key))
-      return;
-    // A reader opens the same file more than once, so two handles reach here
-    // for one map. Wait for whichever thread is parsing it rather than give
-    // up: giving up cost the second handle its prediction AND left it to
-    // parse the file again from its own fill.
-    {
-      std::unique_lock<std::mutex> lk(pmu);
-      bcv.wait(lk, [&] { return std::find(busy.begin(), busy.end(), j.key) == busy.end(); });
-      busy.push_back(j.key);
-    }
-    struct Done {
-      Impl* self;
-      const std::string& key;
-      ~Done() {
-        {
-          std::lock_guard<std::mutex> g(self->pmu);
-          auto it = std::find(self->busy.begin(), self->busy.end(), key);
-          if (it != self->busy.end())
-            self->busy.erase(it);
-        }
-        self->bcv.notify_all();
-      }
-    } done{this, j.key};
-    if (shared.lookupTable(j.key)) {
-      // Parsed for an earlier handle on this file: nothing to read, the
-      // handle just needs the map so its first fill is predicted like the
-      // rest. Counted the same, because that is what the counter is for.
-      if (Stats* s = j.st->store ? &j.st->store->stats() : nullptr)
-        s->prefetchPrimedFiles.fetch_add(1, std::memory_order_relaxed);
-      shard->postPrimed(j.st, j.entry, {});
-      return;
-    }
-    FileEntry& e = *j.entry;
-    // Nothing to read ahead of: a fully cached file needs no origin and the
-    // parse would cost a quarter second for a prediction with no absent
-    // bytes in it. This is what makes a warm pass free.
-    if (e.fileSize() == 0 || e.hasRange(0, e.fileSize()))
-      return;
-    XrdCl::File* f = j.st->acquireInnerIfOpen();
-    if (!f)
-      return; // a trusted warm handle: its origin is not ours to open
-    std::vector<std::pair<uint64_t, uint64_t>> staged;
-    Stats* st = j.st->store ? &j.st->store->stats() : nullptr;
-    transpose::FileMeta fm;
-    bool readFailed = false;
-    {
-      // The parser throws on a hostile or unfamiliar layout. Giving the inner
-      // file back has to survive that: a handle whose in-flight count never
-      // returns to zero can never be closed, and the application thread that
-      // called Close would wait for it forever.
-      struct Held {
-        HandleState* st;
-        ~Held() { st->releaseInner(); }
-      } held{j.st.get()};
-      OriginSource src(e, f, st, staged, &j.st->closing);
-      fm = parseTree(src, static_cast<int64_t>(e.fileSize()));
-      readFailed = src.failed;
-    }
-    const bool src_failed = readFailed;
-    const bool ok = !src_failed && fm.error.empty() && !fm.branches.empty();
-    if (ok) {
-      if (st) {
-        st->prefetchParses.fetch_add(1, std::memory_order_relaxed);
-        st->prefetchPrimedFiles.fetch_add(1, std::memory_order_relaxed);
-      }
-      shared.insertTable(j.key, BasketTable::build(fm, static_cast<int64_t>(e.fileSize())));
-    } else if (!src_failed) {
-      // A real answer -- no TTree here -- rather than a read that did not
-      // come back. Only the former is worth remembering.
-      shared.rememberNoTable(j.key);
-    }
-    // Either way the handle takes the staged metadata, so what the reader
-    // does not demand is dropped and counted at its close like any other
-    // speculative page.
-    shard->postPrimed(j.st, j.entry, std::move(staged));
   }
 };
 
@@ -1242,19 +950,12 @@ Prefetcher::Prefetcher() : impl_(new Impl()) {}
 
 namespace {
 Prefetcher* gPrefetcher = nullptr;
-// Set once the prefetcher exists, so the OPEN path can ask whether there is
-// anything to prime for without constructing it -- a process that never reads
-// ahead must not start its threads.
-std::atomic<bool> gActive{false};
 } // namespace
-
-bool Prefetcher::active() { return gActive.load(std::memory_order_relaxed); }
 
 Prefetcher& Prefetcher::instance() {
   static Prefetcher* p = [] {
     auto* q = new Prefetcher(); // leaked on purpose: its thread outlives static teardown
     gPrefetcher = q;
-    gActive.store(true, std::memory_order_relaxed);
     // fork() copies the queue and its mutex but NOT the worker thread, so a
     // child that inherited an open handle would post a close and wait on a
     // thread that does not exist -- a permanent hang at file close, in
@@ -1299,27 +1000,6 @@ void Prefetcher::onFill(const std::shared_ptr<HandleState>& st,
   for (const auto& c : chunks)
     j.chunks.emplace_back(c.offset, c.length);
   impl_->shardFor(st.get())->post(std::move(j));
-}
-
-void Prefetcher::onOpen(const std::shared_ptr<HandleState>& st,
-                        const std::shared_ptr<FileEntry>& entry) {
-  if (!st || !entry)
-    return;
-  const Config& cfg = globalConfig();
-  if (!cfg.prefetch || !cfg.prefetchPrime || cfg.fillBufferMb <= 0)
-    return;
-  // Nothing to prime FROM until some file has confirmed the prediction and
-  // some map has parsed: without a branch set there is no first fill to
-  // guess, and a process reading no TTree would pay a parse per file for it.
-  if (impl_->shared.disabled.load(std::memory_order_relaxed) ||
-      !impl_->shared.confirmed.load(std::memory_order_relaxed) ||
-      !impl_->shared.mapsWork.load(std::memory_order_relaxed))
-    return;
-  // Marked here, on the caller's thread, for the same reason a fill marks it:
-  // onClose reads it to decide whether there is anything to wait for, and the
-  // pages a prime stages need that close to drop them.
-  st->prefetchSeen.store(true, std::memory_order_release);
-  impl_->postPrime(st, entry);
 }
 
 void Prefetcher::onClose(const std::shared_ptr<HandleState>& st,

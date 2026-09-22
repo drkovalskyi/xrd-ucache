@@ -111,20 +111,6 @@ struct Config {
   // a 1500-branch file is about 21 MB, and a map evicted between being parsed
   // and being used is parsed again.
   int prefetchMapCacheMb = 256;            // UCACHE_PREFETCH_MAP_CACHE_MB
-  // Read a file's basket map as soon as it is opened rather than at the
-  // reader's first fill. OFF, and measured to be worth nothing: the parse it
-  // brings forward was not late -- a map is already parsed at a handle's
-  // first fill once anything in the process has confirmed -- so all it can
-  // win is the difference between our metadata round trips and the reader's
-  // own, and both start at the same moment. Kept as a knob, and needs the
-  // branch set of an earlier file, so it does nothing until read-ahead has
-  // confirmed on one.
-  bool prefetchPrime = false;              // UCACHE_PREFETCH_PRIME
-  // ... and, having the map, also predict that file's FIRST fill. Only right
-  // if the handle starts at the beginning of the file; a reader that gives
-  // each handle its own entry range starts elsewhere and the prediction is
-  // thrown away -- 5.6 GB of it on one measured pass. Needs prefetch_prime.
-  bool prefetchPrimeFirstFill = true;      // UCACHE_PREFETCH_PRIME_FIRST_FILL
   // UCACHE_REVALIDATE_S: cache-freshness window (TTL). When a usable local
   // entry was last validated against the origin within this many seconds,
   // TRUST it — skip the remote Open+Stat and serve locally (the origin is

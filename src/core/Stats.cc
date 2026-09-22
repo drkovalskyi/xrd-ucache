@@ -79,7 +79,6 @@ std::string Stats::toJsonBody() const {
   f("prefetch_dropped_unread", prefetchDroppedUnread);
   f("prefetch_late_bytes", prefetchLateBytes);
   f("prefetch_parses", prefetchParses);
-  f("prefetch_primed_files", prefetchPrimedFiles);
   f("prefetch_bridge_bytes", prefetchBridgeBytes);
   f("prefetch_disabled", prefetchDisabled);
   f("prefetch_fetch_errors", prefetchFetchErrors);
@@ -174,7 +173,6 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.prefetchDroppedUnread += extractU64(last, "prefetch_dropped_unread");
     t.prefetchLateBytes += extractU64(last, "prefetch_late_bytes");
     t.prefetchParses += extractU64(last, "prefetch_parses");
-    t.prefetchPrimedFiles += extractU64(last, "prefetch_primed_files");
     t.prefetchBridgeBytes += extractU64(last, "prefetch_bridge_bytes");
     t.prefetchDisabled += extractU64(last, "prefetch_disabled");
     t.prefetchFetchErrors += extractU64(last, "prefetch_fetch_errors");

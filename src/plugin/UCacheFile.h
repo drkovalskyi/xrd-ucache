@@ -86,10 +86,6 @@ struct HandleState {
   std::mutex setupMu;                          // serializes lazy entry setup
   bool setupDone = false;                      // entry setup attempted (ok or not)
   bool closed = false;
-  // The same fact, readable without the lock: read-ahead's priming parse runs
-  // on its own thread and checks it between reads, so a handle the
-  // application has let go stops costing origin round trips at once.
-  std::atomic<bool> closing{false};
   int errors = 0; // consecutive cache-side errors (UCACHE_MAX_ERRORS trip)
   bool tripped = false;
 
