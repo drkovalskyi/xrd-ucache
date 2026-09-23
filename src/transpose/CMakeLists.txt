@@ -14,7 +14,8 @@ find_path(UCACHE_ZSTD_INC zstd.h)
 find_path(UCACHE_LZ4_INC lz4.h)
 
 if (UCACHE_LZMA AND UCACHE_ZLIB AND UCACHE_ZSTD AND UCACHE_LZMA_INC AND UCACHE_ZSTD_INC)
-  add_library(ucache-transpose STATIC TreeMeta.cc RNTupleMeta.cc RNTupleRewrite.cc Transposer.cc)
+  add_library(ucache-transpose STATIC TreeMeta.cc RNTupleMeta.cc RNTupleRewrite.cc Transposer.cc
+              FillLayout.cc)
   set_target_properties(ucache-transpose PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(ucache-transpose
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
@@ -39,6 +40,9 @@ if (UCACHE_LZMA AND UCACHE_ZLIB AND UCACHE_ZSTD AND UCACHE_LZMA_INC AND UCACHE_Z
 
   add_executable(ucache-rntuple-rewrite rntuple_rewrite.cc)
   target_link_libraries(ucache-rntuple-rewrite PRIVATE ucache-transpose)
+  # writes a TTree file in its cold-replica-run layout, for ROOT to check
+  add_executable(ucache-fill-layout fill_layout.cc)
+  target_link_libraries(ucache-fill-layout PRIVATE ucache-transpose)
 else()
   message(STATUS "ucache-transpose: SKIPPED (lzma/z/zstd incomplete)")
 endif()

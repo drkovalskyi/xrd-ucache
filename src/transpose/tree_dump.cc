@@ -38,8 +38,9 @@ int main(int argc, char** argv) {
               fm.treeKey.objlen, fm.treeKey.keylen);
   std::printf("\"tree\":{\"name\":");
   jstr(argc > 2 ? argv[2] : "Events");
-  std::printf(",\"entries\":%lld,\"autoflush\":%lld,\"cluster_range_end\":[",
-              static_cast<long long>(fm.entries), static_cast<long long>(fm.autoFlush));
+  std::printf(",\"zip_bytes\":%lld,\"entries\":%lld,\"autoflush\":%lld,\"cluster_range_end\":[",
+              static_cast<long long>(fm.zipBytes), static_cast<long long>(fm.entries),
+              static_cast<long long>(fm.autoFlush));
   for (size_t i = 0; i < fm.clusterRangeEnd.size(); ++i)
     std::printf(i ? ",%lld" : "%lld", static_cast<long long>(fm.clusterRangeEnd[i]));
   std::printf("],\"cluster_size\":[");
@@ -53,8 +54,9 @@ int main(int argc, char** argv) {
     first = false;
     std::printf("{\"name\":");
     jstr(b.name);
-    std::printf(",\"write_basket\":%d,\"max_baskets\":%u,\"basket_seek\":[",
-                b.writeBasket, b.maxBaskets);
+    std::printf(",\"compress\":%d,\"zip_bytes\":%lld,\"write_basket\":%d,\"max_baskets\":%u,"
+                "\"basket_seek\":[",
+                b.compress, static_cast<long long>(b.zipBytes), b.writeBasket, b.maxBaskets);
     for (size_t i = 0; i < b.basketSeek.size(); ++i)
       std::printf(i ? ",%lld" : "%lld", static_cast<long long>(b.basketSeek[i]));
     std::printf("],\"basket_bytes\":[");

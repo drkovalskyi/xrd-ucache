@@ -95,6 +95,19 @@ struct BranchInfo {
   // Blob offsets of the live array values (for the transcoder's patches).
   uint64_t seekArrayOff = 0;  // fBasketSeek[0] within the decompressed blob
   uint64_t bytesArrayOff = 0; // fBasketBytes[0]
+  // The branch's compression SETTING (algorithm * 100 + level; -1 inherits the
+  // file's). What each basket actually holds is in its own frame headers — a
+  // basket that did not shrink is stored raw whatever this says — so this
+  // decides what is worth converting, never how to decode.
+  int32_t compress = 0;
+  // fZipBytes: the sum of this branch's stored basket lengths. Readers derive
+  // sizes from it (uproot's step sizing, TTree::Print), so a layout that
+  // changes basket lengths patches it; the offset is into the decompressed blob.
+  int64_t zipBytes = 0;
+  uint64_t zipBytesOff = 0;
+  // fFileName is set: the baskets live in another file, so their seeks mean
+  // nothing in this one and nothing may relocate them.
+  bool externalFile = false;
 };
 
 struct FileMeta {
@@ -114,7 +127,14 @@ struct FileMeta {
   KeyInfo treeKey;                // the live (highest-cycle) tree key
   std::vector<uint8_t> treeBlob;  // decompressed tree metadata
   int64_t entries = 0;            // the tree's fEntries
-  int64_t autoFlush = 0;          // fAutoFlush (0 = not set)
+  int64_t autoFlush = 0;          // fAutoFlush (0 = not set; < 0 = bytes, > 0 = entries)
+  // Offsets into treeBlob of the tree-level fields ROOT sizes its read cache
+  // and estimates cluster lengths from (TTree::GetCacheAutoSize): a layout
+  // that makes baskets longer must scale them with it, or the reader's cache
+  // no longer holds a cluster and every fill splits.
+  uint64_t autoFlushOff = 0;
+  int64_t zipBytes = 0;           // the tree's fZipBytes
+  uint64_t zipBytesOff = 0;
   std::vector<int64_t> clusterRangeEnd; // fClusterRangeEnd[fNClusterRange]
   std::vector<int64_t> clusterSize;     // fClusterSize[fNClusterRange]
   std::vector<BranchInfo> branches;

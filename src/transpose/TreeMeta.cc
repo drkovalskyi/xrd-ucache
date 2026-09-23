@@ -348,6 +348,7 @@ bool parseBranch(Cur& c, FileMeta& fm,
   c.skip(4 * 4 + 8);         // fCompress..fWriteBasket (i4 x4), fEntryNumber (q)
   if (c.fail_)
     return false;
+  b.compress = beGet<int32_t>(c.p + c.at - 24);
   b.writeBasket = beGet<int32_t>(c.p + c.at - 12);
   c.skipObj("TIOFeatures");
   c.skip(4);                 // fOffset
@@ -355,6 +356,10 @@ bool parseBranch(Cur& c, FileMeta& fm,
   c.skip(4);                 // fSplitLevel
   b.entries = c.get<int64_t>();
   c.skip(8 * 3);             // fFirstEntry, fTotBytes, fZipBytes
+  if (c.fail_)
+    return false;
+  b.zipBytesOff = c.at - 8;
+  b.zipBytes = beGet<int64_t>(c.p + c.at - 8);
   if (!objArray(c, classRefs, "fBranches(sub)", [&](const AnyObj&) {
         c.fail_ = true;
         c.why = "sub-branches unsupported (flat trees only)";
@@ -409,6 +414,13 @@ bool parseBranch(Cur& c, FileMeta& fm,
   b.basketSeek.resize(nb);
   for (size_t i = 0; i < nb; ++i)
     b.basketSeek[i] = beGet<int64_t>(c.p + c.at + 8 * i);
+  { // fFileName: a TString right after the seek array, empty unless the
+    // branch's baskets were written to ANOTHER file. Its first byte is the
+    // length (255 escapes to a longer one), so non-zero means "set".
+    const size_t fn = c.at + 8ull * b.maxBaskets;
+    if (fn < end && fn < c.n)
+      b.externalFile = c.p[fn] != 0;
+  }
   c.at = end; // fFileName + any tail via the outer byte count
   fm.branches.push_back(std::move(b));
   return true;
@@ -663,9 +675,14 @@ bool parseTreeBlob(const uint8_t* blob, size_t n, uint16_t keylen, FileMeta& fm)
   c.skipObj("TAttFill");
   c.skipObj("TAttMarker");
   fm.entries = c.get<int64_t>();
+  if (c.need(16)) { // fTotBytes, then fZipBytes
+    fm.zipBytesOff = c.at + 8;
+    fm.zipBytes = beGet<int64_t>(c.p + c.at + 8);
+  }
   c.skip(4 * 8 + 8 + 4 * 4); // fTotBytes..fFlushedBytes (q x4), fWeight (d), 4x i4
   uint32_t nClusterRange = c.get<uint32_t>();
   c.skip(4 * 8);             // fMaxEntries, fMaxEntryLoop, fMaxVirtualSize, fAutoSave
+  fm.autoFlushOff = c.at;
   fm.autoFlush = c.get<int64_t>();
   c.skip(8);                 // fEstimate
   if (nClusterRange > (1u << 20))
