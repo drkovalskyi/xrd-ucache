@@ -381,6 +381,13 @@ void printStats(const StatsTotals& t) {
               human(t.relayBytes).c_str(), human(t.missBytes).c_str(),
               human(t.ramHitBytes).c_str(), human(diskB).c_str(),
               human(t.replicaBytesServed).c_str());
+  if (t.coldReplicaFiles)
+    std::printf("  cold replica run   %llu files, %s converted to %s (%llu baskets, %llu kept as "
+                "stored), %.1f s converting, %llu not published\n",
+                (unsigned long long)t.coldReplicaFiles, human(t.coldReplicaInBytes).c_str(),
+                human(t.coldReplicaOutBytes).c_str(), (unsigned long long)t.coldReplicaBaskets,
+                (unsigned long long)t.coldReplicaBasketsKept, static_cast<double>(t.coldReplicaConvertUs) / 1e6,
+                (unsigned long long)t.coldReplicaDeclined);
   if (t.schemaMixed)
     std::printf("  NOTE               stats files span a version where read counters changed\n"
                 "                     meaning (per page, now per coalesced run) — per-read\n"
@@ -1113,21 +1120,11 @@ static uint64_t estimatedReplicaBytes(uint64_t cachedBytes) {
 #endif
 
 // Free bytes above the eviction floor: what a pass may consume before LRU
-// starts evicting. `~0ull` (unlimited) when eviction is disabled or the volume
-// cannot be queried — absent a floor there is nothing to protect.
+// starts evicting. `~0ull` when eviction is disabled; 0 when free space is
+// unknowable -- a deferred build is retried, a storm is not. The rule lives in
+// CacheStore so the plugin's cold run applies the same one.
 static uint64_t headroomToFloor(const Config& cfg, IOBackend& io) {
-  // Ask the store for the floor rather than reading cfg.minFreeBytes: the
-  // automatic floor is resolved into the STORE's copy of the Config, so a
-  // caller holding the pre-resolution one reads 0 and would conclude there is
-  // nothing to protect — silently disabling every check gated on headroom.
-  const uint64_t floor = CacheStore::effectiveMinFree(cfg, io);
-  if (!floor)
-    return ~0ull; // eviction genuinely off: nothing to stay clear of
-  uint64_t avail = 0, total = 0;
-  if (io.spaceInfo(cfg.cacheDir, avail, total) != 0 || !total)
-    return 0; // eviction IS on but free space is unknowable: decline rather
-              // than gamble — a deferred build is retried, a storm is not.
-  return avail > floor ? avail - floor : 0;
+  return CacheStore::headroomToFloor(cfg, io);
 }
 // Does the cache hold ANY replica? `doctor` has no cache store by design (it
 // must report on a cacheDir that cannot be opened), and the question only needs

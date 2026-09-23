@@ -59,6 +59,13 @@ class CacheStore {
   // reading the field, and the answer is the same wherever it is asked from.
   // Returns 0 only when eviction is genuinely off. Pure: logs nothing.
   static uint64_t effectiveMinFree(const Config& cfg, IOBackend& io);
+  // Free space above the eviction floor: what can be written without making
+  // eviction run. ~0 when eviction is off; 0 when free space is unknowable
+  // (decline rather than gamble). Asks for the floor through
+  // effectiveMinFree, never cfg.minFreeBytes: the automatic floor is resolved
+  // into the store's own copy, and a caller reading the unresolved one would
+  // see 0 and conclude there is nothing to protect.
+  static uint64_t headroomToFloor(const Config& cfg, IOBackend& io);
 
   // Opens (or shares) the entry for `key`, validating against the origin
   // metadata. nullptr => caller fails open to pass-through.

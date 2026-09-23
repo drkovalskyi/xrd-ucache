@@ -106,6 +106,13 @@ std::string Stats::toJsonBody() const {
   f("hit_disk_bytes", hitDiskBytes);
   f("hit_disk_seq", hitDiskSeq);
   f("replica_bytes_served", replicaBytesServed);
+  f("cold_replica_files", coldReplicaFiles);
+  f("cold_replica_in_bytes", coldReplicaInBytes);
+  f("cold_replica_out_bytes", coldReplicaOutBytes);
+  f("cold_replica_baskets", coldReplicaBaskets);
+  f("cold_replica_baskets_kept", coldReplicaBasketsKept);
+  f("cold_replica_convert_us", coldReplicaConvertUs);
+  f("cold_replica_declined", coldReplicaDeclined);
   f("replica_reads", replicaReads);
   f("replica_read_bytes", replicaReadBytes);
   f("relay_bytes", relayBytes);
@@ -199,6 +206,13 @@ StatsTotals aggregateStats(const std::string& statsDir) {
     t.hitDiskBytes += extractU64(last, "hit_disk_bytes");
     t.hitDiskSeq += extractU64(last, "hit_disk_seq");
     t.replicaBytesServed += extractU64(last, "replica_bytes_served");
+    t.coldReplicaFiles += extractU64(last, "cold_replica_files");
+    t.coldReplicaInBytes += extractU64(last, "cold_replica_in_bytes");
+    t.coldReplicaOutBytes += extractU64(last, "cold_replica_out_bytes");
+    t.coldReplicaBaskets += extractU64(last, "cold_replica_baskets");
+    t.coldReplicaBasketsKept += extractU64(last, "cold_replica_baskets_kept");
+    t.coldReplicaConvertUs += extractU64(last, "cold_replica_convert_us");
+    t.coldReplicaDeclined += extractU64(last, "cold_replica_declined");
     t.replicaReads += extractU64(last, "replica_reads");
     // Per FILE, not per total: a file written before this counter existed can
     // only offer served bytes, and mixing the two bases silently divides new

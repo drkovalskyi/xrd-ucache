@@ -96,6 +96,7 @@ class ColdFill {
   tp::FillLayout L;
   std::vector<uint8_t> treeKeyHeader, keysList;
   std::vector<std::string> codecs;
+  bool keepOriginals = false;
   uint64_t originMtime = 0;
   uint8_t cksumKind = 0;
   uint32_t originCksum = 0;
@@ -315,6 +316,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   if (!src.read(cf->keysList.data(), cf->keysList.size(), static_cast<uint64_t>(cf->fm.keyslistSeek)))
     return nullptr;
   cf->codecs = cfg.recompressCodecs;
+  cf->keepOriginals = cfg.recompressKeepOriginals;
   cf->L = tp::layoutForFill(cf->fm, size, header, cf->treeKeyHeader, cf->keysList, cf->codecs,
                             kSlotFactor);
   if (!cf->L.error.empty()) {
@@ -337,6 +339,8 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->key = key;
   cf->cacheDir = cfg.cacheDir;
   cf->slots.reset(new ColdFill::Slot[cf->L.slots.size()]);
+  if (st->store)
+    st->store->stats().coldReplicaFiles.fetch_add(1, std::memory_order_relaxed);
   UCACHE_INFO("cold run for %s: %zu baskets of %zu branches in slots, virtual %llu bytes",
               key.key.c_str(), cf->L.slots.size(), cf->L.relocated.size(),
               static_cast<unsigned long long>(cf->L.virtualSize));
@@ -476,20 +480,33 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     c.kind = tp::ConvertedBasket::kOriginal;
     c.record.assign(rec, rec + recLen);
   }
-  cf.convertUs.fetch_add(nowUs() - t0, std::memory_order_relaxed);
+  const uint64_t us = nowUs() - t0;
+  cf.convertUs.fetch_add(us, std::memory_order_relaxed);
   cf.inBytes.fetch_add(recLen, std::memory_order_relaxed);
   cf.outBytes.fetch_add(c.record.size(), std::memory_order_relaxed);
   (c.kind == tp::ConvertedBasket::kZstd  ? cf.nZstd
    : c.kind == tp::ConvertedBasket::kRaw ? cf.nRaw
                                          : cf.nOrig)
       .fetch_add(1, std::memory_order_relaxed);
+  if (req->st->store) {
+    auto& stats = req->st->store->stats();
+    stats.coldReplicaConvertUs.fetch_add(us, std::memory_order_relaxed);
+    if (c.kind == tp::ConvertedBasket::kOriginal) {
+      stats.coldReplicaBasketsKept.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      stats.coldReplicaBaskets.fetch_add(1, std::memory_order_relaxed);
+      stats.coldReplicaInBytes.fetch_add(recLen, std::memory_order_relaxed);
+      stats.coldReplicaOutBytes.fetch_add(c.record.size(), std::memory_order_relaxed);
+    }
+  }
   if (!tp::patchKeySeek(c.record.data(), c.record.size(), slot.vSeek)) {
     req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
     req->done();
     return;
   }
-  if (c.kind == tp::ConvertedBasket::kOriginal) {
-    // Cannot be converted: the one kind of basket the byte cache keeps.
+  if (c.kind == tp::ConvertedBasket::kOriginal || cf.keepOriginals) {
+    // Cannot be converted: the one kind of basket the byte cache keeps --
+    // unless keeping every original was asked for, to compare the tiers.
     req->entry->writePages(rStart, rounded->size(), rounded->data());
     req->entry->flushMeta(false);
   }
@@ -793,6 +810,8 @@ void ColdFill::publish() {
       });
   if (!ov.error.empty()) {
     UCACHE_WARN("cold run for %s: replica not built (%s)", key.key.c_str(), ov.error.c_str());
+    if (auto store = globalStore())
+      store->stats().coldReplicaDeclined.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   ReplicaMeta meta = ov.meta;
@@ -802,6 +821,19 @@ void ColdFill::publish() {
   auto store = globalStore();
   if (!store)
     return;
+  // Never evict for a replica: the reader's working set was cached for a
+  // reason, and a replica written past the floor makes the next fill evict it.
+  const uint64_t head = CacheStore::headroomToFloor(store->config(), RealIO::instance());
+  if (ov.tdata.size() > head) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+      UCACHE_WARN("cold run for %s: replica not published, %llu bytes do not fit the %llu "
+                  "bytes above the free-space floor (further such files are not reported)",
+                  key.key.c_str(), static_cast<unsigned long long>(ov.tdata.size()),
+                  static_cast<unsigned long long>(head));
+    store->stats().coldReplicaDeclined.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   ReplicaStore rs(RealIO::instance(), store->config(), store->stats());
   // One publisher per file at a time, across processes: the entry's own data
   // file is the lock. The first complete publish wins; a later one would only
@@ -819,9 +851,11 @@ void ColdFill::publish() {
   if (exists)
     UCACHE_INFO("cold run for %s: a replica was published meanwhile; this one is dropped",
                 key.key.c_str());
-  else if (rc != 0)
+  else if (rc != 0) {
     UCACHE_WARN("cold run for %s: replica publish failed (%s)", key.key.c_str(),
                 std::strerror(-rc));
+    store->stats().coldReplicaDeclined.fetch_add(1, std::memory_order_relaxed);
+  }
   else
     UCACHE_INFO("cold run for %s: replica published, %zu baskets (%llu converted, %llu kept as "
                 "stored), %llu -> %llu bytes, %.1f s converting",

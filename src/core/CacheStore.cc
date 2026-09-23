@@ -97,6 +97,16 @@ CacheStore::CacheStore(IOBackend& io, Config cfg) : io_(io), cfg_(std::move(cfg)
   resolveBudget();
 }
 
+uint64_t CacheStore::headroomToFloor(const Config& cfg, IOBackend& io) {
+  const uint64_t floor = effectiveMinFree(cfg, io);
+  if (!floor)
+    return ~0ull; // eviction genuinely off: nothing to stay clear of
+  uint64_t avail = 0, total = 0;
+  if (io.spaceInfo(cfg.cacheDir, avail, total) != 0 || !total)
+    return 0;
+  return avail > floor ? avail - floor : 0;
+}
+
 uint64_t CacheStore::effectiveMinFree(const Config& cfg, IOBackend& io) {
   if (cfg.minFreeBytes)
     return cfg.minFreeBytes; // explicit, or already resolved

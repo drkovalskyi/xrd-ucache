@@ -156,6 +156,11 @@ struct Config {
   // calibration evidence is still collected, but no longer gates builds.
   // Serving already-built replicas is governed by `transpose`, not by these.
   bool recompress = false;                       // UCACHE_RECOMPRESS
+  // With recompress = on, a file's replica is created on its first pass and the
+  // original bytes of what was converted are NOT kept in the byte cache (the
+  // cache would otherwise hold the same data twice). `on` keeps them too, for
+  // comparing the two tiers on one cache.
+  bool recompressKeepOriginals = false;          // UCACHE_RECOMPRESS_KEEP_ORIGINALS
   std::vector<std::string> recompressCodecs{"lzma", "zlib"}; // UCACHE_RECOMPRESS_CODECS
   // `recompress_reclaim`: what to punch from the v1 byte cache once
   // a valid replica exists. kSuperseded (default) frees only the ranges the

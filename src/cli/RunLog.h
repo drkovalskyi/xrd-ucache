@@ -60,6 +60,7 @@ struct Run {
   uint64_t relayBytes = 0, originBytes = 0, originReads = 0, originReadvs = 0;
   uint64_t prefetchServedBytes = 0; // speculative pages the reader demanded (read-ahead)
   uint64_t prefetchIssuedBytes = 0; // ... and everything read ahead, used or not
+  uint64_t coldReplicaInBytes = 0;  // original bytes converted on a cold replica run
   uint64_t hitDiskReads = 0, hitDiskBytes = 0, replicaReads = 0, replicaReadBytes = 0;
   uint64_t crcFailures = 0, replicaCrcFailures = 0, replicaInvalid = 0;
   uint64_t failopenEvents = 0, metaCorrupt = 0, validationsFailed = 0;
@@ -153,8 +154,15 @@ struct Run {
   static constexpr double kMinOriginShare = 0.95;
   bool baselineQualified() const {
     return originShare() >= kMinOriginShare && servedLessThanFetched() && overheadKnown() &&
-           overhead() <= kMaxOverhead && prefetchIssuedBytes == 0 && prefetchServedBytes == 0;
+           overhead() <= kMaxOverhead && prefetchIssuedBytes == 0 && prefetchServedBytes == 0 &&
+           coldReplicaInBytes == 0;
   }
+  // A run that CONVERTED baskets into replicas on its first pass is never a
+  // reference. It fetches from the origin like a fill and its per-file records
+  // see only what the byte cache kept, so every test above can pass for it --
+  // but its wall carries the conversion, which is exactly the cache's own work.
+  // A plain first pass that only filled the byte cache is not affected: it
+  // still qualifies (or not) on the tests above.
   // Read-ahead makes the byte test above pass for a run the cache carried: a
   // cold fill whose next fills were fetched during the reader's compute serves
   // most of its bytes from the speculative stage (they count as hits) while

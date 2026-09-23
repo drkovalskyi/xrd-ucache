@@ -599,6 +599,30 @@ TEST(Baseline, AFillThatReadAheadAndUsedNoneOfItIsNotAReference) {
       << "it fetched a quarter of a GiB nobody read: its origin bytes are not what no cache costs";
 }
 
+// A run that converted baskets into replicas on its first pass fetched like a
+// fill and its per-file records see only what the byte cache kept, so every
+// byte test can pass for it; its wall carries the conversion, which is the
+// cache's own work. The control is the point as much as the rule: the same
+// quiet byte-tier fill WITHOUT conversion must still qualify.
+TEST(Baseline, AColdReplicaRunIsNotAReference) {
+  test::TempDir d;
+  const std::string quiet = fillCounters(kGiB) + ",\"buffer_stall_us\":10000000" + originHist(1000.0);
+  writeRun(d.path(), "h", 4, 4000, 4100, quiet + ",\"cold_replica_files\":1,\"cold_replica_in_bytes\":" +
+                                             std::to_string(kGiB / 2),
+           {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  writeRun(d.path(), "h", 5, 5000, 5100, quiet, {{"root://o//a", 0, 0, kGiB, 0, 0, "fill", kGiB}});
+  const auto runs = loadRuns(d.path());
+  ASSERT_EQ(runs.size(), 2u);
+  for (const auto& r : runs) {
+    if (r.pid == 4) {
+      EXPECT_EQ(r.coldReplicaInBytes, kGiB / 2);
+      EXPECT_FALSE(r.baselineQualified()) << "it converted as it read";
+    } else {
+      EXPECT_TRUE(r.baselineQualified()) << "control: the same quiet fill without conversion";
+    }
+  }
+}
+
 TEST(Baseline, CoresBusyNeedsNoThreadCount) {
   test::TempDir d;
   writeRun(d.path(), "h", 1, 1000, 1100,

@@ -37,6 +37,7 @@ TEST(Config, Defaults) {
   EXPECT_TRUE(c.transpose);
   EXPECT_TRUE(c.announce); // servers are told uCache is in the path, by default
   EXPECT_FALSE(c.disable);
+  EXPECT_FALSE(c.recompressKeepOriginals); // a converted basket is not also kept
   EXPECT_TRUE(c.cacheDir.empty()); // deliberately NO default cache dir
   EXPECT_TRUE(c.sources.empty());  // nothing explicitly set anywhere
 }
@@ -59,6 +60,7 @@ TEST(Config, ParsesEverything) {
   ::setenv("UCACHE_ANNOUNCE", "off", 1);
   ::setenv("UCACHE_RECOMPRESS", "on", 1);
   ::setenv("UCACHE_RECOMPRESS_RECLAIM", "full", 1);
+  ::setenv("UCACHE_RECOMPRESS_KEEP_ORIGINALS", "on", 1);
   ::setenv("UCACHE_KEEP_CGI", "a,b", 1);
   ::setenv("UCACHE_ALLOW", "*.cern.ch", 1);
   ::setenv("UCACHE_DENY", "bad.host", 1);
@@ -81,6 +83,8 @@ TEST(Config, ParsesEverything) {
   EXPECT_TRUE(c.recompress);
   EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kFull);
   EXPECT_EQ(c.valueOf("recompress_reclaim"), "full");
+  EXPECT_TRUE(c.recompressKeepOriginals);
+  EXPECT_EQ(c.valueOf("recompress_keep_originals"), "on");
   EXPECT_EQ(c.keepCgi, (std::vector<std::string>{"a", "b"}));
   EXPECT_EQ(c.allowHosts, (std::vector<std::string>{"*.cern.ch"}));
   EXPECT_EQ(c.denyHosts, (std::vector<std::string>{"bad.host"}));

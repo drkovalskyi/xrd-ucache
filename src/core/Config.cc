@@ -188,6 +188,8 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.announce = !falsy(v); // default on; see Config.h
   else if (k == "recompress")
     c.recompress = truthy(v);
+  else if (k == "recompress_keep_originals")
+    c.recompressKeepOriginals = truthy(v);
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
   else if (k == "recompress_drain_jobs") {
@@ -374,6 +376,7 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"transpose", "UCACHE_TRANSPOSE"},
       {"announce", "UCACHE_ANNOUNCE"},
       {"recompress", "UCACHE_RECOMPRESS"},
+      {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
       {"recompress_drain_jobs", "UCACHE_RECOMPRESS_DRAIN_JOBS"},
@@ -479,6 +482,8 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(announce);
   if (key == "recompress")
     return onoff(recompress);
+  if (key == "recompress_keep_originals")
+    return onoff(recompressKeepOriginals);
   if (key == "recompress_drain_jobs")
     return std::to_string(recompressDrainJobs);
   if (key == "recompress_codecs")
