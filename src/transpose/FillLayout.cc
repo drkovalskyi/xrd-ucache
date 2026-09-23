@@ -348,6 +348,15 @@ ConvertedBasket convertBasket(const uint8_t* rec, size_t n, uint32_t slotLen,
   return c;
 }
 
+bool patchKeySeek(uint8_t* record, size_t n, uint64_t seek) {
+  if (n < 26 || seek > static_cast<uint64_t>(INT64_MAX))
+    return false;
+  const uint16_t ver = beGet<uint16_t>(record + 4);
+  if (ver > 1000 && n < 34)
+    return false;
+  return putKeySeek(record, ver, static_cast<int64_t>(seek));
+}
+
 bool placeInSlot(const ConvertedBasket& c, const FillSlot& slot, uint8_t* out, std::string& err) {
   if (!c.error.empty() || c.record.size() < 26) {
     err = c.error.empty() ? "empty record" : c.error;

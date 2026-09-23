@@ -2,12 +2,16 @@
 #ifdef UCACHE_HAVE_PREFETCH
 #include "Prefetch.h"
 #endif
+#ifdef UCACHE_HAVE_COLDRUN
+#include "ColdRun.h"
+#endif
 
 #include "HelperPath.h"
 #include "Executor.h"
 #include "Log.h"
 #include "OpenRetry.h"
 #include "OriginInFlight.h"
+#include "PluginSupport.h"
 #include "ReadRounding.h"
 #include "Trace.h"
 #include "vendor/crc32c.h"
@@ -203,6 +207,8 @@ class RetryingOpenHandler : public ResponseHandler {
   XRootDStatus lastStatus_;
 };
 
+} // namespace
+
 uint64_t nowUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -231,6 +237,20 @@ AnyObject* chunkResponse(uint64_t off, uint32_t len, void* buf) {
   return obj;
 }
 
+AnyObject* vreadResponse(const ChunkList& chunks) {
+  auto* info = new XrdCl::VectorReadInfo();
+  uint32_t total = 0;
+  for (const auto& c : chunks)
+    total += c.length;
+  info->GetChunks() = chunks;
+  info->SetSize(total);
+  auto* obj = new AnyObject();
+  obj->Set(info);
+  return obj;
+}
+
+namespace {
+
 // Cache-freshness marker (UCACHE_REVALIDATE_S): objects/<aa>/<hash>.val, whose
 // mtime records the last successful remote validation. touchVal() stamps it
 // after a real origin stat; cacheFresh() trusts the entry while it is younger
@@ -252,18 +272,6 @@ bool cacheFresh(const UrlKey& key, const std::string& cacheDir, int revalidateSe
     return false; // stale — revalidate against the origin
   struct ::stat ms; // a sidecar must exist for the entry to be usable
   return RealIO::instance().stat(key.metaPath(cacheDir), &ms) == 0;
-}
-
-AnyObject* vreadResponse(const ChunkList& chunks) {
-  auto* info = new XrdCl::VectorReadInfo();
-  uint32_t total = 0;
-  for (const auto& c : chunks)
-    total += c.length;
-  info->GetChunks() = chunks;
-  info->SetSize(total);
-  auto* obj = new AnyObject();
-  obj->Set(info);
-  return obj;
 }
 
 } // namespace
@@ -400,9 +408,23 @@ static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n,
 static void noteAppRead(const std::shared_ptr<HandleState>& st,
                         const std::shared_ptr<FileEntry>& entry,
                         const std::shared_ptr<ReplicaView>& view, uint64_t off,
-                        uint64_t len) {
+                        uint64_t len, const std::shared_ptr<ColdFill>& cold = nullptr) {
   if (!len)
     return;
+#ifdef UCACHE_HAVE_COLDRUN
+  if (entry && cold) {
+    // The cold run's layout maps back exactly: a slot is its basket, the rest
+    // is the original file or the original tree record.
+    widthSampler().sample();
+    std::vector<std::pair<uint64_t, uint64_t>> orig;
+    coldOriginRanges(*cold, off, len, orig);
+    for (const auto& r : orig)
+      entry->noteRead(r.first, r.second);
+    return;
+  }
+#else
+  (void)cold;
+#endif
   // Reads happen for the whole run, so this is where the parallelism ceiling
   // gets sampled; internally it is a load and a compare all but once a second.
   widthSampler().sample();
@@ -1195,12 +1217,17 @@ UCacheFile::~UCacheFile() {
   st_->drainPersists();
   std::shared_ptr<FileEntry> e;
   std::shared_ptr<ReplicaView> v;
+  std::shared_ptr<ColdFill> cold;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->closed = true;
     e.swap(st_->entry);
     v.swap(st_->view);
+    cold.swap(st_->cold);
   }
+#ifdef UCACHE_HAVE_COLDRUN
+  coldDetach(cold);
+#endif
 #ifdef UCACHE_HAVE_PREFETCH
   // Only touch the prefetcher if this process uses it: reaching the singleton
   // constructs it and starts its thread, which `prefetch = off` should not do.
@@ -1353,6 +1380,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
                  !hostMatchesAny(cfg.denyHosts, key->host);
   std::shared_ptr<FileEntry> entry;
   std::shared_ptr<ReplicaView> view;
+  std::shared_ptr<ColdFill> cold;
   std::unique_ptr<XrdCl::StatInfo> statClone;
 
   bool cacheOnly;
@@ -1380,6 +1408,11 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
                              meta->originCksum);
           if (view)
             statClone->SetSize(view->virtualSize());
+#ifdef UCACHE_HAVE_COLDRUN
+          else if (cfg.recompress && (cold = coldAttach(st_, entry, *key, meta->originMtime,
+                                                        meta->cksumKind, meta->originCksum)))
+            statClone->SetSize(coldVirtualSize(*cold));
+#endif
         }
       }
     }
@@ -1432,6 +1465,13 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
                       key->key.c_str(),
                       static_cast<unsigned long long>(view->virtualSize()));
         }
+#ifdef UCACHE_HAVE_COLDRUN
+        // No replica yet and recompression on: the replica is created on this
+        // pass, from what the reader asks for.
+        else if (cfg.recompress &&
+                 (cold = coldAttach(st_, entry, *key, si->GetModTime(), MetaData::kCksumNone, 0)))
+          statClone->SetSize(coldVirtualSize(*cold));
+#endif
       }
       // Record the validation time so a later open within the window can trust
       // the cache and skip the origin (UCACHE_REVALIDATE_S).
@@ -1446,19 +1486,47 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
       stats.tracer->rec("open", entry->key().key, 0, 0, nowUs() - setupT0,
                         /*sampled=*/false);
   }
-  std::lock_guard<std::mutex> g(st_->mu);
-  st_->setupDone = true;
-  st_->statInfo = std::move(statClone);
-  if (!st_->closed && !st_->tripped) {
-    st_->entry = entry;
-    st_->view = view;
+  bool attached = false;
+  {
+    std::lock_guard<std::mutex> g(st_->mu);
+    st_->setupDone = true;
+    st_->statInfo = std::move(statClone);
+    if (!st_->closed && !st_->tripped) {
+      st_->entry = entry;
+      st_->view = view;
+      st_->cold = cold;
+      attached = true;
+    }
   }
+#ifdef UCACHE_HAVE_COLDRUN
+  if (cold && !attached)
+    coldDetach(cold); // closed while setting up
+#else
+  (void)attached;
+#endif
+  std::lock_guard<std::mutex> g(st_->mu);
   return st_->entry;
 }
 
 std::shared_ptr<ReplicaView> UCacheFile::currentView() const {
   std::lock_guard<std::mutex> g(st_->mu);
   return st_->view;
+}
+
+std::shared_ptr<ColdFill> UCacheFile::currentCold() const {
+  std::lock_guard<std::mutex> g(st_->mu);
+  return st_->cold;
+}
+
+uint64_t UCacheFile::shownSize() const {
+  std::lock_guard<std::mutex> g(st_->mu);
+  if (st_->view)
+    return st_->view->virtualSize();
+#ifdef UCACHE_HAVE_COLDRUN
+  if (st_->cold)
+    return coldVirtualSize(*st_->cold);
+#endif
+  return 0;
 }
 
 
@@ -1587,12 +1655,17 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   st_->drainPersists();
   std::shared_ptr<FileEntry> e;
   std::shared_ptr<ReplicaView> v;
+  std::shared_ptr<ColdFill> cold;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     st_->closed = true;
     e.swap(st_->entry);
     v.swap(st_->view); // releases the overlay fd
+    cold.swap(st_->cold);
   }
+#ifdef UCACHE_HAVE_COLDRUN
+  coldDetach(cold); // the process's last handle on the file publishes its replica
+#endif
 #ifdef UCACHE_HAVE_PREFETCH
   if (globalConfig().prefetch && st_->prefetchSeen.load(std::memory_order_acquire))
     Prefetcher::instance().onClose(st_, e); // drops what was read ahead and never used
@@ -1612,7 +1685,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
     Executor::instance().post(
         [url, cpu, blended] { writeCostSidecar(url, globalConfig(), cpu, blended); });
   }
-  if (e && !v && globalConfig().recompress) {
+  if (e && !v && !cold && globalConfig().recompress) {
     std::string url = st_->url;
     Executor::instance().post([url] { queueRecompress(url, globalConfig()); });
   }
@@ -1663,7 +1736,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
       complete(handler, okStatus(), obj);
       return XRootDStatus();
     }
-  } else if (auto view = currentView()) {
+  } else if (uint64_t vsize = shownSize()) {
     // force=true forwards, but the size a transposed handle reports must
     // stay the stitched one — the origin doesn't know about the extension.
     struct SizeRelay : ResponseHandler {
@@ -1688,7 +1761,7 @@ XrdCl::XRootDStatus UCacheFile::Stat(bool force, ResponseHandler* handler,
     };
     auto* relay = new SizeRelay;
     relay->user = handler;
-    relay->vsize = view->virtualSize();
+    relay->vsize = vsize;
     XRootDStatus s = st_->inner->Stat(force, relay, timeout);
     if (!s.IsOK())
       delete relay;
@@ -1708,11 +1781,15 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
   // replica's, which produces a WRONG signature rather than an absent one --
   // and a wrong signature is evidence, so it is worse than none.
   auto view = currentView();
-  noteAppRead(st_, entry, view, offset, size);
-  if (entry && view) {
+  auto cold = currentCold();
+  noteAppRead(st_, entry, view, offset, size, cold);
+  if (entry && (view || cold)) {
     // Stitched entry: serve on the executor — overlay + v1
     // cache locally, residual original sub-ranges via the miss machinery.
+    // A cold-run handle likewise: its layout exists only here.
     if (offset + size < offset) { // overflow: not a request we can reason about
+      if (cold) // the origin has no such layout to answer from
+        return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
       noteRelayBytes(st_, size, offset, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->Read(offset, size, buffer, rh, timeout); // garbage in, origin's answer out
@@ -1724,7 +1801,7 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
     // the origin cannot give that answer — a stitched file is LARGER than the
     // file the origin has, so the origin returns nothing and the caller sees
     // nread == 0. Clamp to the virtual size and serve what exists.
-    const uint64_t vsize = view->virtualSize();
+    const uint64_t vsize = shownSize();
     const uint32_t served =
         offset >= vsize ? 0u : static_cast<uint32_t>(std::min<uint64_t>(size, vsize - offset));
     if (served == 0) { // at or past EOF, or a zero-length request: 0 bytes, not an error
@@ -1734,6 +1811,14 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, served, buffer);
+#ifdef UCACHE_HAVE_COLDRUN
+    if (cold) {
+      Executor::instance().post([st, entry, cold, one = std::move(one), handler]() mutable {
+        coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, handler);
+      });
+      return XRootDStatus();
+    }
+#endif
     Executor::instance().post([st, entry, view, one = std::move(one), handler]() mutable {
       stitchedServe(st, entry, view, std::move(one), /*isVRead=*/false, handler);
     });
@@ -1860,9 +1945,12 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
   // replica's, which produces a WRONG signature rather than an absent one --
   // and a wrong signature is evidence, so it is worse than none.
   auto view = currentView();
-  noteAppRead(st_, entry, view, offset, size);
-  if (entry && view) {
+  auto cold = currentCold();
+  noteAppRead(st_, entry, view, offset, size, cold);
+  if (entry && (view || cold)) {
     if (offset + size < offset) { // overflow
+      if (cold)
+        return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
       noteRelayBytes(st_, size, offset, size);
       return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
         return f->PgRead(offset, size, buffer, rh, timeout);
@@ -1870,7 +1958,7 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
     }
     // Same clamp as Read: past EOF is a short read, and the origin cannot
     // produce one for a file that is larger here than it is there.
-    const uint64_t pgVsize = view->virtualSize();
+    const uint64_t pgVsize = shownSize();
     if (offset >= pgVsize || size == 0) {
       complete(handler, okStatus(), new AnyObject());
       return XRootDStatus();
@@ -1912,6 +2000,14 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
     auto st = st_;
     ChunkList one;
     one.emplace_back(offset, size, buffer);
+#ifdef UCACHE_HAVE_COLDRUN
+    if (cold) {
+      Executor::instance().post([st, entry, cold, one = std::move(one), pg]() mutable {
+        coldServe(st, entry, cold, std::move(one), /*isVRead=*/false, pg);
+      });
+      return XRootDStatus();
+    }
+#endif
     Executor::instance().post([st, entry, view, one = std::move(one), pg]() mutable {
       stitchedServe(st, entry, view, std::move(one), /*isVRead=*/false, pg);
     });
@@ -2048,8 +2144,9 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
   // recorded the chunks in the original file's coordinates and served them in
   // the replica's -- a WRONG signature rather than an absent one.
   auto view = currentView();
+  auto cold = currentCold();
   for (const auto& c : chunks)
-    noteAppRead(st_, entry, view, c.offset, c.length);
+    noteAppRead(st_, entry, view, c.offset, c.length, cold);
   // The combined-buffer variant is legacy and rare: pass through unchanged.
   if (!entry || buffer || chunks.empty()) {
     noteRelayChunks(st_, chunks);
@@ -2058,6 +2155,24 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
     });
   }
 
+#ifdef UCACHE_HAVE_COLDRUN
+  if (cold) {
+    // Cold-run entry: whole vector served on the executor. A chunk outside the
+    // layout cannot be relayed -- the origin does not have this layout.
+    const uint64_t vsize = coldVirtualSize(*cold);
+    for (const auto& c : chunks)
+      if (c.offset + c.length < c.offset || c.offset + c.length > vsize)
+        return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
+    auto st = st_;
+    noteVectorRequest(st_, chunks);
+    ChunkList userChunks = chunks;
+    Executor::instance().post(
+        [st, entry, cold, userChunks = std::move(userChunks), handler]() mutable {
+          coldServe(st, entry, cold, std::move(userChunks), /*isVRead=*/true, handler);
+        });
+    return XRootDStatus();
+  }
+#endif
   if (view) {
     // Stitched entry: whole vector served on the executor.
     for (const auto& c : chunks)
@@ -2092,12 +2207,17 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
 void UCacheFile::invalidateOnWrite() {
   std::shared_ptr<FileEntry> e;
   std::shared_ptr<ReplicaView> v;
+  std::shared_ptr<ColdFill> cold;
   {
     std::lock_guard<std::mutex> g(st_->mu);
     e.swap(st_->entry);
     v.swap(st_->view); // a written-to URL has no valid replica (§4.4)
+    cold.swap(st_->cold);
     st_->tripped = true; // no caching on this handle after a write
   }
+#ifdef UCACHE_HAVE_COLDRUN
+  coldDetach(cold);
+#endif
   if (st_->store) {
     auto store = st_->store;
     auto key = UrlKey::parse(st_->url, globalConfig().keepCgi);

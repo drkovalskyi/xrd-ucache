@@ -18,6 +18,7 @@
 #include "TreeMeta.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,27 @@ std::vector<std::string> deriveHotBranches(const FileMeta& fm, Source& src,
 
 // Build the overlay for `hot` (already counter-completed) over `src`.
 Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::string>& hot);
+
+// One basket to relocate, named by its place in the tree: FileMeta::branches
+// index and basket index.
+struct RelocatedBasket {
+  uint32_t branch = 0;
+  uint32_t basket = 0;
+};
+
+// Build the same overlay from baskets already converted elsewhere — the cold
+// replica run converts them as the reader asks for them. Each listed basket is
+// relocated on its own, in the order given; every other basket keeps its
+// original locator (so a branch read only in part keeps what was converted).
+// `record(j, out)` fills `out` with basket j's converted record: its original
+// key header (same length) and payload, fNbytes set; fSeekKey is patched here.
+// It returns false when the record cannot be produced, which fails the build
+// as transient. `treeKeyHeader` = the tree key's header bytes, `keysList` = the
+// whole keys-list record, both as read from the origin.
+Overlay buildOverlayFromRecords(const FileMeta& fm, const std::vector<uint8_t>& treeKeyHeader,
+                                const std::vector<uint8_t>& keysList,
+                                const std::vector<RelocatedBasket>& baskets,
+                                const std::function<bool(size_t, std::vector<uint8_t>&)>& record);
 
 // raw bytes -> a ROOT multi-frame ZSTD container. Exposed because RNTuple
 // pages are the same ROOT block format as TTree baskets and must be encoded

@@ -111,6 +111,10 @@ struct ConvertedBasket {
 ConvertedBasket convertBasket(const uint8_t* record, size_t n, uint32_t slotLen,
                               const std::vector<std::string>& codecs);
 
+// Set a key record's fSeekKey at the key's own width (64-bit above version
+// 1000). False when a 32-bit key cannot hold `seek`, or the record is too short.
+bool patchKeySeek(uint8_t* record, size_t n, uint64_t seek);
+
 // Write `c` into `out` (exactly slot.vLen bytes): the record with fSeekKey set
 // to slot.vSeek, then zeros. False (err set) when the record does not fit, or
 // its key is the 32-bit kind and the slot lies past 2^31.

@@ -44,6 +44,8 @@
 
 namespace ucache {
 
+class ColdFill; // ColdRun.h
+
 // State shared between the plugin object, executor tasks, and wire handlers.
 struct HandleState {
   // Read-ahead (Prefetch.h) keeps its per-handle state on its own thread, keyed
@@ -82,6 +84,9 @@ struct HandleState {
   // replica for FUTURE opens; this handle keeps serving what still verifies.
   std::shared_ptr<ReplicaView> view;
   std::atomic<bool> replicaDropped{false};     // one-time drop-on-fault latch
+  // Cold replica run (ColdRun.h): the transient layout this handle was shown
+  // at setup, likewise HANDLE-STABLE. Never set together with `view`.
+  std::shared_ptr<ColdFill> cold;
   std::unique_ptr<XrdCl::StatInfo> statInfo;   // clone source for Stat(false)
   std::mutex setupMu;                          // serializes lazy entry setup
   bool setupDone = false;                      // entry setup attempted (ok or not)
@@ -198,6 +203,9 @@ class UCacheFile : public XrdCl::FilePlugIn {
   // Also adopts the transposed-replica view when one validates.
   std::shared_ptr<FileEntry> ensureEntry();
   std::shared_ptr<ReplicaView> currentView() const;
+  std::shared_ptr<ColdFill> currentCold() const;
+  // The size a replica or cold-run handle shows its reader; 0 for a plain one.
+  uint64_t shownSize() const;
 
   std::shared_ptr<HandleState> st_;
   bool passthroughOnly_ = false; // write-open / UCACHE_DISABLE / denied host

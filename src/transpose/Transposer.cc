@@ -68,6 +68,140 @@ void patchSeek(uint8_t* rec, uint16_t ver, int64_t seek, std::string& err) {
   }
 }
 
+// What every build does once its baskets are placed in `ext`: relocate the
+// patched tree record after them, repoint the keys list at it in place, write
+// fEND, and describe the result as the overlay. `mkey` = the tree key's header
+// bytes, `klist` = the whole keys-list record. Sets ov.error on failure.
+void finishOverlay(const FileMeta& fm, std::vector<uint8_t> blob, std::vector<uint8_t> ext,
+                   std::vector<ReplicaMeta::OrigRange> origMap,
+                   std::vector<ReplicaMeta::Range> superseded, std::vector<uint8_t> mkey,
+                   std::vector<uint8_t> klist, Overlay& ov) {
+  const int64_t extBase = fm.fend;
+  // Relocated metadata key: ROOT-compress the (patched) blob
+  // at rest with kMetaZstdLevel. fObjlen in the key header is left at the
+  // decompressed size (copied from the original key), so ROOT detects the
+  // compressed record (fObjlen > fNbytes − fKeylen) and inflates it exactly as
+  // it does the original LZMA key. fNbytes (here and in the keys-list entry
+  // below) becomes keylen + stored size. Raw fallback if it does not shrink
+  // (never on real metadata; keeps the writer honest). Serving is unchanged —
+  // .tdata stays opaque CRC'd bytes, .tmeta format_version stays 1.
+  ov.metaRawBytes = blob.size();
+  std::vector<uint8_t> metaPayload = zstdFrames(blob.data(), blob.size(), kMetaZstdLevel);
+  if (metaPayload.empty() || metaPayload.size() >= blob.size())
+    metaPayload = blob; // raw fallback (encode error or non-shrinking)
+  ov.metaStoredBytes = metaPayload.size();
+  const int64_t newSeek = extBase + static_cast<int64_t>(ext.size());
+  bePut<int32_t>(mkey.data(), static_cast<int32_t>(fm.treeKey.keylen + metaPayload.size()));
+  patchSeek(mkey.data(), fm.treeKey.ver, newSeek, ov.error);
+  if (!ov.error.empty())
+    return;
+  ext.insert(ext.end(), mkey.begin(), mkey.end());
+  ext.insert(ext.end(), metaPayload.begin(), metaPayload.end());
+  superseded.push_back({static_cast<uint64_t>(fm.treeKey.seekkey),
+                        static_cast<uint64_t>(fm.treeKey.nbytes)});
+  origMap.push_back({static_cast<uint64_t>(newSeek), mkey.size() + metaPayload.size(),
+                     static_cast<uint64_t>(fm.treeKey.seekkey),
+                     static_cast<uint64_t>(fm.treeKey.nbytes)});
+  // Keys-list record: repoint the live tree entry at the relocated metadata
+  // key, in place (same size, same offset — see below).
+  auto kl = parseKey(klist.data(), klist.size(), 0);
+  if (!kl || kl->nbytes <= 0 || static_cast<size_t>(kl->nbytes) != klist.size() ||
+      kl->keylen + 4u > klist.size()) {
+    ov.error = "keys-list key geometry implausible";
+    return;
+  }
+  size_t at = kl->keylen;
+  int32_t nkeys = 0;
+  std::memcpy(&nkeys, klist.data() + at, 4);
+  nkeys = __builtin_bswap32(nkeys);
+  at += 4;
+  bool patched = false;
+  for (int32_t i = 0; i < nkeys; ++i) {
+    auto e = parseKey(klist.data(), klist.size(), at);
+    if (!e) {
+      ov.error = "keys-list entry parse failed";
+      return;
+    }
+    if (e->cls == "TTree" && e->name == fm.treeKey.name && e->seekkey == fm.treeKey.seekkey) {
+      bePut<int32_t>(klist.data() + at,
+                     static_cast<int32_t>(fm.treeKey.keylen + metaPayload.size()));
+      patchSeek(klist.data() + at, e->ver, newSeek, ov.error);
+      if (!ov.error.empty())
+        return;
+      patched = true;
+    }
+    at += e->keylen;
+  }
+  if (!patched) {
+    ov.error = "live tree entry not found in keys list";
+    return;
+  }
+  // The keys-list record stays WHERE IT IS: patching it never changes its
+  // size (only the live tree entry's fNbytes/fSeekKey), so it is served as an
+  // in-place patch window rather than relocated into the extension. Moving it
+  // would have to be published through the root directory's fSeekKeys, and
+  // that field is 32 bits wide whenever the directory record's own seeks fit
+  // in 32 bits — precisely the layout of a file that grew past 2 GB after its
+  // keys list was written, where the extension necessarily starts past 2 GiB
+  // and a 4-byte field cannot address it. Left in place, the directory record
+  // is never written at all and its width cannot matter.
+  if (fm.keyslistSeek < 100 ||
+      static_cast<uint64_t>(fm.keyslistSeek) + klist.size() > static_cast<uint64_t>(extBase)) {
+    ov.error = "keys-list record does not lie inside the original file";
+    return;
+  }
+
+  // The in-place patch windows + the extension = the overlay. fEND is a
+  // HEADER field, so it is written at the header's width — never the
+  // directory's, which is independent (see FileMeta).
+  const int hw = fm.headerSeekWidth;
+  const int64_t newFend = extBase + static_cast<int64_t>(ext.size());
+  if (hw == 4 && newFend >= (1ll << 31)) {
+    ov.error = "small-layout file would grow past 2 GiB";
+    return;
+  }
+  std::vector<uint8_t> hdrWin(hw);
+  if (hw == 8)
+    bePut<int64_t>(hdrWin.data(), newFend);
+  else
+    bePut<int32_t>(hdrWin.data(), static_cast<int32_t>(newFend));
+  ov.tdata.reserve(hdrWin.size() + klist.size() + ext.size());
+  ov.tdata.insert(ov.tdata.end(), hdrWin.begin(), hdrWin.end());
+  ov.tdata.insert(ov.tdata.end(), klist.begin(), klist.end());
+  ov.tdata.insert(ov.tdata.end(), ext.begin(), ext.end());
+  ov.meta.extents = {
+      {12, static_cast<uint64_t>(hw), 0},
+      {static_cast<uint64_t>(fm.keyslistSeek), klist.size(), static_cast<uint64_t>(hw)},
+      {static_cast<uint64_t>(extBase), ext.size(), static_cast<uint64_t>(hw) + klist.size()}};
+  // Patched in place: these windows ARE their own original range.
+  origMap.push_back({12, static_cast<uint64_t>(hw), 12, static_cast<uint64_t>(hw)});
+  origMap.push_back({static_cast<uint64_t>(fm.keyslistSeek), klist.size(),
+                     static_cast<uint64_t>(fm.keyslistSeek), klist.size()});
+  std::sort(origMap.begin(), origMap.end(),
+            [](const ReplicaMeta::OrigRange& a, const ReplicaMeta::OrigRange& b) {
+              return a.virtOff < b.virtOff;
+            });
+  ov.meta.origMap = std::move(origMap);
+  ov.meta.virtualSize = static_cast<uint64_t>(newFend);
+
+  // Merge superseded ranges (few large punches instead of ~1e5 tiny ones).
+  std::sort(superseded.begin(), superseded.end(),
+            [](const auto& a, const auto& b) { return a.off < b.off; });
+  std::vector<ReplicaMeta::Range> merged;
+  for (const auto& r : superseded) {
+    if (!merged.empty() && r.off <= merged.back().off + merged.back().len) {
+      uint64_t end = std::max(merged.back().off + merged.back().len, r.off + r.len);
+      merged.back().len = end - merged.back().off;
+    } else {
+      merged.push_back(r);
+    }
+  }
+  ov.meta.superseded = std::move(merged);
+  ov.meta.encoding = ReplicaMeta::kZstd1;
+  ov.meta.encoderVersion = ZSTD_VERSION_NUMBER; // e.g. 10505
+  ov.meta.originSize = static_cast<uint64_t>(fm.fend);
+}
+
 } // namespace
 
 // Every basket of `b` fully present in `src`?
@@ -275,146 +409,101 @@ Overlay buildOverlay(const FileMeta& fm, Source& src, const std::vector<std::str
     }
   }
 
-  // Relocated metadata key: ROOT-compress the (patched) blob
-  // at rest with kMetaZstdLevel. fObjlen in the key header is left at the
-  // decompressed size (copied from the original key), so ROOT detects the
-  // compressed record (fObjlen > fNbytes − fKeylen) and inflates it exactly as
-  // it does the original LZMA key. fNbytes (here and in the keys-list entry
-  // below) becomes keylen + stored size. Raw fallback if it does not shrink
-  // (never on real metadata; keeps the writer honest). Serving is unchanged —
-  // .tdata stays opaque CRC'd bytes, .tmeta format_version stays 1.
-  {
-    std::vector<uint8_t> mkey(fm.treeKey.keylen);
-    if (!src.has(fm.treeKey.seekkey, fm.treeKey.nbytes) ||
-        !src.read(mkey.data(), mkey.size(), fm.treeKey.seekkey))
-      return unavailable("tree key header not available");
-    ov.metaRawBytes = blob.size();
-    std::vector<uint8_t> metaPayload = zstdFrames(blob.data(), blob.size(), kMetaZstdLevel);
-    if (metaPayload.empty() || metaPayload.size() >= blob.size())
-      metaPayload = blob; // raw fallback (encode error or non-shrinking)
-    ov.metaStoredBytes = metaPayload.size();
+  // The tree key's header and the keys-list record, read here and handed to
+  // the part every build shares.
+  std::vector<uint8_t> mkey(fm.treeKey.keylen);
+  if (!src.has(fm.treeKey.seekkey, fm.treeKey.nbytes) ||
+      !src.read(mkey.data(), mkey.size(), fm.treeKey.seekkey))
+    return unavailable("tree key header not available");
+  // Probe clamped at fend: in a small file the record can sit closer than
+  // 512 bytes to EOF (a strict Source fails a past-EOF read).
+  std::vector<uint8_t> klHead(512);
+  uint64_t probe = fm.fend > fm.keyslistSeek
+                       ? std::min<uint64_t>(klHead.size(),
+                                            static_cast<uint64_t>(fm.fend - fm.keyslistSeek))
+                       : 0;
+  if (probe == 0) // geometry, not availability: fEND lies at or below the
+                  // keys list, so no later pass can make this file buildable
+    return fail("keys-list lies at or past the end of the file");
+  if (!src.read(klHead.data(), probe, fm.keyslistSeek))
+    return unavailable("keys-list header not readable");
+  auto kl = parseKey(klHead.data(), probe, 0);
+  if (!kl)
+    return fail("keys-list key parse failed");
+  // Geometry must hold before it sizes an allocation or indexes the record
+  // (hostile nbytes/keylen: negative alloc, OOB nkeys read).
+  if (kl->nbytes <= 0 || kl->keylen + 4u > static_cast<uint32_t>(kl->nbytes))
+    return fail("keys-list key geometry implausible");
+  std::vector<uint8_t> klist(kl->nbytes);
+  if (!src.has(fm.keyslistSeek, kl->nbytes) ||
+      !src.read(klist.data(), klist.size(), fm.keyslistSeek))
+    return unavailable("keys-list not available");
+  finishOverlay(fm, std::move(blob), std::move(ext), std::move(origMap), std::move(superseded),
+                std::move(mkey), std::move(klist), ov);
+  return ov;
+}
+
+Overlay buildOverlayFromRecords(const FileMeta& fm, const std::vector<uint8_t>& treeKeyHeader,
+                                const std::vector<uint8_t>& keysList,
+                                const std::vector<RelocatedBasket>& baskets,
+                                const std::function<bool(size_t, std::vector<uint8_t>&)>& record) {
+  Overlay ov;
+  if (!fm.error.empty()) {
+    ov.error = "parse: " + fm.error;
+    return ov;
+  }
+  if (treeKeyHeader.size() != fm.treeKey.keylen) {
+    ov.error = "tree key header missing";
+    return ov;
+  }
+  if (keysList.size() < 4) {
+    ov.error = "keys-list record missing";
+    return ov;
+  }
+  std::vector<uint8_t> blob = fm.treeBlob;
+  std::vector<uint8_t> ext;
+  const int64_t extBase = fm.fend;
+  std::vector<ReplicaMeta::OrigRange> origMap;
+  std::vector<ReplicaMeta::Range> superseded;
+  std::vector<uint8_t> rec;
+  for (size_t j = 0; j < baskets.size(); ++j) {
+    const RelocatedBasket& rb = baskets[j];
+    if (rb.branch >= fm.branches.size() ||
+        rb.basket >= static_cast<uint32_t>(std::max(0, fm.branches[rb.branch].writeBasket))) {
+      ov.error = "relocated basket out of range";
+      return ov;
+    }
+    const BranchInfo& b = fm.branches[rb.branch];
+    rec.clear();
+    if (!record(j, rec)) {
+      ov.transient = true; // the caller's stage could not produce it; nothing about the file
+      ov.error = b.name + ": basket " + std::to_string(rb.basket) + " record unavailable";
+      return ov;
+    }
+    auto k = parseKey(rec.data(), rec.size(), 0);
+    if (!k || k->cls != "TBasket" || k->name != b.name ||
+        static_cast<size_t>(k->nbytes) != rec.size()) {
+      ov.error = b.name + ": unexpected basket record";
+      return ov;
+    }
+    const uint64_t off = static_cast<uint64_t>(b.basketSeek[rb.basket]);
+    const uint64_t nb = static_cast<uint64_t>(b.basketBytes[rb.basket]);
     const int64_t newSeek = extBase + static_cast<int64_t>(ext.size());
-    bePut<int32_t>(mkey.data(),
-                   static_cast<int32_t>(fm.treeKey.keylen + metaPayload.size()));
-    patchSeek(mkey.data(), fm.treeKey.ver, newSeek, ov.error);
+    patchSeek(rec.data(), k->ver, newSeek, ov.error);
     if (!ov.error.empty())
       return ov;
-    ext.insert(ext.end(), mkey.begin(), mkey.end());
-    ext.insert(ext.end(), metaPayload.begin(), metaPayload.end());
-    superseded.push_back({static_cast<uint64_t>(fm.treeKey.seekkey),
-                          static_cast<uint64_t>(fm.treeKey.nbytes)});
-    origMap.push_back({static_cast<uint64_t>(newSeek), mkey.size() + metaPayload.size(),
-                       static_cast<uint64_t>(fm.treeKey.seekkey),
-                       static_cast<uint64_t>(fm.treeKey.nbytes)});
-    // Keys-list record: repoint the live tree entry at the relocated metadata
-    // key, in place (same size, same offset — see below).
-    // Probe clamped at fend: in a small file the record can sit closer than
-    // 512 bytes to EOF (a strict Source fails a past-EOF read).
-    std::vector<uint8_t> klHead(512);
-    uint64_t probe = fm.fend > fm.keyslistSeek
-                         ? std::min<uint64_t>(klHead.size(),
-                                              static_cast<uint64_t>(fm.fend - fm.keyslistSeek))
-                         : 0;
-    if (probe == 0) // geometry, not availability: fEND lies at or below the
-                    // keys list, so no later pass can make this file buildable
-      return fail("keys-list lies at or past the end of the file");
-    if (!src.read(klHead.data(), probe, fm.keyslistSeek))
-      return unavailable("keys-list header not readable");
-    auto kl = parseKey(klHead.data(), probe, 0);
-    if (!kl)
-      return fail("keys-list key parse failed");
-    // Geometry must hold before it sizes an allocation or indexes the record
-    // (hostile nbytes/keylen: negative alloc, OOB nkeys read).
-    if (kl->nbytes <= 0 || kl->keylen + 4u > static_cast<uint32_t>(kl->nbytes))
-      return fail("keys-list key geometry implausible");
-    std::vector<uint8_t> klist(kl->nbytes);
-    if (!src.has(fm.keyslistSeek, kl->nbytes) ||
-        !src.read(klist.data(), klist.size(), fm.keyslistSeek))
-      return unavailable("keys-list not available");
-    size_t at = kl->keylen;
-    int32_t nkeys = 0;
-    std::memcpy(&nkeys, klist.data() + at, 4);
-    nkeys = __builtin_bswap32(nkeys);
-    at += 4;
-    bool patched = false;
-    for (int32_t i = 0; i < nkeys; ++i) {
-      auto e = parseKey(klist.data(), klist.size(), at);
-      if (!e)
-        return fail("keys-list entry parse failed");
-      if (e->cls == "TTree" && e->name == fm.treeKey.name &&
-          e->seekkey == fm.treeKey.seekkey) {
-        bePut<int32_t>(klist.data() + at,
-                       static_cast<int32_t>(fm.treeKey.keylen + metaPayload.size()));
-        patchSeek(klist.data() + at, e->ver, newSeek, ov.error);
-        if (!ov.error.empty())
-          return ov;
-        patched = true;
-      }
-      at += e->keylen;
-    }
-    if (!patched)
-      return fail("live tree entry not found in keys list");
-    // The keys-list record stays WHERE IT IS: patching it never changes its
-    // size (only the live tree entry's fNbytes/fSeekKey), so it is served as an
-    // in-place patch window rather than relocated into the extension. Moving it
-    // would have to be published through the root directory's fSeekKeys, and
-    // that field is 32 bits wide whenever the directory record's own seeks fit
-    // in 32 bits — precisely the layout of a file that grew past 2 GB after its
-    // keys list was written, where the extension necessarily starts past 2 GiB
-    // and a 4-byte field cannot address it. Left in place, the directory record
-    // is never written at all and its width cannot matter.
-    if (fm.keyslistSeek < 100 || static_cast<uint64_t>(fm.keyslistSeek) + klist.size() >
-                                     static_cast<uint64_t>(extBase))
-      return fail("keys-list record does not lie inside the original file");
-
-    // The in-place patch windows + the extension = the overlay. fEND is a
-    // HEADER field, so it is written at the header's width — never the
-    // directory's, which is independent (see FileMeta).
-    const int hw = fm.headerSeekWidth;
-    const int64_t newFend = extBase + static_cast<int64_t>(ext.size());
-    if (hw == 4 && newFend >= (1ll << 31))
-      return fail("small-layout file would grow past 2 GiB");
-    std::vector<uint8_t> hdrWin(hw);
-    if (hw == 8)
-      bePut<int64_t>(hdrWin.data(), newFend);
-    else
-      bePut<int32_t>(hdrWin.data(), static_cast<int32_t>(newFend));
-    ov.tdata.reserve(hdrWin.size() + klist.size() + ext.size());
-    ov.tdata.insert(ov.tdata.end(), hdrWin.begin(), hdrWin.end());
-    ov.tdata.insert(ov.tdata.end(), klist.begin(), klist.end());
-    ov.tdata.insert(ov.tdata.end(), ext.begin(), ext.end());
-    ov.meta.extents = {
-        {12, static_cast<uint64_t>(hw), 0},
-        {static_cast<uint64_t>(fm.keyslistSeek), klist.size(), static_cast<uint64_t>(hw)},
-        {static_cast<uint64_t>(extBase), ext.size(), static_cast<uint64_t>(hw) + klist.size()}};
-    // Patched in place: these windows ARE their own original range.
-    origMap.push_back({12, static_cast<uint64_t>(hw), 12, static_cast<uint64_t>(hw)});
-    origMap.push_back({static_cast<uint64_t>(fm.keyslistSeek), klist.size(),
-                       static_cast<uint64_t>(fm.keyslistSeek), klist.size()});
-    std::sort(origMap.begin(), origMap.end(),
-              [](const ReplicaMeta::OrigRange& a, const ReplicaMeta::OrigRange& b) {
-                return a.virtOff < b.virtOff;
-              });
-    ov.meta.origMap = std::move(origMap);
-    ov.meta.virtualSize = static_cast<uint64_t>(newFend);
+    bePut<int64_t>(blob.data() + b.seekArrayOff + 8 * rb.basket, newSeek);
+    bePut<int32_t>(blob.data() + b.bytesArrayOff + 4 * rb.basket, static_cast<int32_t>(rec.size()));
+    superseded.push_back({off, nb});
+    origMap.push_back({static_cast<uint64_t>(newSeek), rec.size(), off, nb});
+    ov.oldBytes += nb;
+    ov.newBytes += rec.size();
+    ++ov.baskets;
+    ++ov.transcoded;
+    ext.insert(ext.end(), rec.begin(), rec.end());
   }
-
-  // Merge superseded ranges (few large punches instead of ~1e5 tiny ones).
-  std::sort(superseded.begin(), superseded.end(),
-            [](const auto& a, const auto& b) { return a.off < b.off; });
-  std::vector<ReplicaMeta::Range> merged;
-  for (const auto& r : superseded) {
-    if (!merged.empty() && r.off <= merged.back().off + merged.back().len) {
-      uint64_t end = std::max(merged.back().off + merged.back().len, r.off + r.len);
-      merged.back().len = end - merged.back().off;
-    } else {
-      merged.push_back(r);
-    }
-  }
-  ov.meta.superseded = std::move(merged);
-  ov.meta.encoding = ReplicaMeta::kZstd1;
-  ov.meta.encoderVersion = ZSTD_VERSION_NUMBER; // e.g. 10505
-  ov.meta.originSize = static_cast<uint64_t>(fm.fend);
+  finishOverlay(fm, std::move(blob), std::move(ext), std::move(origMap), std::move(superseded),
+                treeKeyHeader, keysList, ov);
   return ov;
 }
 

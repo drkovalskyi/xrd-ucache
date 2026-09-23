@@ -366,3 +366,51 @@ TEST(TransposeWidth, NarrowKeyCannotBeRelocatedPastTwoGiB) {
   EXPECT_EQ(ov.error, "32-bit key cannot point past 2 GiB");
   EXPECT_TRUE(ov.meta.extents.empty());
 }
+
+// The cold replica run publishes through buildOverlayFromRecords, from baskets
+// it converted itself. Given the same records, it must produce exactly what
+// buildOverlay does -- one builder, two ways of handing it baskets.
+TEST(TransposeWidth, FromRecordsMatchesBuildOverlay) {
+  Fixture fx = mixedWidthFixture(/*wideBasketKey=*/true);
+  Overlay ref = buildOverlay(fx.fm, fx.src, {"Muon_pt"});
+  ASSERT_TRUE(ref.error.empty()) << ref.error;
+  const auto& tree = fx.src.ranges[kTreeKeySeek];
+  std::vector<uint8_t> tkh(tree.begin(), tree.begin() + fx.fm.treeKey.keylen);
+  const auto& klFull = fx.src.ranges[kKeysListSeek];
+  std::vector<uint8_t> kl(klFull.begin(), klFull.begin() + fx.klNbytes);
+  const auto& basket = fx.src.ranges[kBasketSeek];
+  Overlay got = buildOverlayFromRecords(
+      fx.fm, tkh, kl, {RelocatedBasket{0, 0}}, [&](size_t, std::vector<uint8_t>& out) {
+        out.assign(basket.begin(), basket.begin() + fx.basketLen);
+        return true;
+      });
+  ASSERT_TRUE(got.error.empty()) << got.error;
+  EXPECT_EQ(got.tdata, ref.tdata);
+  EXPECT_EQ(got.meta.virtualSize, ref.meta.virtualSize);
+  ASSERT_EQ(got.meta.extents.size(), ref.meta.extents.size());
+  for (size_t i = 0; i < got.meta.extents.size(); ++i) {
+    EXPECT_EQ(got.meta.extents[i].virtOff, ref.meta.extents[i].virtOff);
+    EXPECT_EQ(got.meta.extents[i].len, ref.meta.extents[i].len);
+    EXPECT_EQ(got.meta.extents[i].tdataOff, ref.meta.extents[i].tdataOff);
+  }
+  ASSERT_EQ(got.meta.superseded.size(), ref.meta.superseded.size());
+  ASSERT_EQ(got.meta.origMap.size(), ref.meta.origMap.size());
+
+  // A record the stage cannot produce fails the build as retryable, and a
+  // record that is not this branch's basket fails it outright.
+  Overlay missing = buildOverlayFromRecords(fx.fm, tkh, kl, {RelocatedBasket{0, 0}},
+                                            [](size_t, std::vector<uint8_t>&) { return false; });
+  EXPECT_TRUE(missing.transient);
+  Overlay wrong = buildOverlayFromRecords(
+      fx.fm, tkh, kl, {RelocatedBasket{0, 0}}, [&](size_t, std::vector<uint8_t>& out) {
+        out.assign(basket.begin(), basket.begin() + fx.basketLen);
+        out[out.size() - 1] ^= 1; // payload only: still a record, still fine
+        out[43] = 'X';             // the branch name inside the key header
+        return true;
+      });
+  EXPECT_FALSE(wrong.error.empty());
+  EXPECT_FALSE(wrong.transient);
+  Overlay range = buildOverlayFromRecords(fx.fm, tkh, kl, {RelocatedBasket{0, 5}},
+                                          [](size_t, std::vector<uint8_t>&) { return true; });
+  EXPECT_FALSE(range.error.empty());
+}
