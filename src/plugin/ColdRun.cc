@@ -2,6 +2,7 @@
 
 #include "Executor.h"
 #include "FillLayout.h"
+#include "RNTupleRewrite.h"
 #include "Log.h"
 #include "OriginInFlight.h"
 #include "PluginSupport.h"
@@ -61,6 +62,8 @@ Executor& convertPool() {
 
 std::atomic<uint64_t> g_stagingSeq{0};
 
+constexpr uint64_t kHeadBlock = 128 * 1024;
+
 // Publishes still running. A process that exits normally waits for them: the
 // stage is an unlinked file, so a publish cut short by exit is a replica lost,
 // and a short job reading a few files would otherwise never leave one. A hard
@@ -92,8 +95,13 @@ class ColdFill {
 
   UrlKey key;
   std::string cacheDir;
-  tp::FileMeta fm;
+  bool rnt = false;  // an RNTuple container: slots hold DECODED pages
+  tp::FileMeta fm;   // TTree
+  tp::RNTupleMeta rm; // RNTuple
   tp::FillLayout L;
+  // The original ranges the layout's relocated metadata stands for (the tree
+  // record; or the page list and footer), for the read footprint.
+  std::vector<std::pair<uint64_t, uint64_t>> metaOrigin;
   std::vector<uint8_t> treeKeyHeader, keysList;
   std::vector<std::string> codecs;
   bool keepOriginals = false;
@@ -244,6 +252,11 @@ struct SetupSource : tp::Source {
     if (entry->hasRange(off, n) && entry->readCached(off, n, dst, /*account=*/false))
       return true;
     auto [ws, we] = roundSpan(entry->pageSize(), entry->fileSize(), off, n);
+    // The file head is fetched as ONE block of the size ROOT itself asks for
+    // it in (128 KiB at offset 0): setup's piecemeal reads would otherwise
+    // leave the reader's own head read partly missing, and one more request.
+    if (ws < kHeadBlock)
+      we = std::max<uint64_t>(we, std::min<uint64_t>(kHeadBlock, entry->fileSize()));
     if (we - ws > UINT32_MAX)
       return false;
     std::vector<char> buf(we - ws);
@@ -294,31 +307,47 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   src.st = st;
   src.entry = entry;
   auto cf = std::make_shared<ColdFill>();
+  cf->codecs = cfg.recompressCodecs;
+  cf->keepOriginals = cfg.recompressKeepOriginals;
   cf->fm = parseTree(src, static_cast<int64_t>(size));
-  if (!cf->fm.error.empty()) {
+  std::vector<uint8_t> header(100);
+  if (!cf->fm.error.empty() && cf->fm.error.find("not found") != std::string::npos) {
+    // No TTree: perhaps an RNTuple.
+    cf->rm = tp::parseRNTuple(src, static_cast<int64_t>(size), "");
+    if (!cf->rm.error.empty() || !src.read(header.data(), header.size(), 0)) {
+      UCACHE_DEBUG("cold run declined for %s: %s", key.key.c_str(), cf->fm.error.c_str());
+      return nullptr;
+    }
+    cf->rnt = true;
+    cf->L = tp::layoutForRNTupleFill(cf->rm, size, header, cf->codecs);
+    cf->metaOrigin = {{cf->rm.pageListOffset, cf->rm.pageListNbytes},
+                      {cf->rm.anchor.seekFooter, cf->rm.anchor.nbytesFooter}};
+  }
+  if (!cf->rnt && !cf->fm.error.empty()) {
     UCACHE_DEBUG("cold run declined for %s: %s", key.key.c_str(), cf->fm.error.c_str());
     return nullptr;
   }
-  std::vector<uint8_t> header(100);
-  cf->treeKeyHeader.resize(cf->fm.treeKey.keylen);
-  uint8_t klLen[4];
-  if (!src.read(header.data(), header.size(), 0) ||
-      !src.read(cf->treeKeyHeader.data(), cf->treeKeyHeader.size(),
-                static_cast<uint64_t>(cf->fm.treeKey.seekkey)) ||
-      !src.read(klLen, 4, static_cast<uint64_t>(cf->fm.keyslistSeek)))
-    return nullptr;
-  const int32_t kn = static_cast<int32_t>(static_cast<uint32_t>(klLen[0]) << 24 |
-                                          static_cast<uint32_t>(klLen[1]) << 16 |
-                                          static_cast<uint32_t>(klLen[2]) << 8 | klLen[3]);
-  if (kn <= 0 || static_cast<uint64_t>(cf->fm.keyslistSeek) + static_cast<uint64_t>(kn) > size)
-    return nullptr;
-  cf->keysList.resize(static_cast<size_t>(kn));
-  if (!src.read(cf->keysList.data(), cf->keysList.size(), static_cast<uint64_t>(cf->fm.keyslistSeek)))
-    return nullptr;
-  cf->codecs = cfg.recompressCodecs;
-  cf->keepOriginals = cfg.recompressKeepOriginals;
-  cf->L = tp::layoutForFill(cf->fm, size, header, cf->treeKeyHeader, cf->keysList, cf->codecs,
-                            kSlotFactor);
+  if (!cf->rnt) {
+    cf->treeKeyHeader.resize(cf->fm.treeKey.keylen);
+    uint8_t klLen[4];
+    if (!src.read(header.data(), header.size(), 0) ||
+        !src.read(cf->treeKeyHeader.data(), cf->treeKeyHeader.size(),
+                  static_cast<uint64_t>(cf->fm.treeKey.seekkey)) ||
+        !src.read(klLen, 4, static_cast<uint64_t>(cf->fm.keyslistSeek)))
+      return nullptr;
+    const int32_t kn = static_cast<int32_t>(static_cast<uint32_t>(klLen[0]) << 24 |
+                                            static_cast<uint32_t>(klLen[1]) << 16 |
+                                            static_cast<uint32_t>(klLen[2]) << 8 | klLen[3]);
+    if (kn <= 0 || static_cast<uint64_t>(cf->fm.keyslistSeek) + static_cast<uint64_t>(kn) > size)
+      return nullptr;
+    cf->keysList.resize(static_cast<size_t>(kn));
+    if (!src.read(cf->keysList.data(), cf->keysList.size(), static_cast<uint64_t>(cf->fm.keyslistSeek)))
+      return nullptr;
+    cf->L = tp::layoutForFill(cf->fm, size, header, cf->treeKeyHeader, cf->keysList, cf->codecs,
+                              kSlotFactor);
+    cf->metaOrigin = {{static_cast<uint64_t>(cf->fm.treeKey.seekkey),
+                       static_cast<uint64_t>(cf->fm.treeKey.nbytes)}};
+  }
   if (!cf->L.error.empty()) {
     UCACHE_INFO("cold run declined for %s: %s; the file is served as stored", key.key.c_str(),
                 cf->L.error.c_str());
@@ -341,8 +370,9 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->slots.reset(new ColdFill::Slot[cf->L.slots.size()]);
   if (st->store)
     st->store->stats().coldReplicaFiles.fetch_add(1, std::memory_order_relaxed);
-  UCACHE_INFO("cold run for %s: %zu baskets of %zu branches in slots, virtual %llu bytes",
-              key.key.c_str(), cf->L.slots.size(), cf->L.relocated.size(),
+  UCACHE_INFO("cold run for %s: %zu %s of %zu %s in slots, virtual %llu bytes", key.key.c_str(),
+              cf->L.slots.size(), cf->rnt ? "pages" : "baskets", cf->L.relocated.size(),
+              cf->rnt ? "column ranges" : "branches",
               static_cast<unsigned long long>(cf->L.virtualSize));
   return cf;
 }
@@ -400,6 +430,23 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
 
 // Copy bytes [from, from+len) of slot i -- its record, then zeros -- to dest.
 bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest) {
+  if (cf.rnt) {
+    // The stage keeps the block the replica will hold; the reader of this pass
+    // is served the page decoded, which is exactly the slot's length.
+    const uint32_t vLen = cf.L.slots[i].vLen;
+    std::vector<uint8_t> enc(cf.slots[i].len);
+    if (from + len > vLen || !cf.readRecord(i, enc.data(), 0, enc.size()))
+      return false;
+    if (enc.size() == vLen) {
+      std::memcpy(dest, enc.data() + from, len);
+      return true;
+    }
+    std::vector<uint8_t> raw = tp::decompressFrames(enc.data(), enc.size(), vLen);
+    if (raw.size() != vLen)
+      return false;
+    std::memcpy(dest, raw.data() + from, len);
+    return true;
+  }
   const uint32_t recLen = cf.slots[i].len;
   uint64_t n = 0;
   if (from < recLen) {
@@ -475,6 +522,40 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   const tp::FillSlot& slot = cf.L.slots[i];
   const auto* rec = reinterpret_cast<const uint8_t*>(rounded->data() + recOff);
   const uint64_t t0 = nowUs();
+  if (cf.rnt) {
+    const auto& pg = cf.rm.ranges[slot.branch].pages[slot.basket];
+    tp::ConvertedPage p = tp::convertPage(rec, recLen, pg.nbytes, pg.hasChecksum, pg.uncompressedBytes);
+    const uint64_t us = nowUs() - t0;
+    if (!p.error.empty()) {
+      // A page whose checksum or decode fails must not be served decoded: the
+      // reader could no longer detect it. Fail the read, as ROOT would.
+      UCACHE_WARN("cold run for %s: page at %llu: %s", cf.key.key.c_str(),
+                  static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
+      req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
+      req->done();
+      return;
+    }
+    const uint8_t kind = p.enc.size() == p.raw.size() ? tp::ConvertedBasket::kRaw
+                                                      : tp::ConvertedBasket::kZstd;
+    cf.convertUs.fetch_add(us, std::memory_order_relaxed);
+    cf.inBytes.fetch_add(recLen, std::memory_order_relaxed);
+    cf.outBytes.fetch_add(p.enc.size(), std::memory_order_relaxed);
+    (kind == tp::ConvertedBasket::kZstd ? cf.nZstd : cf.nRaw).fetch_add(1, std::memory_order_relaxed);
+    if (req->st->store) {
+      auto& stats = req->st->store->stats();
+      stats.coldReplicaConvertUs.fetch_add(us, std::memory_order_relaxed);
+      stats.coldReplicaBaskets.fetch_add(1, std::memory_order_relaxed);
+      stats.coldReplicaInBytes.fetch_add(recLen, std::memory_order_relaxed);
+      stats.coldReplicaOutBytes.fetch_add(p.enc.size(), std::memory_order_relaxed);
+    }
+    if (cf.keepOriginals) {
+      req->entry->writePages(rStart, rounded->size(), rounded->data());
+      req->entry->flushMeta(false);
+    }
+    cf.stage(i, kind, std::move(p.enc));
+    req->done();
+    return;
+  }
   tp::ConvertedBasket c = tp::convertBasket(rec, recLen, slot.vLen, cf.codecs);
   if (!c.error.empty()) { // not a basket: the reader gets the origin's bytes, as it would have
     c.kind = tp::ConvertedBasket::kOriginal;
@@ -803,11 +884,36 @@ void ColdFill::publish() {
     UCACHE_DEBUG("cold run for %s converted nothing; no replica", key.key.c_str());
     return;
   }
-  tp::Overlay ov = tp::buildOverlayFromRecords(
-      fm, treeKeyHeader, keysList, list, [&](size_t j, std::vector<uint8_t>& out) {
-        out.resize(slots[idx[j]].len);
-        return readRecord(idx[j], out.data(), 0, out.size());
-      });
+  tp::Overlay ov;
+  if (rnt) {
+    // Pages are addressed by (range, page) here and by original offset in the
+    // slots: a page several records share has one slot.
+    std::unordered_map<uint64_t, uint32_t> byOffset;
+    for (uint32_t i = 0; i < L.slots.size(); ++i)
+      byOffset.emplace(L.slots[i].origSeek, i);
+    auto slotOf = [&](size_t ri, size_t pi) -> int64_t {
+      auto it = byOffset.find(rm.ranges[ri].pages[pi].offset);
+      if (it == byOffset.end() || slots[it->second].state.load(std::memory_order_acquire) != kReady)
+        return -1;
+      return it->second;
+    };
+    auto rw = tp::buildRNTupleRewriteFromPages(
+        rm, L.originSize, 1, [&](size_t ri, size_t pi) { return slotOf(ri, pi) >= 0; },
+        [&](size_t ri, size_t pi, std::vector<uint8_t>& enc) {
+          const int64_t i = slotOf(ri, pi);
+          if (i < 0)
+            return false;
+          enc.resize(slots[i].len);
+          return readRecord(static_cast<uint32_t>(i), enc.data(), 0, enc.size());
+        });
+    ov = tp::rnTupleOverlay(rm, rw);
+  } else {
+    ov = tp::buildOverlayFromRecords(fm, treeKeyHeader, keysList, list,
+                                     [&](size_t j, std::vector<uint8_t>& out) {
+                                       out.resize(slots[idx[j]].len);
+                                       return readRecord(idx[j], out.data(), 0, out.size());
+                                     });
+  }
   if (!ov.error.empty()) {
     UCACHE_WARN("cold run for %s: replica not built (%s)", key.key.c_str(), ov.error.c_str());
     if (auto store = globalStore())
@@ -935,8 +1041,8 @@ void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
     out.emplace_back(off, std::min(end, L.originSize) - off);
   const uint64_t metaEnd = L.metaSeek + L.metaRecord.size();
   if (off < metaEnd && end > L.metaSeek)
-    out.emplace_back(static_cast<uint64_t>(cf.fm.treeKey.seekkey),
-                     static_cast<uint64_t>(cf.fm.treeKey.nbytes));
+    for (const auto& r : cf.metaOrigin)
+      out.push_back(r);
   if (end > L.slotsBegin && !L.slots.empty()) {
     auto it = std::upper_bound(L.slots.begin(), L.slots.end(), std::max(off, L.slotsBegin),
                                [](uint64_t v, const tp::FillSlot& s) { return v < s.vSeek; });

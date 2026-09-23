@@ -3,6 +3,7 @@
 // the way a reader's request would fill it; the extension's unused bytes are
 // the zeros a reader would be served.
 #include "FillLayout.h"
+#include "RNTupleRewrite.h"
 
 #include <algorithm>
 #include <chrono>
@@ -40,6 +41,74 @@ bool writeZeros(int fd, uint64_t n) {
   return true;
 }
 
+// An RNTuple file in its cold-run layout: pages decoded into their slots.
+int rntupleMain(const char* inPath, const char* outPath, const std::vector<std::string>& codecs) {
+  using namespace ucache::transpose;
+  RNTupleMeta m = parseRNTuple(inPath, "");
+  if (!m.error.empty()) {
+    std::fprintf(stderr, "parse: %s\n", m.error.c_str());
+    return 1;
+  }
+  int in = ::open(inPath, O_RDONLY | O_CLOEXEC);
+  std::vector<uint8_t> header(100);
+  if (in < 0 || !preadAll(in, header.data(), header.size(), 0)) {
+    std::fprintf(stderr, "cannot read %s\n", inPath);
+    return 1;
+  }
+  FillLayout L = layoutForRNTupleFill(m, m.fileSize, header, codecs);
+  if (!L.error.empty()) {
+    std::fprintf(stderr, "declined: %s\n", L.error.c_str());
+    return 3;
+  }
+  int out = ::open(outPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (out < 0)
+    return 1;
+  std::vector<uint8_t> buf(8 << 20);
+  for (uint64_t at = 0; at < L.originSize;) {
+    size_t n = (size_t)std::min<uint64_t>(buf.size(), L.originSize - at);
+    if (!preadAll(in, buf.data(), n, at))
+      return 1;
+    for (const auto& w : L.windows) {
+      const uint64_t a = std::max(w.off, at), b = std::min(w.off + w.bytes.size(), at + n);
+      if (a < b) std::memcpy(buf.data() + (a - at), w.bytes.data() + (a - w.off), b - a);
+    }
+    if (!writeAll(out, buf.data(), n))
+      return 1;
+    at += n;
+  }
+  if (!writeZeros(out, L.metaSeek - L.originSize) || !writeAll(out, L.metaRecord.data(), L.metaRecord.size()) ||
+      !writeZeros(out, L.slotsBegin - L.metaSeek - L.metaRecord.size()))
+    return 1;
+  unsigned long long rawBytes = 0, encBytes = 0, inBytes = 0;
+  std::vector<uint8_t> rec;
+  for (const auto& s : L.slots) {
+    rec.resize(s.origLen);
+    if (!preadAll(in, rec.data(), rec.size(), s.origSeek))
+      return 1;
+    const auto& pg = m.ranges[s.branch].pages[s.basket];
+    ConvertedPage c = convertPage(rec.data(), rec.size(), pg.nbytes, pg.hasChecksum, pg.uncompressedBytes);
+    if (!c.error.empty() || c.raw.size() != s.vLen) {
+      std::fprintf(stderr, "page at %llu: %s\n", (unsigned long long)s.origSeek, c.error.c_str());
+      return 1;
+    }
+    if (!writeAll(out, c.raw.data(), c.raw.size()))
+      return 1;
+    rawBytes += c.raw.size();
+    encBytes += c.enc.size();
+    inBytes += s.origLen;
+  }
+  ::close(in);
+  if (::close(out) != 0)
+    return 1;
+  std::printf("{\"rntuple\":true,\"slots\":%zu,\"ranges_relocated\":%zu,\"ranges\":%zu,"
+              "\"orig_page_bytes\":%llu,\"raw_bytes\":%llu,\"zstd1_bytes\":%llu,"
+              "\"origin_size\":%llu,\"virtual_size\":%llu,\"header_promoted\":%s}\n",
+              L.slots.size(), L.relocated.size(), m.ranges.size(), inBytes, rawBytes, encBytes,
+              (unsigned long long)L.originSize, (unsigned long long)L.virtualSize,
+              L.windows.front().off == 0 ? "true" : "false");
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -63,6 +132,8 @@ int main(int argc, char** argv) {
 
   const auto t0 = std::chrono::steady_clock::now();
   FileMeta fm = parseFile(argv[1], tree);
+  if (!fm.error.empty() && fm.error.find("not found") != std::string::npos)
+    return rntupleMain(argv[1], argv[2], codecs); // no such TTree: perhaps an RNTuple
   if (!fm.error.empty()) {
     std::fprintf(stderr, "parse: %s\n", fm.error.c_str());
     return 1;

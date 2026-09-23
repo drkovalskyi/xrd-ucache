@@ -102,17 +102,27 @@ Frame readFrame(LE& c) {
   return f;
 }
 
-std::vector<uint8_t> preadRange(int fd, uint64_t off, uint64_t len, uint64_t fileSize) {
-  if (len == 0 || off > fileSize || len > fileSize - off) return {};
+// A plain file as a Source: every byte is present.
+struct FdSource : Source {
+  int fd = -1;
+  uint64_t size = 0;
+  bool has(uint64_t off, uint64_t n) override { return off + n >= off && off + n <= size; }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    return ::pread(fd, dst, n, (off_t)off) == (ssize_t)n;
+  }
+};
+
+std::vector<uint8_t> preadRange(Source& src, uint64_t off, uint64_t len, uint64_t fileSize) {
+  if (len == 0 || off > fileSize || len > fileSize - off || !src.has(off, len)) return {};
   std::vector<uint8_t> buf((size_t)len);
-  if (::pread(fd, buf.data(), buf.size(), (off_t)off) != (ssize_t)buf.size()) return {};
+  if (!src.read(buf.data(), buf.size(), off)) return {};
   return buf;
 }
 
 // Read an envelope: `nbytes` on disk at `off`, inflating to `len` if the two
 // disagree. The seek points past the enclosing key header, straight at the
 // block, exactly as a page locator does.
-std::vector<uint8_t> readEnvelope(int fd, uint64_t off, uint64_t nbytes, uint64_t len,
+std::vector<uint8_t> readEnvelope(Source& fd, uint64_t off, uint64_t nbytes, uint64_t len,
                                   uint64_t fileSize) {
   auto raw = preadRange(fd, off, nbytes, fileSize);
   if (raw.empty()) return {};
@@ -158,7 +168,11 @@ void sealEnvelope(uint8_t* p, size_t n) {
   for (size_t i = 0; i < 8; ++i) p[n - 8 + i] = (uint8_t)((h >> (8 * i)) & 0xFF);
 }
 
-RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
+namespace {
+
+// The walk itself, over whatever holds the bytes. `cm` is the container walk
+// already done over the same bytes.
+RNTupleMeta parseRNTupleFrom(Source& fd, const ContainerMeta& cm, const std::string& ntuple) {
   RNTupleMeta m;
   auto fail = [&](std::string why) {
     m.error = std::move(why);
@@ -166,14 +180,8 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
     m.columns.clear();
     return m;
   };
-
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return fail("cannot open " + path);
-  ContainerMeta cm = parseContainer(fd);
-  if (!cm.error.empty()) {
-    ::close(fd);
+  if (!cm.error.empty())
     return fail(cm.error);
-  }
   const uint64_t fsz = (uint64_t)cm.fileSize;
   m.fileSize = fsz;
   m.fend = cm.fend;
@@ -187,7 +195,6 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
         e.cycle >= anchorKey.cycle)
       anchorKey = e;
   if (anchorKey.nbytes == 0) {
-    ::close(fd);
     return fail("RNTuple '" + ntuple + "' not found in keys list");
   }
 
@@ -196,7 +203,6 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
   // trailing checksum: 78 bytes. Unlike everything else here the anchor is
   // BIG-endian, the ROOT streamer convention.
   if (ap.size() < 78) {
-    ::close(fd);
     return fail("anchor payload too short");
   }
   m.anchor.versionEpoch = beU16(ap.data() + 6);
@@ -221,24 +227,20 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
     // recomputed or ROOT refuses the file.
     const uint64_t stored = beU64(ap.data() + 70);
     if (xxh3_64(ap.data() + 6, 64) != stored) {
-      ::close(fd);
-      return fail("anchor checksum mismatch");
+        return fail("anchor checksum mismatch");
     }
   }
 
   m.header = readEnvelope(fd, m.anchor.seekHeader, m.anchor.nbytesHeader, m.anchor.lenHeader, fsz);
   m.footer = readEnvelope(fd, m.anchor.seekFooter, m.anchor.nbytesFooter, m.anchor.lenFooter, fsz);
   if (m.header.empty() || m.footer.empty()) {
-    ::close(fd);
     return fail("cannot read header/footer envelope");
   }
   std::string why;
   if (!verifyEnvelope(m.header.data(), m.header.size(), kEnvelopeHeader, why)) {
-    ::close(fd);
     return fail("header " + why);
   }
   if (!verifyEnvelope(m.footer.data(), m.footer.size(), kEnvelopeFooter, why)) {
-    ::close(fd);
     return fail("footer " + why);
   }
 
@@ -274,8 +276,7 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
       if (c.at > c.n) c.bad = true;
     }
     if (c.bad) {
-      ::close(fd);
-      return fail("header schema walk out of bounds");
+        return fail("header schema walk out of bounds");
     }
   }
 
@@ -304,8 +305,7 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
       if (plNbytes < 0) {
         // Extended locator: >2 GB or a non-standard payload. Untested against
         // a real file, so refuse rather than guess at it.
-        ::close(fd);
-        return fail("extended page-list locator unsupported");
+            return fail("extended page-list locator unsupported");
       }
       if (i == 0) m.pageListLocatorOffset = (uint32_t)locAt;
       pageLists.push_back({plLen, {(uint32_t)plNbytes, plOff}});
@@ -313,12 +313,10 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
       if (c.at > c.n) c.bad = true;
     }
     if (c.bad || pageLists.empty()) {
-      ::close(fd);
-      return fail("footer cluster-group walk out of bounds");
+        return fail("footer cluster-group walk out of bounds");
     }
   }
   if (pageLists.size() != 1) {
-    ::close(fd);
     return fail("multiple cluster groups unsupported");
   }
 
@@ -327,7 +325,6 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
   m.pageListNbytes = pageLists[0].second.first;
   m.pageList = readEnvelope(fd, pageLists[0].second.second, pageLists[0].second.first,
                             pageLists[0].first, fsz);
-  ::close(fd);
   if (m.pageList.empty()) return fail("cannot read page-list envelope");
   if (!verifyEnvelope(m.pageList.data(), m.pageList.size(), kEnvelopePageList, why))
     return fail("page list " + why);
@@ -386,6 +383,28 @@ RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
   }
 
   return m;
+}
+
+} // namespace
+
+RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple) {
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    RNTupleMeta m;
+    m.error = "cannot open " + path;
+    return m;
+  }
+  ContainerMeta cm = parseContainer(fd);
+  FdSource src;
+  src.fd = fd;
+  src.size = static_cast<uint64_t>(cm.fileSize);
+  RNTupleMeta m = parseRNTupleFrom(src, cm, ntuple);
+  ::close(fd);
+  return m;
+}
+
+RNTupleMeta parseRNTuple(Source& src, int64_t fileSize, const std::string& ntuple) {
+  return parseRNTupleFrom(src, parseContainer(src, fileSize), ntuple);
 }
 
 } // namespace ucache::transpose

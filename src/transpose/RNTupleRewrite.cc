@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <map>
 #include <set>
 #include <utility>
@@ -74,8 +75,72 @@ std::string rnTupleCodecName(int32_t compressionSettings) {
   }
 }
 
-RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize, int level,
-                                   const std::vector<std::string>& codecs) {
+namespace {
+
+// A page-list or footer envelope as stored: ZSTD at `level`, or raw when that
+// does not shrink it.
+std::vector<uint8_t> storeEnvelope(const std::vector<uint8_t>& env, int level) {
+  auto out = encodeZstdFrames(env.data(), env.size(), level);
+  if (out.empty() || out.size() >= env.size()) out = env;
+  return out;
+}
+
+// Point the footer's cluster-group link at a page list: uncompressed length,
+// then the locator's size and offset. Three separate fields.
+bool patchFooterLink(const RNTupleMeta& m, std::vector<uint8_t>& ftr, uint64_t plLen,
+                     uint64_t plStored, uint64_t plAt) {
+  if (m.pageListLocatorOffset < 8 || m.pageListLocatorOffset + 12 > ftr.size()) return false;
+  putLE(ftr.data() + m.pageListLocatorOffset - 8, plLen, 8);
+  putLE(ftr.data() + m.pageListLocatorOffset, plStored, 4);
+  putLE(ftr.data() + m.pageListLocatorOffset + 4, plAt, 8);
+  return true;
+}
+
+// The anchor, patched where it lies: same size, so its enclosing key is
+// untouched. It is BIG-endian, and its own checksum must be recomputed or ROOT
+// refuses the file outright.
+//
+// ONE contiguous window from seekFooter through the checksum, rather than two
+// with maxKeySize untouched between them. The bytes in the gap are rewritten to
+// their existing values, which costs 8 bytes and means no read of the anchor can
+// straddle an extent boundary -- a stitched reader then never has to splice this
+// record out of two sources.
+RNTuplePatch anchorPatch(const RNTupleMeta& m, uint64_t ftrAt, uint64_t ftrStored, uint64_t ftrLen) {
+  RNTuplePatch p;
+  p.offset = m.anchor.payloadOffset + 38; // seekFooter .. checksum
+  p.bytes.resize(40);
+  putBE(p.bytes.data(), ftrAt, 8);
+  putBE(p.bytes.data() + 8, ftrStored, 8);
+  putBE(p.bytes.data() + 16, ftrLen, 8);
+  putBE(p.bytes.data() + 24, m.anchor.maxKeySize, 8); // unchanged, rewritten
+  // Rebuild the checksummed window (payload[6:70]) to hash it.
+  std::vector<uint8_t> win(64);
+  putBE(win.data(), m.anchor.versionEpoch, 2);
+  putBE(win.data() + 2, m.anchor.versionMajor, 2);
+  putBE(win.data() + 4, m.anchor.versionMinor, 2);
+  putBE(win.data() + 6, m.anchor.versionPatch, 2);
+  putBE(win.data() + 8, m.anchor.seekHeader, 8);
+  putBE(win.data() + 16, m.anchor.nbytesHeader, 8);
+  putBE(win.data() + 24, m.anchor.lenHeader, 8);
+  putBE(win.data() + 32, ftrAt, 8);
+  putBE(win.data() + 40, ftrStored, 8);
+  putBE(win.data() + 48, ftrLen, 8);
+  putBE(win.data() + 56, m.anchor.maxKeySize, 8);
+  putBE(p.bytes.data() + 32, xxh3_64(win.data(), win.size()), 8);
+  return p;
+}
+
+// How a build decides a range, and obtains a relocated page's new block.
+//   eligible: 0 = relocate, 1 = declined by codec policy (`codec` set when
+//             known), 2 = not available.
+//   block:    fill `enc` with the page's new block WITHOUT its checksum; false
+//             with `err` set (and `transient` when the source could not vouch).
+using EligibleFn = std::function<int(size_t ri, const ColumnRange& r, std::string& codec)>;
+using BlockFn = std::function<bool(size_t ri, size_t pi, const PageInfo& pg, std::vector<uint8_t>& enc,
+                                   RNTupleRewrite& rw, std::string& err, bool& transient)>;
+
+RNTupleRewrite buildImpl(const RNTupleMeta& m, uint64_t fileSize, int level,
+                         const EligibleFn& eligible, const BlockFn& block) {
   RNTupleRewrite rw;
   rw.extBase = fileSize;
   auto fail = [&](std::string why, bool transient = false) {
@@ -88,7 +153,7 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   if (m.pageList.empty() || m.footer.empty()) return fail("no page list to rewrite");
 
   std::vector<uint8_t> pl = m.pageList; // patched copy
-  std::vector<uint8_t> buf, raw;
+  std::vector<uint8_t> enc;
 
   // RNTuple SHARES pages: distinct page records can point at the same bytes
   // (identical pages are written once). Re-encoding each record separately is
@@ -101,33 +166,28 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   std::set<uint64_t> live;
   std::vector<ReplicaMeta::Range> supersedeCandidates;
 
-  for (const auto& range : m.ranges) {
+  for (size_t ri = 0; ri < m.ranges.size(); ++ri) {
+    const auto& range = m.ranges[ri];
     // Eligibility is decided for the whole range BEFORE any transcode work,
     // because a range that turns out to be unusable half way through would
     // leave its locators half patched.
-    if (!codecs.empty()) {
-      const std::string codec = rnTupleCodecName(range.compressionSettings);
-      if (std::find(codecs.begin(), codecs.end(), codec) == codecs.end()) {
-        ++rw.rangesDeclined;
-        if (rw.declinedCodec.empty() && !codec.empty()) rw.declinedCodec = codec;
-        for (const auto& pg : range.pages) live.insert(pg.offset);
-        continue;
-      }
+    std::string codec;
+    const int e = eligible(ri, range, codec);
+    if (e == 1) {
+      ++rw.rangesDeclined;
+      if (rw.declinedCodec.empty() && !codec.empty()) rw.declinedCodec = codec;
+      for (const auto& pg : range.pages) live.insert(pg.offset);
+      continue;
     }
-    bool cached = true;
-    for (const auto& pg : range.pages)
-      if (!src.has(pg.offset, (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0))) {
-        cached = false;
-        break;
-      }
-    if (!cached) {
+    if (e == 2) {
       ++rw.rangesUncached;
       for (const auto& pg : range.pages) live.insert(pg.offset);
       continue; // left pointing at the original bytes
     }
     ++rw.rangesRelocated;
 
-    for (const auto& pg : range.pages) {
+    for (size_t pi = 0; pi < range.pages.size(); ++pi) {
+      const auto& pg = range.pages[pi];
       {
         auto it = seen.find({pg.offset, pg.nbytes});
         if (it != seen.end()) {
@@ -139,54 +199,11 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
         }
       }
       const uint64_t onDisk = (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0);
-      if (!src.has(pg.offset, onDisk))
-        return fail("page bytes not available", true);
-      raw.resize(pg.nbytes);
-      if (pg.nbytes && !src.read(raw.data(), pg.nbytes, pg.offset))
-        return fail("page read failed", true);
-
-      // Verify the page against the checksum the FORMAT already carries,
-      // before anything is re-encoded. Skipping this is not a theoretical
-      // risk: a page stored uncompressed decodes to itself, so damaged bytes
-      // pass straight through the transcoder and into a replica that then
-      // serves them for ever. The checksum is right there — use it.
-      if (pg.hasChecksum) {
-        uint8_t ck[8];
-        if (!src.read(ck, 8, pg.offset + pg.nbytes))
-          return fail("page checksum read failed", true);
-        uint64_t stored = 0;
-        for (int i = 7; i >= 0; --i) stored = (stored << 8) | ck[(size_t)i];
-        if (xxh3_64(raw.data(), raw.size()) != stored)
-          return fail("page checksum mismatch — source bytes are damaged (run `ucache verify`)");
-      }
-
-      // The page's uncompressed size is authoritative from the schema, not
-      // from the block header: a bit-packed column's byte count is a ceiling
-      // over the element count and nothing on disk restates it.
+      std::string err;
+      bool transient = false;
+      enc.clear();
+      if (!block(ri, pi, pg, enc, rw, err, transient)) return fail(err, transient);
       const uint64_t want = pg.uncompressedBytes;
-      if (want == 0) return fail("page of unknown width (column not in schema)");
-
-      const auto t0 = std::chrono::steady_clock::now();
-      if ((uint64_t)pg.nbytes == want) {
-        buf = raw; // stored uncompressed at source
-      } else {
-        buf = decompressFrames(raw.data(), raw.size(), want);
-        if (buf.size() != want) return fail("page decompression failed");
-      }
-      rw.decodeNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now() - t0)
-                         .count();
-      rw.decodeBytes += want;
-
-      auto enc = encodeZstdFrames(buf.data(), buf.size(), level);
-      // An encoder failure is environmental (e.g. OOM), not a bad file; a
-      // block that fails to shrink is stored raw, exactly as ROOT does.
-      if (enc.empty() && !buf.empty()) return fail("zstd encode failed");
-      const bool rawStore = enc.size() >= buf.size();
-      if (rawStore) {
-        enc = buf;
-        ++rw.storedRaw;
-      }
 
       std::vector<uint8_t> stored = enc;
       if (pg.hasChecksum) {
@@ -235,62 +252,23 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
 
   // Re-seal the page list, then store it compressed like any other payload.
   sealEnvelope(pl.data(), pl.size());
-  auto plStored = encodeZstdFrames(pl.data(), pl.size(), level);
-  if (plStored.empty() || plStored.size() >= pl.size()) plStored = pl;
+  auto plStored = storeEnvelope(pl, level);
   const uint64_t plAt = appendBlob(rw.extension, rw.extBase, plStored, pl.size());
   if (m.pageListNbytes)
     rw.origMap.push_back({plAt, plStored.size(), m.pageListOffset, m.pageListNbytes});
 
-  // Point the footer's cluster-group link at the new page list: uncompressed
-  // length, then the locator's size and offset. Three separate fields.
   std::vector<uint8_t> ftr = m.footer;
-  if (m.pageListLocatorOffset < 8 || m.pageListLocatorOffset + 12 > ftr.size())
+  if (!patchFooterLink(m, ftr, pl.size(), plStored.size(), plAt))
     return fail("footer page-list locator out of bounds");
-  putLE(ftr.data() + m.pageListLocatorOffset - 8, pl.size(), 8);
-  putLE(ftr.data() + m.pageListLocatorOffset, plStored.size(), 4);
-  putLE(ftr.data() + m.pageListLocatorOffset + 4, plAt, 8);
   sealEnvelope(ftr.data(), ftr.size());
-  auto ftrStored = encodeZstdFrames(ftr.data(), ftr.size(), level);
-  if (ftrStored.empty() || ftrStored.size() >= ftr.size()) ftrStored = ftr;
+  auto ftrStored = storeEnvelope(ftr, level);
   const uint64_t ftrAt = appendBlob(rw.extension, rw.extBase, ftrStored, ftr.size());
   if (m.anchor.nbytesFooter)
     rw.origMap.push_back({ftrAt, ftrStored.size(), m.anchor.seekFooter, m.anchor.nbytesFooter});
 
-  // The anchor is patched where it lies: same size, so its enclosing key is
-  // untouched. It is BIG-endian, and its own checksum must be recomputed or
-  // ROOT refuses the file outright.
   if (m.anchor.payloadOffset == 0) return fail("compressed anchor cannot be patched in place");
   if (m.anchor.payloadLength < 78) return fail("anchor payload too short to patch");
-  {
-    // ONE contiguous window from seekFooter through the checksum, rather than
-    // two with maxKeySize untouched between them. The bytes in the gap are
-    // rewritten to their existing values, which costs 8 bytes and means no
-    // read of the anchor can straddle an extent boundary — a stitched reader
-    // then never has to splice this record out of two sources.
-    RNTuplePatch p;
-    p.offset = m.anchor.payloadOffset + 38; // seekFooter .. checksum
-    p.bytes.resize(40);
-    putBE(p.bytes.data(), ftrAt, 8);
-    putBE(p.bytes.data() + 8, ftrStored.size(), 8);
-    putBE(p.bytes.data() + 16, ftr.size(), 8);
-    putBE(p.bytes.data() + 24, m.anchor.maxKeySize, 8); // unchanged, rewritten
-
-    // Rebuild the checksummed window (payload[6:70]) to hash it.
-    std::vector<uint8_t> win(64);
-    putBE(win.data(), m.anchor.versionEpoch, 2);
-    putBE(win.data() + 2, m.anchor.versionMajor, 2);
-    putBE(win.data() + 4, m.anchor.versionMinor, 2);
-    putBE(win.data() + 6, m.anchor.versionPatch, 2);
-    putBE(win.data() + 8, m.anchor.seekHeader, 8);
-    putBE(win.data() + 16, m.anchor.nbytesHeader, 8);
-    putBE(win.data() + 24, m.anchor.lenHeader, 8);
-    putBE(win.data() + 32, ftrAt, 8);
-    putBE(win.data() + 40, ftrStored.size(), 8);
-    putBE(win.data() + 48, ftr.size(), 8);
-    putBE(win.data() + 56, m.anchor.maxKeySize, 8);
-    putBE(p.bytes.data() + 32, xxh3_64(win.data(), win.size()), 8);
-    rw.patches.push_back(std::move(p));
-  }
+  rw.patches.push_back(anchorPatch(m, ftrAt, ftrStored.size(), ftr.size()));
 
   // fEND must cover the appended data or ROOT truncates its view of the file.
   // It is patched at ITS OWN width; a narrow header that the rewrite would
@@ -307,6 +285,249 @@ RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t f
   }
 
   return rw;
+}
+
+} // namespace
+
+RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize, int level,
+                                   const std::vector<std::string>& codecs) {
+  std::vector<uint8_t> raw, buf;
+  EligibleFn eligible = [&](size_t, const ColumnRange& range, std::string& codecOut) {
+    if (!codecs.empty()) {
+      const std::string codec = rnTupleCodecName(range.compressionSettings);
+      if (std::find(codecs.begin(), codecs.end(), codec) == codecs.end()) {
+        codecOut = codec;
+        return 1;
+      }
+    }
+    for (const auto& pg : range.pages)
+      if (!src.has(pg.offset, (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0)))
+        return 2;
+    return 0;
+  };
+  BlockFn block = [&](size_t, size_t, const PageInfo& pg, std::vector<uint8_t>& enc,
+                      RNTupleRewrite& rw, std::string& err, bool& transient) {
+    const uint64_t onDisk = (uint64_t)pg.nbytes + (pg.hasChecksum ? 8 : 0);
+    if (!src.has(pg.offset, onDisk)) {
+      err = "page bytes not available";
+      transient = true;
+      return false;
+    }
+    raw.resize(pg.nbytes);
+    if (pg.nbytes && !src.read(raw.data(), pg.nbytes, pg.offset)) {
+      err = "page read failed";
+      transient = true;
+      return false;
+    }
+    // Verify the page against the checksum the FORMAT already carries,
+    // before anything is re-encoded. Skipping this is not a theoretical
+    // risk: a page stored uncompressed decodes to itself, so damaged bytes
+    // pass straight through the transcoder and into a replica that then
+    // serves them for ever. The checksum is right there — use it.
+    if (pg.hasChecksum) {
+      uint8_t ck[8];
+      if (!src.read(ck, 8, pg.offset + pg.nbytes)) {
+        err = "page checksum read failed";
+        transient = true;
+        return false;
+      }
+      uint64_t stored = 0;
+      for (int i = 7; i >= 0; --i) stored = (stored << 8) | ck[(size_t)i];
+      if (xxh3_64(raw.data(), raw.size()) != stored) {
+        err = "page checksum mismatch — source bytes are damaged (run `ucache verify`)";
+        return false;
+      }
+    }
+    // The page's uncompressed size is authoritative from the schema, not
+    // from the block header: a bit-packed column's byte count is a ceiling
+    // over the element count and nothing on disk restates it.
+    const uint64_t want = pg.uncompressedBytes;
+    if (want == 0) {
+      err = "page of unknown width (column not in schema)";
+      return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if ((uint64_t)pg.nbytes == want) {
+      buf = raw; // stored uncompressed at source
+    } else {
+      buf = decompressFrames(raw.data(), raw.size(), want);
+      if (buf.size() != want) {
+        err = "page decompression failed";
+        return false;
+      }
+    }
+    rw.decodeNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+    rw.decodeBytes += want;
+    enc = encodeZstdFrames(buf.data(), buf.size(), level);
+    // An encoder failure is environmental (e.g. OOM), not a bad file; a
+    // block that fails to shrink is stored raw, exactly as ROOT does.
+    if (enc.empty() && !buf.empty()) {
+      err = "zstd encode failed";
+      return false;
+    }
+    if (enc.size() >= buf.size()) {
+      enc = buf;
+      ++rw.storedRaw;
+    }
+    return true;
+  };
+  return buildImpl(m, fileSize, level, eligible, block);
+}
+
+RNTupleRewrite buildRNTupleRewriteFromPages(
+    const RNTupleMeta& m, uint64_t fileSize, int level,
+    const std::function<bool(size_t ri, size_t pi)>& has,
+    const std::function<bool(size_t ri, size_t pi, std::vector<uint8_t>& enc)>& page) {
+  EligibleFn eligible = [&](size_t ri, const ColumnRange& range, std::string&) {
+    for (size_t pi = 0; pi < range.pages.size(); ++pi)
+      if (!has(ri, pi))
+        return 2;
+    return 0;
+  };
+  BlockFn block = [&](size_t ri, size_t pi, const PageInfo& pg, std::vector<uint8_t>& enc,
+                      RNTupleRewrite& rw, std::string& err, bool& transient) {
+    if (!page(ri, pi, enc)) {
+      err = "converted page unavailable";
+      transient = true;
+      return false;
+    }
+    if (enc.size() > pg.uncompressedBytes) {
+      err = "converted page larger than the page";
+      return false;
+    }
+    if (enc.size() == pg.uncompressedBytes)
+      ++rw.storedRaw;
+    rw.decodeBytes += pg.uncompressedBytes;
+    return true;
+  };
+  return buildImpl(m, fileSize, level, eligible, block);
+}
+
+FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
+                                const std::vector<uint8_t>& header,
+                                const std::vector<std::string>& codecs) {
+  FillLayout L;
+  auto decline = [&](std::string why) {
+    L = FillLayout();
+    L.error = std::move(why);
+    return L;
+  };
+  if (!m.error.empty()) return decline("parse: " + m.error);
+  if (m.pageList.empty() || m.footer.empty()) return decline("no page list");
+  if (fileSize != static_cast<uint64_t>(m.fend) || fileSize != m.fileSize)
+    return decline("file size differs from fEND");
+  if (m.anchor.payloadOffset == 0) return decline("compressed anchor cannot be patched in place");
+  if (m.anchor.payloadLength < 78) return decline("anchor payload too short to patch");
+  if (m.anchor.payloadOffset + 78 > fileSize) return decline("anchor outside the file");
+
+  for (uint32_t ri = 0; ri < m.ranges.size(); ++ri) {
+    const auto& r = m.ranges[ri];
+    const std::string codec = rnTupleCodecName(r.compressionSettings);
+    if (r.pages.empty() || std::find(codecs.begin(), codecs.end(), codec) == codecs.end())
+      continue;
+    bool ok = true;
+    for (const auto& pg : r.pages)
+      ok = ok && pg.uncompressedBytes > 0 && pg.uncompressedBytes <= 0x7FFFFFFFull &&
+           pg.offset + pg.nbytes + (pg.hasChecksum ? 8 : 0) <= fileSize && pg.offset >= 100;
+    if (ok) L.relocated.push_back(ri);
+  }
+  if (L.relocated.empty()) return decline("no convertible column range");
+
+  // The page list and footer come first; their reservation is their RAW size in
+  // an RBlob key each, since the patched envelopes keep their length and their
+  // compressed size is not known until the slot offsets inside them are.
+  L.originSize = fileSize;
+  L.metaSeek = (fileSize + 4095) / 4096 * 4096;
+  const uint64_t reserve = 2 * kRBlobKeyLen + m.pageList.size() + m.footer.size();
+  L.slotsBegin = L.metaSeek + reserve;
+
+  std::vector<uint8_t> pl = m.pageList;
+  std::map<uint64_t, uint64_t> seen; // original page offset -> slot offset
+  uint64_t at = L.slotsBegin;
+  for (uint32_t ri : L.relocated) {
+    const auto& r = m.ranges[ri];
+    for (uint32_t pi = 0; pi < r.pages.size(); ++pi) {
+      const auto& pg = r.pages[pi];
+      uint64_t v;
+      auto it = seen.find(pg.offset);
+      if (it != seen.end()) {
+        v = it->second;
+      } else {
+        FillSlot s;
+        s.origSeek = pg.offset;
+        s.origLen = pg.nbytes + (pg.hasChecksum ? 8u : 0u);
+        s.vSeek = at;
+        s.vLen = static_cast<uint32_t>(pg.uncompressedBytes);
+        s.branch = ri;
+        s.basket = pi;
+        L.slots.push_back(s);
+        v = at;
+        seen.emplace(pg.offset, at);
+        at += s.vLen;
+      }
+      putLE(pl.data() + pg.recordOffset, pg.nElements, 4); // positive: no checksum
+      putLE(pl.data() + pg.recordOffset + 4, pg.uncompressedBytes, 4);
+      putLE(pl.data() + pg.recordOffset + 8, v, 8);
+    }
+    putLE(pl.data() + r.compressionOffset, 0, 4);
+  }
+  L.virtualSize = at;
+
+  sealEnvelope(pl.data(), pl.size());
+  const auto plStored = storeEnvelope(pl, 1);
+  std::vector<uint8_t> blobs;
+  const uint64_t plAt = appendBlob(blobs, L.metaSeek, plStored, pl.size());
+  std::vector<uint8_t> ftr = m.footer;
+  if (!patchFooterLink(m, ftr, pl.size(), plStored.size(), plAt))
+    return decline("footer page-list locator out of bounds");
+  sealEnvelope(ftr.data(), ftr.size());
+  const auto ftrStored = storeEnvelope(ftr, 1);
+  const uint64_t ftrAt = appendBlob(blobs, L.metaSeek, ftrStored, ftr.size());
+  if (blobs.size() > reserve) return decline("metadata outgrew its reservation");
+  L.metaRecord = std::move(blobs);
+
+  FillLayout::Window hw;
+  std::string err;
+  if (!headerWindowForEnd(header, L.virtualSize, hw.off, hw.bytes, err)) return decline(err);
+  RNTuplePatch ap = anchorPatch(m, ftrAt, ftrStored.size(), ftr.size());
+  L.windows.push_back(std::move(hw));
+  L.windows.push_back({ap.offset, std::move(ap.bytes)});
+  std::sort(L.windows.begin(), L.windows.end(),
+            [](const FillLayout::Window& a, const FillLayout::Window& b) { return a.off < b.off; });
+  if (L.windows[0].off + L.windows[0].bytes.size() > L.windows[1].off)
+    return decline("anchor overlaps the file header");
+  return L;
+}
+
+ConvertedPage convertPage(const uint8_t* onDisk, size_t n, uint32_t nbytes, bool hasChecksum,
+                          uint64_t uncompressed) {
+  ConvertedPage c;
+  if (n != nbytes + (hasChecksum ? 8u : 0u) || uncompressed == 0) {
+    c.error = "page geometry";
+    return c;
+  }
+  if (hasChecksum) {
+    uint64_t stored = 0;
+    for (int i = 7; i >= 0; --i) stored = (stored << 8) | onDisk[nbytes + (size_t)i];
+    if (xxh3_64(onDisk, nbytes) != stored) {
+      c.error = "page checksum mismatch";
+      return c;
+    }
+  }
+  if (nbytes == uncompressed)
+    c.raw.assign(onDisk, onDisk + nbytes);
+  else
+    c.raw = decompressFrames(onDisk, nbytes, uncompressed);
+  if (c.raw.size() != uncompressed) {
+    c.error = "page decompression failed";
+    c.raw.clear();
+    return c;
+  }
+  c.enc = encodeZstdFrames(c.raw.data(), c.raw.size(), 1);
+  if (c.enc.empty() || c.enc.size() >= c.raw.size()) c.enc = c.raw;
+  return c;
 }
 
 Overlay rnTupleOverlay(const RNTupleMeta& m, const RNTupleRewrite& rw) {

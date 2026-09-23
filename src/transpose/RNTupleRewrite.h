@@ -16,8 +16,11 @@
 // Thread-safety: pure functions over caller-owned data; no shared state.
 #pragma once
 
+#include "FillLayout.h"
 #include "RNTupleMeta.h"
 #include "Transposer.h" // Source
+
+#include <functional>
 
 #include <cstdint>
 #include <string>
@@ -78,6 +81,45 @@ struct RNTupleRewrite {
 // range and could not describe a range that was only half relocated.
 RNTupleRewrite buildRNTupleRewrite(const RNTupleMeta& m, Source& src, uint64_t fileSize, int level,
                                    const std::vector<std::string>& codecs = {});
+
+// The same build from pages converted elsewhere -- the cold replica run
+// converts them as the reader asks. A range is relocated when `has` answers
+// true for every one of its pages (its codec was already judged when the page
+// was converted); `page(ri, pi, enc)` then fills `enc` with page pi of range ri
+// as its new block, ZSTD-1 or uncompressed, WITHOUT a checksum (one is added
+// here where the page carries one). Output identical in form to the above.
+RNTupleRewrite buildRNTupleRewriteFromPages(
+    const RNTupleMeta& m, uint64_t fileSize, int level,
+    const std::function<bool(size_t ri, size_t pi)>& has,
+    const std::function<bool(size_t ri, size_t pi, std::vector<uint8_t>& enc)>& page);
+
+// The layout an RNTuple file is presented in while its replica is created on
+// the first read, computed from metadata alone (see FillLayout.h for the TTree
+// counterpart and the shape of the result). A page's uncompressed size IS in
+// the metadata, so every page of a convertible column range gets a slot of
+// exactly that size and is served DECODED: its record's locator points at the
+// slot with size = uncompressed size (ROOT copies a page whose stored and
+// uncompressed sizes agree), its checksum flag is cleared, and the range's
+// compression setting becomes 0. The rebuilt page list and footer come first in
+// the extension, the anchor is patched in place, and the header says the new
+// end. `header` = the file's first fBEGIN bytes. `slots[i].branch` is the
+// range index and `.basket` the page index; a page several records share gets
+// one slot. Declines (error set) rather than guess.
+FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
+                                const std::vector<uint8_t>& header,
+                                const std::vector<std::string>& codecs);
+
+// One page prepared for a cold run from its ORIGINAL on-disk bytes (block, plus
+// the 8-byte checksum when it carries one): `raw` = the decoded page, what the
+// reader is served; `enc` = the block the replica keeps (ZSTD-1, or `raw` when
+// that does not shrink it). A checksum that does not match, or a page that does
+// not decode to `uncompressed` bytes, sets `error`: the bytes must not be served.
+struct ConvertedPage {
+  std::vector<uint8_t> raw, enc;
+  std::string error;
+};
+ConvertedPage convertPage(const uint8_t* onDisk, size_t n, uint32_t nbytes, bool hasChecksum,
+                          uint64_t uncompressed);
 
 // Codec name for a page-list compression setting ("lzma"/"zlib"/"zstd"/"lz4"/
 // "none"), the same vocabulary the recompress policy is written in.

@@ -158,9 +158,10 @@ rejected, or cleaned up. See the replica section of [FORMAT.md](FORMAT.md).
 
 ### Replicas created on the first pass
 
-With `recompress = on`, a TTree file that has no replica is converted as the
-job reads it and its replica is published when the job closes it. All zero
-otherwise. `ucache stats` prints them on one `cold replica run` line.
+With `recompress = on`, a file that has no replica is converted as the job
+reads it and its replica is published when the job closes it. All zero
+otherwise. `ucache stats` prints them on one `cold replica run` line. For an
+RNTuple file, read "page" wherever these say "basket".
 
 - `cold_replica_files` — files served this way.
 - `cold_replica_in_bytes` / `cold_replica_out_bytes` — original basket bytes

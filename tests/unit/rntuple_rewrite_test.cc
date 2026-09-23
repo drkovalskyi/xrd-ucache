@@ -267,3 +267,154 @@ TEST(RNTupleRewrite, OriginMapCoversTheWholePageIncludingItsChecksum) {
       if (r.origOff == s.off) mapTotal += r.origLen;
   EXPECT_EQ(mapTotal, supTotal);
 }
+
+// ---------------------------------------------------------------------------
+// The cold replica run's RNTuple layout: pages served DECODED in slots of their
+// uncompressed size. The file it describes must parse back -- envelopes,
+// anchor checksum and all -- with every relocated record pointing at its slot
+// as an uncompressed, checksum-less page, and every page must decode to the
+// same bytes as in the original.
+namespace {
+
+struct BytesSource : Source {
+  std::vector<uint8_t> b;
+  bool has(uint64_t off, uint64_t n) override { return off + n >= off && off + n <= b.size(); }
+  bool read(void* dst, uint64_t n, uint64_t off) override {
+    if (!has(off, n)) return false;
+    std::memcpy(dst, b.data() + off, n);
+    return true;
+  }
+};
+
+std::vector<uint8_t> slurp(const std::string& path) {
+  std::vector<uint8_t> out;
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return out;
+  uint8_t buf[65536];
+  size_t n;
+  while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.insert(out.end(), buf, buf + n);
+  std::fclose(f);
+  return out;
+}
+
+} // namespace
+
+TEST(RNTupleFill, LayoutParsesBackAndServesTheSamePages) {
+  RNTupleMeta m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  const auto orig = slurp(fixture());
+  ASSERT_EQ(orig.size(), m.fileSize);
+  const std::vector<uint8_t> header(orig.begin(), orig.begin() + 100);
+  const std::string codec = rnTupleCodecName(m.ranges[0].compressionSettings);
+  FillLayout L = layoutForRNTupleFill(m, m.fileSize, header, {codec});
+  ASSERT_TRUE(L.error.empty()) << L.error;
+  ASSERT_FALSE(L.slots.empty());
+  EXPECT_EQ(L.originSize, m.fileSize);
+  EXPECT_LE(L.metaSeek + L.metaRecord.size(), L.slotsBegin);
+
+  // The file the reader is shown: original + windows, zeros, metadata, slots.
+  BytesSource v;
+  v.b = orig;
+  for (const auto& w : L.windows) std::memcpy(v.b.data() + w.off, w.bytes.data(), w.bytes.size());
+  v.b.resize(L.virtualSize, 0);
+  std::memcpy(v.b.data() + L.metaSeek, L.metaRecord.data(), L.metaRecord.size());
+  for (const auto& s : L.slots) {
+    const auto& pg = m.ranges[s.branch].pages[s.basket];
+    ConvertedPage c = convertPage(orig.data() + s.origSeek, s.origLen, pg.nbytes, pg.hasChecksum,
+                                  pg.uncompressedBytes);
+    ASSERT_TRUE(c.error.empty()) << c.error;
+    ASSERT_EQ(c.raw.size(), s.vLen);
+    std::memcpy(v.b.data() + s.vSeek, c.raw.data(), c.raw.size());
+  }
+
+  RNTupleMeta t = parseRNTuple(v, static_cast<int64_t>(v.b.size()), "");
+  ASSERT_TRUE(t.error.empty()) << t.error; // envelope and anchor checksums hold
+  ASSERT_EQ(t.ranges.size(), m.ranges.size());
+  size_t relocatedPages = 0;
+  for (uint32_t ri : L.relocated)
+    for (const auto& pg : t.ranges[ri].pages) {
+      EXPECT_EQ(pg.nbytes, pg.uncompressedBytes);
+      EXPECT_FALSE(pg.hasChecksum);
+      EXPECT_GE(pg.offset, L.slotsBegin);
+      EXPECT_LE(pg.offset + pg.nbytes, L.virtualSize);
+      ++relocatedPages;
+    }
+  EXPECT_GT(relocatedPages, L.slots.size() - 1); // shared pages: records >= slots
+  for (uint32_t ri : L.relocated) EXPECT_EQ(t.ranges[ri].compressionSettings, 0);
+
+  FileSource src(::open(fixture().c_str(), O_RDONLY), m.fileSize);
+  EXPECT_EQ(decodeAllPages(t, v), decodeAllPages(m, src));
+}
+
+TEST(RNTupleFill, PublishFromConvertedPagesMatchesTheRewrite) {
+  RNTupleMeta m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  const auto orig = slurp(fixture());
+  int fd = ::open(fixture().c_str(), O_RDONLY);
+  FileSource src(fd, m.fileSize);
+  RNTupleRewrite ref = buildRNTupleRewrite(m, src, m.fileSize, 1, {});
+  ::close(fd);
+  ASSERT_TRUE(ref.error.empty()) << ref.error;
+  RNTupleRewrite got = buildRNTupleRewriteFromPages(
+      m, m.fileSize, 1, [](size_t, size_t) { return true; },
+      [&](size_t ri, size_t pi, std::vector<uint8_t>& enc) {
+        const auto& pg = m.ranges[ri].pages[pi];
+        ConvertedPage c = convertPage(orig.data() + pg.offset, pg.nbytes + (pg.hasChecksum ? 8 : 0),
+                                      pg.nbytes, pg.hasChecksum, pg.uncompressedBytes);
+        enc = c.enc;
+        return c.error.empty();
+      });
+  ASSERT_TRUE(got.error.empty()) << got.error;
+  EXPECT_EQ(got.extension, ref.extension);
+  ASSERT_EQ(got.patches.size(), ref.patches.size());
+  for (size_t i = 0; i < got.patches.size(); ++i) {
+    EXPECT_EQ(got.patches[i].offset, ref.patches[i].offset);
+    EXPECT_EQ(got.patches[i].bytes, ref.patches[i].bytes);
+  }
+  EXPECT_EQ(got.superseded.size(), ref.superseded.size());
+  EXPECT_EQ(got.rangesRelocated, ref.rangesRelocated);
+
+  // A range with a page the stage does not hold stays where it was.
+  RNTupleRewrite part = buildRNTupleRewriteFromPages(
+      m, m.fileSize, 1, [](size_t ri, size_t) { return ri != 0; },
+      [&](size_t ri, size_t pi, std::vector<uint8_t>& enc) {
+        const auto& pg = m.ranges[ri].pages[pi];
+        enc = convertPage(orig.data() + pg.offset, pg.nbytes + (pg.hasChecksum ? 8 : 0), pg.nbytes,
+                          pg.hasChecksum, pg.uncompressedBytes)
+                  .enc;
+        return true;
+      });
+  ASSERT_TRUE(part.error.empty()) << part.error;
+  EXPECT_EQ(part.rangesRelocated, ref.rangesRelocated - 1);
+  EXPECT_EQ(part.rangesUncached, 1u);
+}
+
+TEST(RNTupleFill, DamagedPageIsNeverServed) {
+  RNTupleMeta m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  auto orig = slurp(fixture());
+  const PageInfo* pg = nullptr;
+  for (const auto& r : m.ranges)
+    for (const auto& p : r.pages)
+      if (p.hasChecksum && p.nbytes > 4 && !pg) pg = &p;
+  ASSERT_NE(pg, nullptr) << "the fixture's pages carry checksums";
+  ConvertedPage ok = convertPage(orig.data() + pg->offset, pg->nbytes + 8, pg->nbytes, true,
+                                 pg->uncompressedBytes);
+  EXPECT_TRUE(ok.error.empty()) << ok.error;
+  orig[pg->offset + 1] ^= 0x40;
+  ConvertedPage bad = convertPage(orig.data() + pg->offset, pg->nbytes + 8, pg->nbytes, true,
+                                  pg->uncompressedBytes);
+  EXPECT_FALSE(bad.error.empty());
+  EXPECT_TRUE(bad.raw.empty());
+}
+
+TEST(RNTupleFill, Declines) {
+  RNTupleMeta m = parseRNTuple(fixture(), "");
+  ASSERT_TRUE(m.error.empty()) << m.error;
+  const auto orig = slurp(fixture());
+  const std::vector<uint8_t> header(orig.begin(), orig.begin() + 100);
+  EXPECT_FALSE(layoutForRNTupleFill(m, m.fileSize, header, {"lz4"}).error.empty());
+  EXPECT_FALSE(layoutForRNTupleFill(m, m.fileSize + 1, header,
+                                    {rnTupleCodecName(m.ranges[0].compressionSettings)})
+                   .error.empty());
+}

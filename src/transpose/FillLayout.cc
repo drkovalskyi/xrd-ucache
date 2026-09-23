@@ -130,6 +130,28 @@ std::vector<uint8_t> largeHeader(const Header& h, int64_t newEnd) {
 
 } // namespace
 
+bool headerWindowForEnd(const std::vector<uint8_t>& header, uint64_t newEnd, uint64_t& windowOff,
+                        std::vector<uint8_t>& window, std::string& err) {
+  Header H;
+  if (!parseHeader(header, H)) {
+    err = "file header unreadable or fBEGIN below 75";
+    return false;
+  }
+  if (H.large) {
+    window.assign(8, 0);
+    bePut<int64_t>(window.data(), static_cast<int64_t>(newEnd));
+    windowOff = 12;
+  } else if (newEnd < (1ull << 31)) {
+    window.assign(4, 0);
+    bePut<int32_t>(window.data(), static_cast<int32_t>(newEnd));
+    windowOff = 12;
+  } else {
+    window = largeHeader(H, static_cast<int64_t>(newEnd));
+    windowOff = 0;
+  }
+  return true;
+}
+
 std::string codecOfSetting(int32_t compress, int32_t fileCompress) {
   int32_t c = compress < 0 ? fileCompress : compress;
   if (c <= 0 || c % 100 == 0) // unset, or level 0: stored uncompressed
@@ -285,16 +307,12 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
 
   // The header: fEND at its own width, or the whole header rewritten in the
   // 64-bit layout when a 32-bit header cannot hold the virtual end.
-  if (H.large) {
-    std::vector<uint8_t> w(8);
-    bePut<int64_t>(w.data(), static_cast<int64_t>(L.virtualSize));
-    L.windows.push_back({12, std::move(w)});
-  } else if (L.virtualSize < (1ull << 31)) {
-    std::vector<uint8_t> w(4);
-    bePut<int32_t>(w.data(), static_cast<int32_t>(L.virtualSize));
-    L.windows.push_back({12, std::move(w)});
-  } else {
-    L.windows.push_back({0, largeHeader(H, static_cast<int64_t>(L.virtualSize))});
+  {
+    FillLayout::Window w;
+    std::string err;
+    if (!headerWindowForEnd(header, L.virtualSize, w.off, w.bytes, err))
+      return decline(err);
+    L.windows.push_back(std::move(w));
   }
   L.windows.push_back({static_cast<uint64_t>(fm.keyslistSeek), std::move(klist)});
   return L;

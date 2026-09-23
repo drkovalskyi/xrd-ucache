@@ -74,6 +74,14 @@ struct FillLayout {
   std::vector<uint32_t> relocated;   // branch indices, in slot order
 };
 
+// The file-header window that makes the header say fEND = `newEnd`: fEND at
+// the header's own width at offset 12, or -- when a 32-bit header cannot hold
+// it -- the whole header rewritten in place in the 64-bit layout at offset 0,
+// as ROOT itself does when a file passes 2 GB. `header` = the file's first
+// fBEGIN bytes. False (err set) when the header cannot be read.
+bool headerWindowForEnd(const std::vector<uint8_t>& header, uint64_t newEnd, uint64_t& windowOff,
+                        std::vector<uint8_t>& window, std::string& err);
+
 // The codec a compression SETTING names: "zlib", "lzma", "lz4" or "zstd";
 // "" for no compression, an inherited setting that is itself unset, or an
 // algorithm this code does not transcode. -1 inherits `fileCompress`.

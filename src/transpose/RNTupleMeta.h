@@ -122,6 +122,10 @@ struct RNTupleMeta {
 // unsupported input the result carries `error` and the caller fails open —
 // never guesses, same contract as TreeMeta::parse.
 RNTupleMeta parseRNTuple(const std::string& path, const std::string& ntuple);
+// The same walk over a Source (a cache image, or the plugin's own reads);
+// `fileSize` is the origin size the caller knows. Fails where `src.has` is false.
+struct Source;
+RNTupleMeta parseRNTuple(Source& src, int64_t fileSize, const std::string& ntuple);
 
 // Verify and strip an envelope: checks the type, that the length field matches
 // the buffer, and the trailing xxh3-64. Returns false with `why` set on any
