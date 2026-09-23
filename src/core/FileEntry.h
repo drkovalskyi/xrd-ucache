@@ -131,6 +131,13 @@ class FileEntry {
   // never covered); returns the bytes dropped and counts them never-used.
   uint64_t dropSpeculative(uint64_t off, uint64_t len);
   uint64_t dropAllSpeculative();
+  // The cache itself used the speculative pages of [off, off+len) -- the cold
+  // replica run converted the basket they hold, after reading them with
+  // readCached(..., account = false). Removes the pages wholly inside the range
+  // from the stage WITHOUT writing them and without counting them never-used,
+  // and counts them as read ahead and served. Edge pages stay: they are shared
+  // with the neighbouring basket. Returns the bytes consumed.
+  uint64_t consumeSpeculative(uint64_t off, uint64_t len);
   uint64_t speculativeBytes();
   // Page runs inside [off, off+len) that are neither present nor staged --
   // what a prefetch would have to fetch. Page-aligned, the tail page clamped
@@ -352,6 +359,10 @@ class FileEntry {
     std::unique_ptr<uint8_t[]> data; // pageBytes(i) bytes (tail page short)
     uint32_t crc = 0;
     bool spec = false; // speculative: serve it, never write it while marked
+    // Speculative, and partly used by the cache itself: the edge of a basket
+    // the cold replica run converted, shared with the neighbouring basket.
+    // It stays for that neighbour; dropping it later is not waste.
+    bool touched = false;
   };
   std::map<uint64_t, BufPage> buf_;      // staged, awaiting flush (incl. speculative)
   std::map<uint64_t, BufPage> flushing_; // snapshot being written (readable; never speculative)

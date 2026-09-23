@@ -599,7 +599,7 @@ uint64_t FileEntry::dropSpeculative(uint64_t off, uint64_t len) {
   const uint64_t stopPage = end == meta_.fileSize ? (end + P - 1) / P : endPage;
   if (firstPage >= stopPage)
     return 0;
-  uint64_t dropped = 0;
+  uint64_t dropped = 0, unread = 0;
   {
     std::lock_guard<std::mutex> g(mu_);
     for (auto it = buf_.lower_bound(firstPage); it != buf_.end() && it->first < stopPage;) {
@@ -607,16 +607,18 @@ uint64_t FileEntry::dropSpeculative(uint64_t off, uint64_t len) {
         const uint32_t nbytes = meta_.pageBytes(it->first);
         specBytes_ -= nbytes;
         dropped += nbytes;
+        if (!it->second.touched)
+          unread += nbytes;
         it = buf_.erase(it);
       } else {
         ++it;
       }
     }
   }
-  if (dropped) {
+  if (dropped)
     g_specTotal_.fetch_sub(dropped, std::memory_order_relaxed);
-    noteSpeculativeDropped(dropped);
-  }
+  if (unread)
+    noteSpeculativeDropped(unread);
   return dropped;
 }
 
@@ -632,6 +634,46 @@ void FileEntry::noteSpeculativeDropped(uint64_t n) {
 }
 
 uint64_t FileEntry::dropAllSpeculative() { return dropSpeculative(0, meta_.fileSize); }
+
+uint64_t FileEntry::consumeSpeculative(uint64_t off, uint64_t len) {
+  if (len == 0 || off + len < off)
+    return 0;
+  const uint32_t P = meta_.pageSize;
+  const uint64_t end = std::min(off + len, meta_.fileSize);
+  if (off >= end)
+    return 0;
+  // Wholly inside only, as dropSpeculative and for the same reason.
+  const uint64_t firstPage = (off + P - 1) / P;
+  const uint64_t stopPage = end == meta_.fileSize ? (end + P - 1) / P : end / P;
+  uint64_t used = 0;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    // Partly covered edge pages stay for the neighbour, but they WERE used:
+    // mark them, so dropping them later is not counted as a wasted read-ahead
+    // (that count switches read-ahead off; on 17 KB baskets the edges are a
+    // third of every basket's pages).
+    for (uint64_t pg : {off / P, (end - 1) / P})
+      if (pg < firstPage || pg >= stopPage)
+        if (auto e = buf_.find(pg); e != buf_.end() && e->second.spec)
+          e->second.touched = true;
+    for (auto it = buf_.lower_bound(firstPage); it != buf_.end() && it->first < stopPage;) {
+      if (it->second.spec) {
+        const uint32_t nbytes = meta_.pageBytes(it->first);
+        specBytes_ -= nbytes;
+        used += nbytes;
+        it = buf_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (used) {
+    g_specTotal_.fetch_sub(used, std::memory_order_relaxed);
+    stats_.prefetchServedBytes.fetch_add(used, std::memory_order_relaxed);
+    obs_.prefetchServed.fetch_add(used, std::memory_order_relaxed);
+  }
+  return used;
+}
 
 uint64_t FileEntry::speculativeBytes() {
   std::lock_guard<std::mutex> g(mu_);
@@ -1190,7 +1232,8 @@ uint64_t FileEntry::releaseRanges(const std::vector<std::pair<uint64_t, uint64_t
           if (bit->second.spec) { // a speculative page's bytes live in the OTHER pool
             specBytes_ -= nb;
             g_specTotal_.fetch_sub(nb, std::memory_order_relaxed);
-            specDropped += nb;
+            if (!bit->second.touched)
+              specDropped += nb;
           } else {
             bufBytes_ -= nb;
             g_bufTotal_.fetch_sub(nb, std::memory_order_relaxed);

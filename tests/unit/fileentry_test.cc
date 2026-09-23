@@ -963,6 +963,36 @@ TEST(FileEntry, DropSpeculativeLeavesServedPages) {
   EXPECT_FALSE(e->hasRange(2 * 4096, 2 * 4096));
 }
 
+// The cold replica run converts a basket that read-ahead staged: it reads the
+// pages with account = false and consumes them. They leave the stage as
+// SERVED -- never written (the byte cache must not hold a converted basket),
+// never counted never-used (that would switch read-ahead off) -- and an edge
+// page shared with the next basket stays for it.
+TEST(FileEntry, ConsumedSpeculativePagesAreServedNotWrittenNorDropped) {
+  Fixture fx(16 * 4096, 4096);
+  auto e = fx.open();
+  ASSERT_TRUE(e);
+  EXPECT_EQ(e->stageSpeculative(0, 5 * 4096, fx.src.data()), 5u * 4096); // pages 0..4
+  // A basket at [100, 3*4096+100): pages 1 and 2 wholly inside, 0 and 3 are edges.
+  std::vector<uint8_t> buf(3 * 4096);
+  ASSERT_TRUE(e->readCached(100, 3 * 4096, buf.data(), /*account=*/false));
+  EXPECT_EQ(0, memcmp(buf.data(), fx.src.data() + 100, 3 * 4096));
+  EXPECT_EQ(e->consumeSpeculative(100, 3 * 4096), 2u * 4096);
+  EXPECT_EQ(fx.stats.prefetchServedBytes.load(), 2u * 4096);
+  EXPECT_EQ(fx.stats.prefetchDroppedUnread.load(), 0u);
+  EXPECT_EQ(e->speculativeBytes(), 3u * 4096); // edges 0 and 3, and page 4
+  EXPECT_TRUE(e->hasRange(3 * 4096, 2 * 4096)); // the next basket still finds its pages
+  EXPECT_FALSE(e->hasRange(4096, 4096));
+  e->flushAll();
+  EXPECT_EQ(fx.stats.pageWrites.load(), 0u);
+  EXPECT_EQ(e->cachedBytes(), 0u);
+  EXPECT_EQ(e->consumeSpeculative(4096, 2 * 4096), 0u); // already gone: nothing twice
+  // At close the edges go too -- but they were used, so only page 4, which
+  // nothing touched, counts as read ahead and never used.
+  EXPECT_EQ(e->dropAllSpeculative(), 3u * 4096);
+  EXPECT_EQ(fx.stats.prefetchDroppedUnread.load(), 4096u);
+}
+
 // The cache reading its OWN stage -- what the basket-map parse does, through
 // readCached(account=false) -- must not turn a speculative page into a real
 // one. It used to: the mark was cleared before the accounting flag was

@@ -5,6 +5,9 @@
 #include "RNTupleRewrite.h"
 #include "Log.h"
 #include "OriginInFlight.h"
+#ifdef UCACHE_HAVE_PREFETCH
+#include "Prefetch.h"
+#endif
 #include "PluginSupport.h"
 #include "ReadRounding.h"
 #include "ReplicaStore.h"
@@ -390,6 +393,7 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   bool isVRead = false;
   ResponseHandler* user = nullptr;
   int attempt = 0;
+  bool mayPark = true; // may wait once for read-ahead already on the wire
   uint64_t t0 = 0;
 
   // Filled in by classify(), consumed when every fetch it started is done.
@@ -486,6 +490,7 @@ void ColdRequest::finish() {
       again->isVRead = isVRead;
       again->user = user;
       again->attempt = attempt + 1;
+      again->mayPark = false;
       again->t0 = t0;
       Executor::instance().post([again] { serveRequest(again); });
       return;
@@ -805,6 +810,58 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   std::sort(need.begin(), need.end());
   need.erase(std::unique(need.begin(), need.end()), need.end());
 
+#ifdef UCACHE_HAVE_PREFETCH
+  const Config& cfg = globalConfig();
+  if (cfg.prefetch && req->mayPark) {
+    // Read-ahead learns from this fill in the ORIGINAL file's coordinates --
+    // a slot is its basket -- and predicts and fetches the next baskets into
+    // the byte cache's speculative stage, from where the conversion below
+    // takes them. Slots are identified once per fill, not once per piece.
+    std::vector<uint32_t> ids;
+    for (const auto& p : req->slotPieces)
+      ids.push_back(p.slot);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    XrdCl::ChunkList orig;
+    for (uint32_t i : ids)
+      orig.emplace_back(cf.L.slots[i].origSeek, cf.L.slots[i].origLen, nullptr);
+    if (!orig.empty())
+      Prefetcher::instance().onFill(req->st, req->entry, orig, !need.empty());
+  }
+  if (cfg.prefetch && cfg.prefetchJoin && req->mayPark && !need.empty()) {
+    // A basket read ahead may be on the wire right now: wait for that copy
+    // (once) instead of fetching it a second time.
+    std::vector<std::pair<uint64_t, uint64_t>> want;
+    for (uint32_t i : need) {
+      const tp::FillSlot& s = cf.L.slots[i];
+      if (!req->entry->hasRange(s.origSeek, s.origLen))
+        want.emplace_back(s.origSeek, s.origLen);
+    }
+    if (!want.empty()) {
+      auto fired = std::make_shared<std::atomic<bool>>(false);
+      auto again = [req, fired] {
+        if (fired->exchange(true))
+          return;
+        auto r2 = std::make_shared<ColdRequest>();
+        r2->st = req->st;
+        r2->entry = req->entry;
+        r2->cf = req->cf;
+        r2->chunks = req->chunks;
+        r2->isVRead = req->isVRead;
+        r2->user = req->user;
+        r2->attempt = req->attempt;
+        r2->mayPark = false;
+        r2->t0 = req->t0;
+        Executor::instance().post([r2] { serveRequest(r2); });
+      };
+      if (req->entry->waitForInFlight(want, again)) {
+        Executor::instance().postAfter(10000, again); // a lost wakeup must not hang the read
+        return;
+      }
+    }
+  }
+#endif
+
   // Claim what nobody is fetching; wait for what somebody is.
   for (uint32_t i : need) {
     bool ready = false;
@@ -833,6 +890,9 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     if (req->entry->hasRange(s.origSeek, s.origLen)) {
       auto buf = std::make_shared<std::vector<char>>(s.origLen);
       if (req->entry->readCached(s.origSeek, s.origLen, buf->data(), /*account=*/false)) {
+        // Read ahead into the stage: used now, so it leaves the stage as served
+        // rather than being written or dropped as never used.
+        req->entry->consumeSpeculative(s.origSeek, s.origLen);
         req->outstanding.fetch_add(1, std::memory_order_relaxed);
         convertPool().post([req, i, buf, s] { convertOne(req, i, buf, s.origSeek, 0, s.origLen); });
         continue;
