@@ -1,5 +1,6 @@
 #include "ColdRun.h"
 
+#include "CacheStore.h"
 #include "Executor.h"
 #include "FillLayout.h"
 #include "RNTupleRewrite.h"
@@ -10,10 +11,11 @@
 #endif
 #include "PluginSupport.h"
 #include "ReadRounding.h"
-#include "ReplicaStore.h"
+#include "SlotStore.h"
 #include "Transposer.h"
 #include "UCacheFile.h"
 #include "XrdClTimeout.h"
+#include "vendor/xxh3.h"
 
 #include <XrdCl/XrdClFile.hh>
 
@@ -24,13 +26,10 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
+#include <exception>
 #include <functional>
 #include <mutex>
-#include <sys/file.h>
-#include <sys/stat.h>
 #include <thread>
-#include <unistd.h>
 #include <unordered_map>
 
 namespace ucache {
@@ -44,16 +43,27 @@ using XrdCl::XRootDStatus;
 
 namespace {
 
-// Slots are this many times a basket's stored length: enough for the ZSTD-1
-// record of >= 99% of what LZMA and ZLIB baskets decode to, measured on
-// NanoAOD. A basket whose record does not fit is served as it was stored.
-constexpr uint32_t kSlotFactor = 4;
+// Slots are this many times a basket's stored length. At 3 the ZSTD-1 record
+// of all but ~2% of NanoAOD's LZMA baskets fits (0.1% of the bytes); the rest
+// is served as it was stored. A warm pass reads 3x as fast as it does 4x and
+// the file seen through the cache is smaller.
+constexpr uint32_t kSlotFactor = 3;
+
+// Bumped whenever the layout a store was made for could be computed
+// differently: a store of another version is replaced, never served.
+constexpr uint32_t kLayoutVersion = 1;
+
+// Converted records wait in memory until this many bytes, the periodic
+// checkpoint, or the process's last close of the file, then go to the store in
+// one commit.
+constexpr uint64_t kCommitBytes = 8ull << 20;
 
 // A reader's fill is fetched as several vector reads of about this many bytes
 // each, so conversion starts when the first of them lands rather than when the
 // whole fill has. Smaller fills go as one request, exactly as they would
-// without the cache.
+// without the cache. A part never carries more items than a vector read may.
 constexpr uint64_t kPartBytes = 4ull << 20;
+constexpr size_t kPartItems = 512;
 
 // Conversions run here, never on the executor that serves hits: they are
 // CPU-bound and as many as the reader has threads, and a hit must not queue
@@ -63,130 +73,158 @@ Executor& convertPool() {
   return *pool;
 }
 
-std::atomic<uint64_t> g_stagingSeq{0};
-
 constexpr uint64_t kHeadBlock = 128 * 1024;
 
-// Publishes still running. A process that exits normally waits for them: the
-// stage is an unlinked file, so a publish cut short by exit is a replica lost,
-// and a short job reading a few files would otherwise never leave one. A hard
-// _exit() skips this and loses them -- which is also all it can lose.
-std::mutex g_pubMu;
-std::condition_variable g_pubCv;
-int g_pubPending = 0;
+// Commits posted and not yet run. A process that exits normally waits for them
+// (bounded); a hard _exit() skips this, and loses at most what the periodic
+// checkpoint had not yet committed.
+std::mutex g_cmtMu;
+std::condition_variable g_cmtCv;
+int g_cmtPending = 0;
 
-void waitForPublishes() {
-  std::unique_lock<std::mutex> lk(g_pubMu);
-  if (g_pubPending == 0)
-    return;
-  const int pending = g_pubPending;
-  if (!g_pubCv.wait_for(lk, std::chrono::minutes(10), [] { return g_pubPending == 0; }))
-    UCACHE_WARN("exiting with %d cold-run replica publish(es) unfinished after 10 min", pending);
+// The store's kind for a converted basket, and back.
+uint8_t entryKind(uint8_t basketKind) {
+  return basketKind == tp::ConvertedBasket::kZstd  ? SlotEntry::kZstd
+         : basketKind == tp::ConvertedBasket::kRaw ? SlotEntry::kRaw
+                                                   : SlotEntry::kKept;
+}
+uint8_t basketKind(uint8_t entryKind) {
+  return entryKind == SlotEntry::kZstd  ? tp::ConvertedBasket::kZstd
+         : entryKind == SlotEntry::kRaw ? tp::ConvertedBasket::kRaw
+                                        : tp::ConvertedBasket::kOriginal;
 }
 
 } // namespace
 
-class ColdFill {
+class ColdFill : public std::enable_shared_from_this<ColdFill> {
  public:
   enum : uint8_t { kAbsent = 0, kFetching = 1, kReady = 2 };
-  struct Slot {
-    std::atomic<uint8_t> state{kAbsent};
-    uint8_t kind = 0;  // tp::ConvertedBasket::Kind, valid once kReady
-    uint64_t off = 0;  // in the staging file
-    uint32_t len = 0;  // the record's length
+  // What is known of a slot someone has touched. Guarded by ColdFill::mu.
+  struct Info {
+    uint8_t kind = 0;       // tp::ConvertedBasket::Kind, valid once kReady
+    bool inStore = false;   // `e` is a committed entry (anyone's)
+    bool persist = false;   // `mem` is to be committed
+    bool fromCache = false; // converted from the byte cache's copy of the original
+    SlotEntry e;
+    std::shared_ptr<const std::vector<uint8_t>> mem; // the record, until committed
+  };
+  // RNTuple only: what decoding a page needs, per slot.
+  struct Page {
+    uint32_t nbytes = 0;
+    bool hasChecksum = false;
   };
 
   UrlKey key;
   std::string cacheDir;
   bool rnt = false;  // an RNTuple container: slots hold DECODED pages
-  tp::FileMeta fm;   // TTree
-  tp::RNTupleMeta rm; // RNTuple
   tp::FillLayout L;
+  std::vector<Page> pages; // RNTuple, by slot
   // The original ranges the layout's relocated metadata stands for (the tree
   // record; or the page list and footer), for the read footprint.
   std::vector<std::pair<uint64_t, uint64_t>> metaOrigin;
-  std::vector<uint8_t> treeKeyHeader, keysList;
-  std::vector<std::string> codecs;
+  std::vector<std::string> codecs; // the store's: which baskets are converted
+  uint32_t slotFactor = 0;         // the store's
   bool keepOriginals = false;
-  uint64_t originMtime = 0;
-  uint8_t cksumKind = 0;
-  uint32_t originCksum = 0;
-  std::unique_ptr<Slot[]> slots;
-  int fd = -1;
-  std::atomic<uint64_t> appendOff{0};
+  std::shared_ptr<SlotStore> store;
+  std::atomic<bool> storeGone{false}; // dropped or replaced: nothing more is committed
+  std::shared_ptr<FileEntry> entry;
+  std::unique_ptr<std::atomic<uint8_t>[]> state; // per slot: kAbsent / kFetching / kReady
 
-  std::mutex mu; // guards everything below
+  std::mutex mu; // guards `info` and everything below
+  std::unordered_map<uint32_t, Info> info;
   std::unordered_map<uint32_t, std::vector<std::function<void(bool)>>> waiters;
-  std::unordered_map<uint32_t, std::vector<uint8_t>> mem; // records the staging file refused
+  std::vector<uint32_t> pending;
+  uint64_t pendingBytes = 0;
   int handles = 0;
+  // Original ranges of relocated baskets, sorted: bytes the reader never reads
+  // in this layout, so never worth keeping (built on first need).
+  std::vector<std::pair<uint64_t, uint64_t>> relocatedOrig;
+
+  std::mutex commitMu; // one commit of this file at a time in this process
+  std::atomic<bool> commitQueued{false};
 
   std::atomic<uint64_t> nZstd{0}, nRaw{0}, nOrig{0}, inBytes{0}, outBytes{0}, convertUs{0},
       wireBytes{0};
 
-  ~ColdFill() {
-    if (fd >= 0)
-      ::close(fd);
-  }
-
-  // Bytes [from, from+n) of slot i's staged record into dst.
-  bool readRecord(uint32_t i, uint8_t* dst, uint64_t from, uint64_t n) {
-    const Slot& s = slots[i];
-    if (from + n > s.len)
+  // A snapshot of where slot i's bytes are, if it is ready.
+  struct Where {
+    uint8_t kind = 0;
+    bool inStore = false;
+    SlotEntry e;
+    std::shared_ptr<const std::vector<uint8_t>> mem;
+  };
+  bool where(uint32_t i, Where& w) {
+    std::lock_guard<std::mutex> g(mu);
+    if (state[i].load(std::memory_order_acquire) != kReady)
       return false;
-    {
-      std::lock_guard<std::mutex> g(mu);
-      auto it = mem.find(i);
-      if (it != mem.end()) {
-        std::memcpy(dst, it->second.data() + from, n);
-        return true;
-      }
-    }
-    uint64_t at = 0;
-    while (at < n) {
-      ssize_t r = ::pread(fd, dst + at, n - at, static_cast<off_t>(s.off + from + at));
-      if (r <= 0) {
-        if (r < 0 && errno == EINTR)
-          continue;
-        return false;
-      }
-      at += static_cast<uint64_t>(r);
-    }
+    auto it = info.find(i);
+    if (it == info.end())
+      return false;
+    w.kind = it->second.kind;
+    w.inStore = it->second.inStore;
+    w.e = it->second.e;
+    w.mem = it->second.mem;
     return true;
   }
 
-  // Stage a converted record for slot i and publish it to readers.
-  void stage(uint32_t i, uint8_t kind, std::vector<uint8_t>&& rec) {
-    Slot& s = slots[i];
-    s.kind = kind;
-    s.len = static_cast<uint32_t>(rec.size());
-    s.off = appendOff.fetch_add(rec.size(), std::memory_order_relaxed);
-    bool ok = true;
-    uint64_t at = 0;
-    while (at < rec.size()) {
-      ssize_t w = ::pwrite(fd, rec.data() + at, rec.size() - at, static_cast<off_t>(s.off + at));
-      if (w <= 0) {
-        if (w < 0 && errno == EINTR)
-          continue;
-        ok = false;
-        break;
-      }
-      at += static_cast<uint64_t>(w);
-    }
+  // A committed kept-as-stored slot is served from the byte cache's copy of
+  // its original; if that copy is gone (evicted), the slot must be fetched.
+  bool keptOriginalGone(uint32_t i) {
+    if (rnt || state[i].load(std::memory_order_acquire) != kReady)
+      return false;
+    std::lock_guard<std::mutex> g(mu);
+    auto it = info.find(i);
+    if (it == info.end() || it->second.kind != tp::ConvertedBasket::kOriginal || it->second.mem)
+      return false;
+    const tp::FillSlot& fs = L.slots[i];
+    if (entry->hasRange(fs.origSeek, fs.origLen))
+      return false;
+    forgetLocked(i);
+    return true;
+  }
+
+  // Slot i turned out unreadable (a record failing its CRC, an original gone):
+  // absent again, so the next request fetches and converts it anew.
+  void forget(uint32_t i) {
+    std::lock_guard<std::mutex> g(mu);
+    forgetLocked(i);
+  }
+
+  // Entries committed by anyone: the slots they name are ready from the store.
+  void apply(const std::vector<SlotEntry>& es) {
     std::vector<std::function<void(bool)>> wake;
     {
       std::lock_guard<std::mutex> g(mu);
-      if (!ok) // disk full or similar: keep it in memory rather than fail the reader
-        mem.emplace(i, std::move(rec));
-      s.state.store(kReady, std::memory_order_release);
-      auto it = waiters.find(i);
-      if (it != waiters.end()) {
-        wake.swap(it->second);
-        waiters.erase(it);
+      for (const auto& e : es) {
+        if (e.slot >= L.slots.size())
+          continue;
+        Info& s = info[e.slot];
+        s.inStore = true;
+        s.e = e;
+        if (!s.mem)
+          s.kind = basketKind(e.kind);
+        if (state[e.slot].load(std::memory_order_acquire) != kReady) {
+          state[e.slot].store(kReady, std::memory_order_release);
+          takeWaitersLocked(e.slot, wake);
+        }
       }
     }
     for (auto& w : wake)
       w(true);
   }
+
+  // Pick up what other processes committed since we last looked -- unless a
+  // commit is under way, in which case this is skipped, not waited for.
+  void sync(bool wait = false) {
+    if (store) {
+      auto es = store->refresh(wait);
+      if (!es.empty())
+        apply(es);
+    }
+  }
+
+  // A converted record for slot i: served from memory until it is committed.
+  void stage(uint32_t i, uint8_t kind, std::vector<uint8_t>&& rec, bool fromCache);
 
   // A fetch that claimed slot i failed: give the claim back and tell whoever
   // waited on it, so they can fetch it themselves.
@@ -194,12 +232,9 @@ class ColdFill {
     std::vector<std::function<void(bool)>> wake;
     {
       std::lock_guard<std::mutex> g(mu);
-      slots[i].state.store(kAbsent, std::memory_order_release);
-      auto it = waiters.find(i);
-      if (it != waiters.end()) {
-        wake.swap(it->second);
-        waiters.erase(it);
-      }
+      uint8_t expect = kFetching;
+      state[i].compare_exchange_strong(expect, kAbsent, std::memory_order_acq_rel);
+      takeWaitersLocked(i, wake);
     }
     for (auto& w : wake)
       w(false);
@@ -207,27 +242,46 @@ class ColdFill {
 
   // Claim slot i for fetching (true), or register `cb` to hear when whoever
   // holds it is done (false). A slot found ready returns false with `ready`
-  // set and registers nothing.
+  // set and registers nothing. Both looks are compare-and-swaps: a slot
+  // released between them is claimed by exactly one caller.
   bool claimOrWait(uint32_t i, std::function<void(bool)> cb, bool& ready) {
     ready = false;
     uint8_t expect = kAbsent;
-    if (slots[i].state.compare_exchange_strong(expect, kFetching, std::memory_order_acq_rel))
+    if (state[i].compare_exchange_strong(expect, kFetching, std::memory_order_acq_rel))
       return true;
     std::lock_guard<std::mutex> g(mu);
-    const uint8_t now = slots[i].state.load(std::memory_order_acquire);
-    if (now == kReady) {
+    expect = kAbsent;
+    if (state[i].compare_exchange_strong(expect, kFetching, std::memory_order_acq_rel))
+      return true;
+    if (expect == kReady) {
       ready = true;
       return false;
-    }
-    if (now == kAbsent) { // released between the two looks: take it
-      slots[i].state.store(kFetching, std::memory_order_release);
-      return true;
     }
     waiters[i].push_back(std::move(cb));
     return false;
   }
 
-  void publish();
+  // Original bytes worth keeping in the byte cache, of the page-aligned range
+  // [rs, re): every page not wholly inside a relocated basket.
+  std::vector<std::pair<uint64_t, uint64_t>> storableRuns(uint64_t rs, uint64_t re, uint64_t ps);
+
+  void queueCommit();
+  void commit();
+
+ private:
+  void forgetLocked(uint32_t i) {
+    uint8_t expect = kReady;
+    state[i].compare_exchange_strong(expect, kAbsent, std::memory_order_acq_rel);
+    info.erase(i);
+  }
+  void takeWaitersLocked(uint32_t i, std::vector<std::function<void(bool)>>& out) {
+    auto it = waiters.find(i);
+    if (it != waiters.end()) {
+      out.swap(it->second);
+      waiters.erase(it);
+    }
+  }
+  void dropRecords(const std::vector<SlotRecord>& recs, const std::string& why);
 };
 
 namespace {
@@ -242,7 +296,7 @@ std::unordered_map<std::string, std::shared_ptr<ColdFill>>& registry() {
 // The parser's byte source at setup: the byte cache when it has the range,
 // otherwise ONE synchronous page-rounded read from the origin, kept in the byte
 // cache (these are the file's own records -- header, directory, keys list, tree
-// record -- which is exactly what the byte cache holds on a cold run).
+// record -- which is exactly what the byte cache holds).
 struct SetupSource : tp::Source {
   std::shared_ptr<HandleState> st;
   std::shared_ptr<FileEntry> entry;
@@ -255,11 +309,22 @@ struct SetupSource : tp::Source {
     if (entry->hasRange(off, n) && entry->readCached(off, n, dst, /*account=*/false))
       return true;
     auto [ws, we] = roundSpan(entry->pageSize(), entry->fileSize(), off, n);
-    // The file head is fetched as ONE block of the size ROOT itself asks for
-    // it in (128 KiB at offset 0): setup's piecemeal reads would otherwise
-    // leave the reader's own head read partly missing, and one more request.
-    if (ws < kHeadBlock)
-      we = std::max<uint64_t>(we, std::min<uint64_t>(kHeadBlock, entry->fileSize()));
+    return fetch(ws, we, dst, off, n);
+  }
+  // The file head as ONE block of the size ROOT's RNTuple reader asks for it
+  // in (128 KiB at offset 0): setup's piecemeal reads would otherwise leave
+  // that read partly missing, and cost one more request. A TTree reader reads
+  // only the first few hundred bytes, so this is for RNTuple files only.
+  bool fetchHead() {
+    const uint64_t n = std::min<uint64_t>(kHeadBlock, entry->fileSize());
+    if (entry->hasRange(0, n))
+      return true;
+    std::vector<char> tmp(1);
+    return fetch(0, n, tmp.data(), 0, 0);
+  }
+
+ private:
+  bool fetch(uint64_t ws, uint64_t we, void* dst, uint64_t off, uint64_t n) {
     if (we - ws > UINT32_MAX)
       return false;
     std::vector<char> buf(we - ws);
@@ -280,7 +345,8 @@ struct SetupSource : tp::Source {
       stats.originRtUs.add(nowUs() - t0);
     }
     entry->writePages(ws, got, buf.data());
-    std::memcpy(dst, buf.data() + (off - ws), n);
+    if (n)
+      std::memcpy(dst, buf.data() + (off - ws), n);
     return true;
   }
 };
@@ -300,83 +366,464 @@ tp::FileMeta parseTree(tp::Source& src, int64_t size) {
   return fm;
 }
 
+// Everything a reader could learn from the layout, hashed: two layouts that
+// agree on it serve the same bytes at the same offsets.
+uint64_t layoutHash(const tp::FillLayout& L, bool rnt) {
+  std::vector<uint8_t> b;
+  auto put64 = [&](uint64_t v) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    b.insert(b.end(), p, p + 8);
+  };
+  put64(rnt ? 1 : 0);
+  put64(L.originSize);
+  put64(L.virtualSize);
+  put64(L.metaSeek);
+  put64(L.slotsBegin);
+  put64(L.windows.size());
+  for (const auto& w : L.windows) {
+    put64(w.off);
+    put64(w.bytes.size());
+    b.insert(b.end(), w.bytes.begin(), w.bytes.end());
+  }
+  put64(L.metaRecord.size());
+  b.insert(b.end(), L.metaRecord.begin(), L.metaRecord.end());
+  put64(L.slots.size());
+  for (const auto& s : L.slots) {
+    put64(s.origSeek);
+    put64(s.vSeek);
+    put64((static_cast<uint64_t>(s.origLen) << 32) | s.vLen);
+  }
+  return xxh3_64(b.data(), b.size());
+}
+
+std::string joinCodecs(const std::vector<std::string>& v) {
+  std::string s;
+  for (const auto& c : v)
+    s += (s.empty() ? "" : ",") + c;
+  return s;
+}
+std::vector<std::string> splitCodecs(const std::string& s) {
+  std::vector<std::string> v;
+  std::string cur;
+  for (char c : s + ",")
+    if (c == ',') {
+      if (!cur.empty())
+        v.push_back(cur);
+      cur.clear();
+    } else
+      cur += c;
+  return v;
+}
+
+// ---- the stored layout: what the store's creator computed, as everyone serves it
+//
+// Serialized once, at creation, and never recomputed: parsing a large tree's
+// metadata costs ~200 ms per open, and a layout recomputed by another build
+// could differ in its compressed metadata bytes.
+
+constexpr char kLayoutMagic[8] = {'U', 'C', 'L', 'A', 'Y', 'T', '0', '2'};
+
+struct Writer {
+  std::vector<uint8_t> b;
+  template <typename T> void put(T v) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    b.insert(b.end(), p, p + sizeof v);
+  }
+  void bytes(const std::vector<uint8_t>& v) {
+    put<uint64_t>(v.size());
+    b.insert(b.end(), v.begin(), v.end());
+  }
+  void varint(uint64_t v) {
+    while (v >= 0x80) {
+      b.push_back(static_cast<uint8_t>(v | 0x80));
+      v >>= 7;
+    }
+    b.push_back(static_cast<uint8_t>(v));
+  }
+  void svarint(int64_t v) { varint((static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63)); }
+};
+struct Reader {
+  const uint8_t* p;
+  size_t n, at = 0;
+  bool ok = true;
+  template <typename T> T get() {
+    T v{};
+    if (at + sizeof v > n) {
+      ok = false;
+      return v;
+    }
+    std::memcpy(&v, p + at, sizeof v);
+    at += sizeof v;
+    return v;
+  }
+  bool bytes(std::vector<uint8_t>& v) {
+    const uint64_t len = get<uint64_t>();
+    if (!ok || len > n - at)
+      return ok = false;
+    v.assign(p + at, p + at + len);
+    at += len;
+    return true;
+  }
+  uint64_t varint() {
+    uint64_t v = 0;
+    for (int shift = 0; shift < 64; shift += 7) {
+      if (at >= n) {
+        ok = false;
+        return 0;
+      }
+      const uint8_t c = p[at++];
+      v |= static_cast<uint64_t>(c & 0x7f) << shift;
+      if (!(c & 0x80))
+        return v;
+    }
+    ok = false;
+    return 0;
+  }
+  int64_t svarint() {
+    const uint64_t u = varint();
+    return static_cast<int64_t>(u >> 1) ^ -static_cast<int64_t>(u & 1);
+  }
+};
+
+// A TTree slot's length when nothing capped it: k times the stored basket.
+uint32_t plainSlotLen(uint32_t origLen, uint32_t k) {
+  const uint64_t v = static_cast<uint64_t>(origLen) * k;
+  return v > INT32_MAX ? static_cast<uint32_t>(INT32_MAX) : static_cast<uint32_t>(v);
+}
+
+std::vector<uint8_t> encodeLayout(const ColdFill& cf) {
+  Writer w;
+  w.b.insert(w.b.end(), kLayoutMagic, kLayoutMagic + 8);
+  const tp::FillLayout& L = cf.L;
+  w.put<uint8_t>(cf.rnt ? 1 : 0);
+  w.put<uint64_t>(L.originSize);
+  w.put<uint64_t>(L.virtualSize);
+  w.put<uint64_t>(L.metaSeek);
+  w.put<uint64_t>(L.slotsBegin);
+  w.put<uint32_t>(static_cast<uint32_t>(L.windows.size()));
+  for (const auto& win : L.windows) {
+    w.put<uint64_t>(win.off);
+    w.bytes(win.bytes);
+  }
+  w.bytes(L.metaRecord);
+  w.put<uint32_t>(static_cast<uint32_t>(cf.metaOrigin.size()));
+  for (const auto& [o, n] : cf.metaOrigin) {
+    w.put<uint64_t>(o);
+    w.put<uint64_t>(n);
+  }
+  w.put<uint32_t>(static_cast<uint32_t>(L.relocated.size()));
+  for (uint32_t r : L.relocated)
+    w.put<uint32_t>(r);
+  // The slot table, delta-coded: slots follow one another from slotsBegin, a
+  // branch's baskets are consecutive, and a TTree slot is k times its basket
+  // unless capped -- so most of a slot is implied by the one before it.
+  w.put<uint32_t>(static_cast<uint32_t>(L.slots.size()));
+  uint64_t prevOrig = 0, nextV = L.slotsBegin;
+  uint32_t prevBranch = 0, prevBasket = 0;
+  for (const auto& s : L.slots) {
+    w.svarint(static_cast<int64_t>(s.branch) - static_cast<int64_t>(prevBranch));
+    w.svarint(static_cast<int64_t>(s.basket) - static_cast<int64_t>(prevBasket) - 1);
+    w.svarint(static_cast<int64_t>(s.origSeek - prevOrig));
+    w.varint(s.origLen);
+    w.varint(!cf.rnt && s.vLen == plainSlotLen(s.origLen, cf.slotFactor) ? 0 : uint64_t(s.vLen) + 1);
+    w.svarint(static_cast<int64_t>(s.vSeek - nextV)); // 0 when contiguous
+    prevBranch = s.branch;
+    prevBasket = s.basket;
+    prevOrig = s.origSeek;
+    nextV = s.vSeek + s.vLen;
+  }
+  if (cf.rnt)
+    for (const auto& pg : cf.pages) {
+      w.put<uint32_t>(pg.nbytes);
+      w.put<uint8_t>(pg.hasChecksum ? 1 : 0);
+    }
+  // Stored compressed: the slot table of a large tree is tens of MB raw.
+  std::vector<uint8_t> out(8);
+  const uint64_t raw = w.b.size();
+  std::memcpy(out.data(), &raw, 8);
+  auto z = tp::encodeZstdFrames(w.b.data(), w.b.size(), 3);
+  if (z.empty())
+    out.insert(out.end(), w.b.begin(), w.b.end()); // stored raw (flagged by length)
+  else
+    out.insert(out.end(), z.begin(), z.end());
+  return out;
+}
+
+bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf) {
+  if (blob.size() < 8)
+    return false;
+  uint64_t raw = 0;
+  std::memcpy(&raw, blob.data(), 8);
+  std::vector<uint8_t> b;
+  if (blob.size() - 8 == raw)
+    b.assign(blob.begin() + 8, blob.end());
+  else
+    b = tp::decompressFrames(blob.data() + 8, blob.size() - 8, raw);
+  if (b.size() != raw || raw < 8 || std::memcmp(b.data(), kLayoutMagic, 8) != 0)
+    return false;
+  Reader r{b.data(), b.size(), 8};
+  tp::FillLayout& L = cf.L;
+  cf.rnt = r.get<uint8_t>() != 0;
+  L.originSize = r.get<uint64_t>();
+  L.virtualSize = r.get<uint64_t>();
+  L.metaSeek = r.get<uint64_t>();
+  L.slotsBegin = r.get<uint64_t>();
+  const uint32_t nw = r.get<uint32_t>();
+  for (uint32_t i = 0; r.ok && i < nw; ++i) {
+    tp::FillLayout::Window win;
+    win.off = r.get<uint64_t>();
+    r.bytes(win.bytes);
+    L.windows.push_back(std::move(win));
+  }
+  r.bytes(L.metaRecord);
+  const uint32_t nm = r.get<uint32_t>();
+  for (uint32_t i = 0; r.ok && i < nm; ++i) {
+    const uint64_t o = r.get<uint64_t>();
+    cf.metaOrigin.emplace_back(o, r.get<uint64_t>());
+  }
+  const uint32_t nr = r.get<uint32_t>();
+  if (!r.ok || nr > b.size())
+    return false;
+  L.relocated.resize(nr);
+  for (uint32_t i = 0; r.ok && i < nr; ++i)
+    L.relocated[i] = r.get<uint32_t>();
+  const uint32_t ns = r.get<uint32_t>();
+  if (!r.ok || static_cast<uint64_t>(ns) * 6 > b.size())
+    return false;
+  L.slots.resize(ns);
+  uint64_t prevOrig = 0, nextV = L.slotsBegin;
+  uint32_t prevBranch = 0, prevBasket = 0;
+  for (uint32_t i = 0; r.ok && i < ns; ++i) {
+    tp::FillSlot& s = L.slots[i];
+    s.branch = static_cast<uint32_t>(prevBranch + r.svarint());
+    s.basket = static_cast<uint32_t>(prevBasket + 1 + r.svarint());
+    s.origSeek = prevOrig + static_cast<uint64_t>(r.svarint());
+    s.origLen = static_cast<uint32_t>(r.varint());
+    const uint64_t vl = r.varint();
+    s.vLen = vl ? static_cast<uint32_t>(vl - 1) : plainSlotLen(s.origLen, cf.slotFactor);
+    s.vSeek = nextV + static_cast<uint64_t>(r.svarint());
+    prevBranch = s.branch;
+    prevBasket = s.basket;
+    prevOrig = s.origSeek;
+    nextV = s.vSeek + s.vLen;
+  }
+  if (cf.rnt) {
+    cf.pages.resize(ns);
+    for (uint32_t i = 0; r.ok && i < ns; ++i) {
+      cf.pages[i].nbytes = r.get<uint32_t>();
+      cf.pages[i].hasChecksum = r.get<uint8_t>() != 0;
+    }
+  }
+  // Checked, not trusted: every slot lies in the layout, in order.
+  if (!r.ok || r.at != b.size() || L.virtualSize < L.slotsBegin || L.slotsBegin < L.metaSeek)
+    return false;
+  uint64_t prev = L.slotsBegin;
+  for (const auto& s : L.slots) {
+    // (An RNTuple slot is the page's DECODED size, which may be shorter than
+    // the page as stored with its checksum; a TTree slot holds the record.)
+    if (s.vSeek < prev || s.vSeek + s.vLen > L.virtualSize ||
+        (!cf.rnt && s.vLen < s.origLen) || s.origSeek + s.origLen > L.originSize)
+      return false;
+    prev = s.vSeek + s.vLen;
+  }
+  for (const auto& win : L.windows)
+    if (win.off + win.bytes.size() > L.originSize)
+      return false;
+  return true;
+}
+
+// Parse the file and compute its layout with the given parameters into cf.
+// False when the file is not served this way; `declined` then says whether
+// that is the file's nature (worth remembering) or a failed read (not).
+bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k, bool& declined) {
+  declined = false;
+  std::vector<uint8_t> header(100);
+  cf.rnt = false;
+  tp::FileMeta fm = parseTree(src, static_cast<int64_t>(size));
+  if (!fm.error.empty() && fm.error.find("not found") != std::string::npos) {
+    // No TTree: perhaps an RNTuple.
+    if (!src.fetchHead())
+      return false;
+    tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(size), "");
+    if (!rm.error.empty() || !src.read(header.data(), header.size(), 0)) {
+      UCACHE_DEBUG("slot run declined for %s: %s", cf.key.key.c_str(), fm.error.c_str());
+      declined = !rm.error.empty() && rm.error.find("cannot read") == std::string::npos;
+      return false;
+    }
+    cf.rnt = true;
+    cf.L = tp::layoutForRNTupleFill(rm, size, header, cf.codecs);
+    cf.metaOrigin = {{rm.pageListOffset, rm.pageListNbytes},
+                     {rm.anchor.seekFooter, rm.anchor.nbytesFooter}};
+    if (cf.L.error.empty()) {
+      cf.pages.resize(cf.L.slots.size());
+      for (size_t i = 0; i < cf.L.slots.size(); ++i) {
+        const auto& pg = rm.ranges[cf.L.slots[i].branch].pages[cf.L.slots[i].basket];
+        cf.pages[i].nbytes = static_cast<uint32_t>(pg.nbytes);
+        cf.pages[i].hasChecksum = pg.hasChecksum;
+      }
+    }
+  } else {
+    if (!fm.error.empty()) {
+      UCACHE_DEBUG("slot run declined for %s: %s", cf.key.key.c_str(), fm.error.c_str());
+      declined = fm.error.find("read") == std::string::npos; // the file's nature, not an I/O failure
+      return false;
+    }
+    std::vector<uint8_t> treeKeyHeader(fm.treeKey.keylen), keysList;
+    uint8_t klLen[4];
+    if (!src.read(header.data(), header.size(), 0) ||
+        !src.read(treeKeyHeader.data(), treeKeyHeader.size(),
+                  static_cast<uint64_t>(fm.treeKey.seekkey)) ||
+        !src.read(klLen, 4, static_cast<uint64_t>(fm.keyslistSeek)))
+      return false;
+    const int32_t kn = static_cast<int32_t>(static_cast<uint32_t>(klLen[0]) << 24 |
+                                            static_cast<uint32_t>(klLen[1]) << 16 |
+                                            static_cast<uint32_t>(klLen[2]) << 8 | klLen[3]);
+    if (kn <= 0 || static_cast<uint64_t>(fm.keyslistSeek) + static_cast<uint64_t>(kn) > size)
+      return false;
+    keysList.resize(static_cast<size_t>(kn));
+    if (!src.read(keysList.data(), keysList.size(), static_cast<uint64_t>(fm.keyslistSeek)))
+      return false;
+    cf.L = tp::layoutForFill(fm, size, header, treeKeyHeader, keysList, cf.codecs, k);
+    cf.metaOrigin = {{static_cast<uint64_t>(fm.treeKey.seekkey),
+                      static_cast<uint64_t>(fm.treeKey.nbytes)}};
+  }
+  if (!cf.L.error.empty()) {
+    UCACHE_INFO("slot run declined for %s: %s; the file is served as stored", cf.key.key.c_str(),
+                cf.L.error.c_str());
+    declined = true; // decided by the file's own metadata
+    return false;
+  }
+  return true;
+}
+
+// The replica tier's adoption rule: size always; mtime or checksum only when
+// `validate` asks for them (some storage reports differing mtimes for a file
+// that has not changed).
+bool adoptable(const SlotStoreHeader& h, uint64_t size, uint64_t originMtime, uint8_t cksumKind,
+               uint32_t originCksum) {
+  const Config& cfg = globalConfig();
+  if (h.layoutVersion != kLayoutVersion || h.originSize != size)
+    return false;
+  if (cfg.validate == ValidateMode::kSizeMtime && h.originMtime != originMtime)
+    return false;
+  if (cfg.validate == ValidateMode::kCksum && cksumKind != 0 &&
+      (h.cksumKind != cksumKind || h.originCksum != originCksum))
+    return false;
+  return true;
+}
+
+// Set up the slot run of a file.
+//
+// An existing store is served as it is: its layout was computed once, by
+// whoever created it, and is never recomputed. With kCreate and no store, the
+// layout is computed and a store made (a file whose layout declines gets a
+// store marked DECLINED, so the next open need not parse it to find that
+// out). kMatch is for a process that has already shown this file's slot
+// layout: only a layout with that hash will do.
 std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
-                                const std::shared_ptr<FileEntry>& entry, const UrlKey& key) {
+                                const std::shared_ptr<FileEntry>& entry, const UrlKey& key,
+                                uint64_t originMtime, uint8_t cksumKind, uint32_t originCksum,
+                                AttachMode mode, uint64_t matchHash) {
   const Config& cfg = globalConfig();
   const uint64_t size = entry->fileSize();
   if (size < 100)
     return nullptr;
-  SetupSource src;
-  src.st = st;
-  src.entry = entry;
-  auto cf = std::make_shared<ColdFill>();
-  cf->codecs = cfg.recompressCodecs;
-  cf->keepOriginals = cfg.recompressKeepOriginals;
-  cf->fm = parseTree(src, static_cast<int64_t>(size));
-  std::vector<uint8_t> header(100);
-  if (!cf->fm.error.empty() && cf->fm.error.find("not found") != std::string::npos) {
-    // No TTree: perhaps an RNTuple.
-    cf->rm = tp::parseRNTuple(src, static_cast<int64_t>(size), "");
-    if (!cf->rm.error.empty() || !src.read(header.data(), header.size(), 0)) {
-      UCACHE_DEBUG("cold run declined for %s: %s", key.key.c_str(), cf->fm.error.c_str());
-      return nullptr;
-    }
-    cf->rnt = true;
-    cf->L = tp::layoutForRNTupleFill(cf->rm, size, header, cf->codecs);
-    cf->metaOrigin = {{cf->rm.pageListOffset, cf->rm.pageListNbytes},
-                      {cf->rm.anchor.seekFooter, cf->rm.anchor.nbytesFooter}};
-  }
-  if (!cf->rnt && !cf->fm.error.empty()) {
-    UCACHE_DEBUG("cold run declined for %s: %s", key.key.c_str(), cf->fm.error.c_str());
-    return nullptr;
-  }
-  if (!cf->rnt) {
-    cf->treeKeyHeader.resize(cf->fm.treeKey.keylen);
-    uint8_t klLen[4];
-    if (!src.read(header.data(), header.size(), 0) ||
-        !src.read(cf->treeKeyHeader.data(), cf->treeKeyHeader.size(),
-                  static_cast<uint64_t>(cf->fm.treeKey.seekkey)) ||
-        !src.read(klLen, 4, static_cast<uint64_t>(cf->fm.keyslistSeek)))
-      return nullptr;
-    const int32_t kn = static_cast<int32_t>(static_cast<uint32_t>(klLen[0]) << 24 |
-                                            static_cast<uint32_t>(klLen[1]) << 16 |
-                                            static_cast<uint32_t>(klLen[2]) << 8 | klLen[3]);
-    if (kn <= 0 || static_cast<uint64_t>(cf->fm.keyslistSeek) + static_cast<uint64_t>(kn) > size)
-      return nullptr;
-    cf->keysList.resize(static_cast<size_t>(kn));
-    if (!src.read(cf->keysList.data(), cf->keysList.size(), static_cast<uint64_t>(cf->fm.keyslistSeek)))
-      return nullptr;
-    cf->L = tp::layoutForFill(cf->fm, size, header, cf->treeKeyHeader, cf->keysList, cf->codecs,
-                              kSlotFactor);
-    cf->metaOrigin = {{static_cast<uint64_t>(cf->fm.treeKey.seekkey),
-                       static_cast<uint64_t>(cf->fm.treeKey.nbytes)}};
-  }
-  if (!cf->L.error.empty()) {
-    UCACHE_INFO("cold run declined for %s: %s; the file is served as stored", key.key.c_str(),
-                cf->L.error.c_str());
-    return nullptr;
-  }
-  // The stage: created and unlinked at once, so a crash leaves nothing behind.
+  const uint64_t tSetup = nowUs();
+  IOBackend& io = RealIO::instance();
   const std::string dir = key.objectDir(cfg.cacheDir);
-  const std::string path = dir + "/" + key.hashHex + ".cold." + std::to_string(::getpid()) + "." +
-                           std::to_string(g_stagingSeq.fetch_add(1));
-  int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  if (fd < 0) {
-    UCACHE_WARN("cold run declined for %s: cannot create its stage (%s)", key.key.c_str(),
-                std::strerror(errno));
-    return nullptr;
-  }
-  ::unlink(path.c_str());
-  cf->fd = fd;
+
+  auto cf = std::make_shared<ColdFill>();
   cf->key = key;
   cf->cacheDir = cfg.cacheDir;
-  cf->slots.reset(new ColdFill::Slot[cf->L.slots.size()]);
-  if (st->store)
+  cf->entry = entry;
+  cf->keepOriginals = cfg.recompressKeepOriginals;
+
+  auto store = SlotStore::open(io, dir, key.hashHex);
+  if (store && !adoptable(store->header(), size, originMtime, cksumKind, originCksum)) {
+    UCACHE_INFO("slot store for %s was made for another version of the file; replaced",
+                key.key.c_str());
+    store.reset();
+    SlotStore::drop(io, dir, key.hashHex);
+  }
+  if (store && store->header().declined)
+    return nullptr; // served as stored, as decided when the store was made
+  if (store && mode == AttachMode::kMatch && store->header().layoutHash != matchHash)
+    return nullptr; // not the layout this process has shown: never mix two
+  bool created = false;
+  if (!store) {
+    if (mode == AttachMode::kExisting)
+      return nullptr;
+    SetupSource src;
+    src.st = st;
+    src.entry = entry;
+    cf->codecs = cfg.recompressCodecs;
+    cf->slotFactor = kSlotFactor;
+    bool declined = false;
+    const bool ok = computeLayout(*cf, src, size, kSlotFactor, declined);
+    SlotStoreHeader want;
+    want.layoutVersion = kLayoutVersion;
+    want.slotFactor = static_cast<uint8_t>(kSlotFactor);
+    want.codecs = joinCodecs(cf->codecs);
+    want.originSize = size;
+    want.originMtime = originMtime;
+    want.cksumKind = cksumKind;
+    want.originCksum = originCksum;
+    std::vector<uint8_t> blob;
+    if (!ok) {
+      if (!declined || mode != AttachMode::kCreate)
+        return nullptr;
+      want.declined = true;
+    } else {
+      want.container = cf->rnt ? 1 : 0;
+      want.virtualSize = cf->L.virtualSize;
+      want.nSlots = static_cast<uint32_t>(cf->L.slots.size());
+      want.layoutHash = layoutHash(cf->L, cf->rnt);
+      if (mode == AttachMode::kMatch && want.layoutHash != matchHash)
+        return nullptr; // this build cannot reproduce what was shown
+      blob = encodeLayout(*cf);
+    }
+    std::string err;
+    store = SlotStore::openOrCreate(io, dir, key.hashHex, want, blob, created, err);
+    if (!store) {
+      UCACHE_INFO("slot run declined for %s: %s", key.key.c_str(), err.c_str());
+      return nullptr;
+    }
+    if (store->header().declined)
+      return nullptr;
+    if (!created) { // someone else made it first: theirs is the layout
+      if (!adoptable(store->header(), size, originMtime, cksumKind, originCksum) ||
+          (mode == AttachMode::kMatch && store->header().layoutHash != matchHash))
+        return nullptr;
+    }
+  }
+  if (!created) {
+    cf->L = tp::FillLayout(); // the stored layout, in place of anything computed above
+    cf->slotFactor = store->header().slotFactor;
+    cf->metaOrigin.clear();
+    cf->pages.clear();
+    if (!decodeLayout(store->layoutBlob(), *cf) ||
+        cf->L.slots.size() != store->header().nSlots ||
+        cf->L.virtualSize != store->header().virtualSize) {
+      UCACHE_WARN("slot store for %s has an unreadable layout; the file is served as stored",
+                  key.key.c_str());
+      return nullptr;
+    }
+    cf->codecs = splitCodecs(store->header().codecs);
+  }
+  cf->store = store;
+  cf->state.reset(new std::atomic<uint8_t>[cf->L.slots.size()]());
+  // Every record anyone has committed so far -- without waiting, so a commit
+  // held up in another process never holds up an open (what is missed now is
+  // read at the next request, or converted again and deduplicated).
+  cf->sync();
+  if (created && st->store)
     st->store->stats().coldReplicaFiles.fetch_add(1, std::memory_order_relaxed);
-  UCACHE_INFO("cold run for %s: %zu %s of %zu %s in slots, virtual %llu bytes", key.key.c_str(),
-              cf->L.slots.size(), cf->rnt ? "pages" : "baskets", cf->L.relocated.size(),
-              cf->rnt ? "column ranges" : "branches",
-              static_cast<unsigned long long>(cf->L.virtualSize));
+  UCACHE_INFO("slot run for %s: %zu %s of %zu %s in slots (%s), virtual %llu bytes, "
+              "set up in %.1f ms",
+              key.key.c_str(), cf->L.slots.size(), cf->rnt ? "pages" : "baskets",
+              cf->L.relocated.size(), cf->rnt ? "column ranges" : "branches",
+              created ? "new store" : "existing store",
+              static_cast<unsigned long long>(cf->L.virtualSize), (nowUs() - tSetup) / 1e3);
   return cf;
 }
 
@@ -430,43 +877,86 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
     }
   }
   void finish();
+  // Serve the same chunks again from the start (a slot fell through).
+  void again(bool mayParkAgain);
 };
 
 // Copy bytes [from, from+len) of slot i -- its record, then zeros -- to dest.
+// False when the slot's bytes are not to be had after all: the slot is then
+// absent again, and serving the request again fetches it.
 bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest) {
-  if (cf.rnt) {
-    // The stage keeps the block the replica will hold; the reader of this pass
-    // is served the page decoded, which is exactly the slot's length.
-    const uint32_t vLen = cf.L.slots[i].vLen;
-    std::vector<uint8_t> enc(cf.slots[i].len);
-    if (from + len > vLen || !cf.readRecord(i, enc.data(), 0, enc.size()))
+  ColdFill::Where w;
+  if (!cf.where(i, w))
+    return false;
+  const tp::FillSlot& fs = cf.L.slots[i];
+  if (from + len > fs.vLen)
+    return false;
+  std::shared_ptr<const std::vector<uint8_t>> rec = w.mem;
+  if (!rec && w.kind == tp::ConvertedBasket::kOriginal && !cf.rnt) {
+    // Kept as stored: the original record, from the byte cache, with its
+    // fSeekKey pointing at the slot.
+    auto buf = std::make_shared<std::vector<uint8_t>>(fs.origLen);
+    if (!cf.entry->hasRange(fs.origSeek, fs.origLen) ||
+        !cf.entry->readCached(fs.origSeek, fs.origLen, buf->data(), /*account=*/false) ||
+        !tp::patchKeySeek(buf->data(), buf->size(), fs.vSeek)) {
+      cf.forget(i);
       return false;
-    if (enc.size() == vLen) {
-      std::memcpy(dest, enc.data() + from, len);
+    }
+    rec = buf;
+  } else if (!rec) {
+    auto buf = std::make_shared<std::vector<uint8_t>>();
+    if (!w.inStore || !cf.store->readRecord(w.e, *buf)) {
+      UCACHE_WARN("slot record for %s (slot %u) failed its check; converting it again",
+                  cf.key.key.c_str(), i);
+      cf.forget(i);
+      return false;
+    }
+    rec = buf;
+  }
+  if (cf.rnt) {
+    // The store keeps the block; the reader is served the page decoded, which
+    // is exactly the slot's length.
+    if (rec->size() == fs.vLen) {
+      std::memcpy(dest, rec->data() + from, len);
       return true;
     }
-    std::vector<uint8_t> raw = tp::decompressFrames(enc.data(), enc.size(), vLen);
-    if (raw.size() != vLen)
+    std::vector<uint8_t> raw = tp::decompressFrames(rec->data(), rec->size(), fs.vLen);
+    if (raw.size() != fs.vLen) {
+      cf.forget(i);
       return false;
+    }
     std::memcpy(dest, raw.data() + from, len);
     return true;
   }
-  const uint32_t recLen = cf.slots[i].len;
+  const uint64_t recLen = rec->size();
   uint64_t n = 0;
   if (from < recLen) {
     n = std::min<uint64_t>(len, recLen - from);
-    if (!cf.readRecord(i, reinterpret_cast<uint8_t*>(dest), from, n))
-      return false;
+    std::memcpy(dest, rec->data() + from, n);
   }
   if (n < len)
     std::memset(dest + n, 0, len - n);
   return true;
 }
 
+void ColdRequest::again(bool mayParkAgain) {
+  auto r2 = std::make_shared<ColdRequest>();
+  r2->st = st;
+  r2->entry = entry;
+  r2->cf = cf;
+  r2->chunks = chunks;
+  r2->isVRead = isVRead;
+  r2->user = user;
+  r2->attempt = attempt + 1;
+  r2->mayPark = mayParkAgain;
+  r2->t0 = t0;
+  Executor::instance().post([r2] { serveRequest(r2); });
+}
+
 void ColdRequest::finish() {
   if (failed.load()) {
     for (uint32_t i : claimed)
-      if (cf->slots[i].state.load(std::memory_order_acquire) != ColdFill::kReady)
+      if (cf->state[i].load(std::memory_order_acquire) != ColdFill::kReady)
         cf->abandon(i);
     XRootDStatus s;
     {
@@ -480,34 +970,33 @@ void ColdRequest::finish() {
     complete(user, new XRootDStatus(s), nullptr);
     return;
   }
-  if (retry.load()) { // another request's fetch failed: serve again, fetching ourselves
+  bool lost = retry.load(); // another request's fetch failed
+  if (!lost)
+    for (const auto& p : slotPieces)
+      if (!copySlot(*cf, p.slot, p.from, p.len, p.dest)) {
+        lost = true; // a record failed its check, or a kept original is gone
+        break;
+      }
+  if (lost) {
     if (attempt < 2) {
-      auto again = std::make_shared<ColdRequest>();
-      again->st = st;
-      again->entry = entry;
-      again->cf = cf;
-      again->chunks = std::move(chunks);
-      again->isVRead = isVRead;
-      again->user = user;
-      again->attempt = attempt + 1;
-      again->mayPark = false;
-      again->t0 = t0;
-      Executor::instance().post([again] { serveRequest(again); });
+      again(false);
       return;
     }
     complete(user, new XRootDStatus(XrdCl::stError, XrdCl::errDataError), nullptr);
     return;
   }
-  for (const auto& p : slotPieces)
-    if (!copySlot(*cf, p.slot, p.from, p.len, p.dest)) {
-      complete(user, new XRootDStatus(XrdCl::stError, XrdCl::errOSError), nullptr);
-      return;
-    }
   if (st->store) {
-    uint64_t total = 0;
+    uint64_t total = 0, slotBytes = 0;
     for (const auto& c : chunks)
       total += c.length;
-    st->store->stats().servedBytes.fetch_add(total, std::memory_order_relaxed);
+    for (const auto& p : slotPieces)
+      slotBytes += p.len;
+    auto& stats = st->store->stats();
+    stats.servedBytes.fetch_add(total, std::memory_order_relaxed);
+    // Slot bytes are the replica tier's share: converted records (and their
+    // padding), not the byte cache's.
+    stats.replicaBytesServed.fetch_add(slotBytes, std::memory_order_relaxed);
+    entry->obs().replicaBytes.fetch_add(slotBytes, std::memory_order_relaxed);
   }
   entry->noteActivity();
   st->noteCacheOk();
@@ -519,22 +1008,23 @@ void ColdRequest::finish() {
 
 // Convert one claimed basket and stage it. `rounded` holds the page-rounded
 // original range starting at `rStart`; the basket is [recOff, recOff+recLen)
-// inside it. Runs on the conversion pool.
+// inside it. `fromCache` = the original came from the byte cache (its copy
+// there is freed once the record is committed). Runs on the conversion pool.
 void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
                 std::shared_ptr<std::vector<char>> rounded, uint64_t rStart, uint64_t recOff,
-                uint32_t recLen) {
+                uint32_t recLen, bool fromCache) try {
   ColdFill& cf = *req->cf;
   const tp::FillSlot& slot = cf.L.slots[i];
   const auto* rec = reinterpret_cast<const uint8_t*>(rounded->data() + recOff);
   const uint64_t t0 = nowUs();
   if (cf.rnt) {
-    const auto& pg = cf.rm.ranges[slot.branch].pages[slot.basket];
-    tp::ConvertedPage p = tp::convertPage(rec, recLen, pg.nbytes, pg.hasChecksum, pg.uncompressedBytes);
+    const ColdFill::Page& pg = cf.pages[i];
+    tp::ConvertedPage p = tp::convertPage(rec, recLen, pg.nbytes, pg.hasChecksum, slot.vLen);
     const uint64_t us = nowUs() - t0;
     if (!p.error.empty()) {
       // A page whose checksum or decode fails must not be served decoded: the
       // reader could no longer detect it. Fail the read, as ROOT would.
-      UCACHE_WARN("cold run for %s: page at %llu: %s", cf.key.key.c_str(),
+      UCACHE_WARN("slot run for %s: page at %llu: %s", cf.key.key.c_str(),
                   static_cast<unsigned long long>(slot.origSeek), p.error.c_str());
       req->fail(XRootDStatus(XrdCl::stError, XrdCl::errDataError));
       req->done();
@@ -557,7 +1047,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       req->entry->writePages(rStart, rounded->size(), rounded->data());
       req->entry->flushMeta(false);
     }
-    cf.stage(i, kind, std::move(p.enc));
+    cf.stage(i, kind, std::move(p.enc), fromCache);
     req->done();
     return;
   }
@@ -590,13 +1080,19 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     req->done();
     return;
   }
-  if (c.kind == tp::ConvertedBasket::kOriginal || cf.keepOriginals) {
+  if ((c.kind == tp::ConvertedBasket::kOriginal && !fromCache) || cf.keepOriginals) {
     // Cannot be converted: the one kind of basket the byte cache keeps --
     // unless keeping every original was asked for, to compare the tiers.
     req->entry->writePages(rStart, rounded->size(), rounded->data());
     req->entry->flushMeta(false);
   }
-  cf.stage(i, static_cast<uint8_t>(c.kind), std::move(c.record));
+  // A kept original is not punched from the byte cache: it is the only copy.
+  cf.stage(i, static_cast<uint8_t>(c.kind), std::move(c.record),
+           fromCache && c.kind != tp::ConvertedBasket::kOriginal);
+  req->done();
+} catch (const std::exception& e) {
+  UCACHE_WARN("slot run for %s: conversion failed (%s)", req->cf->key.key.c_str(), e.what());
+  req->fail(XRootDStatus(XrdCl::stError, XrdCl::errInternal));
   req->done();
 }
 
@@ -658,20 +1154,28 @@ class PartHandler : public ResponseHandler {
         const uint32_t idx = it.index;
         const uint64_t rs = it.rs;
         convertPool().post(
-            [req, idx, buf, rs, recOff, recLen] { convertOne(req, idx, buf, rs, recOff, recLen); });
+            [req, idx, buf, rs, recOff, recLen] {
+              convertOne(req, idx, buf, rs, recOff, recLen, /*fromCache=*/false);
+            });
       } else {
         const auto& p = req_->origPieces[it.index];
         std::memcpy(p.dest, buf->data() + (p.off - it.rs), p.len);
-        // Original bytes the reader asked for that are not a converted basket:
-        // the byte cache keeps them.
-        st->beginPersist();
-        auto entry = req_->entry;
-        const uint64_t rs = it.rs;
-        Executor::instance().post([st, entry, buf, rs] {
-          entry->writePages(rs, buf->size(), buf->data());
-          entry->flushMeta(false);
-          st->endPersist();
-        });
+        // Original bytes the reader asked for: the byte cache keeps them --
+        // except pages wholly inside a relocated basket, which a reader of
+        // this layout never needs (a copy tool reading everything would
+        // otherwise store every basket a second time).
+        auto runs = req_->cf->storableRuns(it.rs, it.re, req_->entry->pageSize());
+        if (!runs.empty()) {
+          st->beginPersist();
+          auto entry = req_->entry;
+          const uint64_t rs = it.rs;
+          Executor::instance().post([st, entry, buf, rs, runs] {
+            for (const auto& [a, b] : runs)
+              entry->writePages(a, b - a, buf->data() + (a - rs));
+            entry->flushMeta(false);
+            st->endPersist();
+          });
+        }
       }
     }
     req_->done();
@@ -795,7 +1299,8 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         const uint64_t from = pos - s.vSeek;
         const uint64_t n = std::min<uint64_t>(end, s.vSeek + s.vLen) - pos;
         req->slotPieces.push_back({i, from, n, d});
-        if (cf.slots[i].state.load(std::memory_order_acquire) != ColdFill::kReady)
+        if (cf.state[i].load(std::memory_order_acquire) != ColdFill::kReady ||
+            cf.keptOriginalGone(i))
           need.push_back(i);
         pos += n;
       }
@@ -809,24 +1314,30 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   classify(req, need);
   std::sort(need.begin(), need.end());
   need.erase(std::unique(need.begin(), need.end()), need.end());
+  if (!need.empty()) {
+    // Another process may have converted them since: use its records rather
+    // than fetch and convert the same baskets again.
+    cf.sync();
+    need.erase(std::remove_if(need.begin(), need.end(),
+                              [&](uint32_t i) {
+                                return cf.state[i].load(std::memory_order_acquire) ==
+                                       ColdFill::kReady;
+                              }),
+               need.end());
+  }
 
 #ifdef UCACHE_HAVE_PREFETCH
   const Config& cfg = globalConfig();
-  if (cfg.prefetch && req->mayPark) {
+  if (cfg.prefetch && req->mayPark && !need.empty()) {
     // Read-ahead learns from this fill in the ORIGINAL file's coordinates --
     // a slot is its basket -- and predicts and fetches the next baskets into
     // the byte cache's speculative stage, from where the conversion below
-    // takes them. Slots are identified once per fill, not once per piece.
-    std::vector<uint32_t> ids;
-    for (const auto& p : req->slotPieces)
-      ids.push_back(p.slot);
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    // takes them. Only the slots still to be converted: predicting from the
+    // ones in the store would fetch originals nobody needs.
     XrdCl::ChunkList orig;
-    for (uint32_t i : ids)
+    for (uint32_t i : need)
       orig.emplace_back(cf.L.slots[i].origSeek, cf.L.slots[i].origLen, nullptr);
-    if (!orig.empty())
-      Prefetcher::instance().onFill(req->st, req->entry, orig, !need.empty());
+    Prefetcher::instance().onFill(req->st, req->entry, orig, true);
   }
   if (cfg.prefetch && cfg.prefetchJoin && req->mayPark && !need.empty()) {
     // A basket read ahead may be on the wire right now: wait for that copy
@@ -894,7 +1405,8 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
         // rather than being written or dropped as never used.
         req->entry->consumeSpeculative(s.origSeek, s.origLen);
         req->outstanding.fetch_add(1, std::memory_order_relaxed);
-        convertPool().post([req, i, buf, s] { convertOne(req, i, buf, s.origSeek, 0, s.origLen); });
+        convertPool().post(
+            [req, i, buf, s] { convertOne(req, i, buf, s.origSeek, 0, s.origLen, /*fromCache=*/true); });
         continue;
       }
     }
@@ -912,7 +1424,9 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   std::vector<PartItem> part;
   uint64_t partBytes = 0, partEnd = 0;
   for (const auto& it : items) {
-    if (!part.empty() && partBytes >= kPartBytes && it.rs >= partEnd) {
+    // Cut by bytes, and by element count: a vector read carries at most 1024.
+    if (!part.empty() && (partBytes >= kPartBytes || part.size() >= kPartItems) &&
+        it.rs >= partEnd) {
       issuePart(req, std::move(part));
       part.clear();
       partBytes = 0;
@@ -928,135 +1442,302 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
 
 } // namespace
 
-// --------------------------------------------------------------- publishing
+// --------------------------------------------------------------- committing
 
-void ColdFill::publish() {
-  std::vector<tp::RelocatedBasket> list;
-  std::vector<uint32_t> idx;
-  for (uint32_t i = 0; i < L.slots.size(); ++i)
-    if (slots[i].state.load(std::memory_order_acquire) == kReady &&
-        slots[i].kind != tp::ConvertedBasket::kOriginal) {
-      list.push_back({L.slots[i].branch, L.slots[i].basket});
-      idx.push_back(i);
+namespace {
+
+// Commits run here: they take the store's exclusive lock, which may wait for
+// another process's commit, and nothing that serves reads may wait on that.
+// Leaked like the other pools.
+Executor& commitPool() {
+  static Executor* pool = new Executor(2);
+  return *pool;
+}
+
+// Records converted in this process and not yet committed, all files. Past
+// the cap the thread that converts commits itself -- back-pressure instead of
+// memory growth.
+std::atomic<uint64_t> g_pendingTotal{0};
+constexpr uint64_t kPendingCap = 512ull << 20;
+
+// The file's first 128 KiB is never punched: ROOT reads it as one block, and
+// a hole there sends every open to the origin.
+constexpr uint64_t kKeepHead = 128 * 1024;
+
+} // namespace
+
+void ColdFill::stage(uint32_t i, uint8_t kind, std::vector<uint8_t>&& rec, bool fromCache) {
+  std::vector<std::function<void(bool)>> wake;
+  bool kick = false, now = false;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    Info& s = info[i];
+    if (!s.inStore) { // someone committed it meanwhile: theirs serves
+      s.kind = kind;
+      // A basket kept as stored is served from the byte cache's copy of its
+      // original, just written; memory keeps it only if that write did not
+      // land.
+      const tp::FillSlot& fs = L.slots[i];
+      const bool inCache = !rnt && kind == tp::ConvertedBasket::kOriginal &&
+                           entry->hasRange(fs.origSeek, fs.origLen);
+      s.mem = inCache ? nullptr : std::make_shared<const std::vector<uint8_t>>(std::move(rec));
+      s.fromCache = fromCache;
+      s.persist = !storeGone.load(std::memory_order_relaxed);
+      if (s.persist) {
+        pending.push_back(i);
+        const uint64_t b = s.mem ? s.mem->size() : 0;
+        pendingBytes += b;
+        kick = pendingBytes >= kCommitBytes;
+        now = g_pendingTotal.fetch_add(b, std::memory_order_relaxed) + b > kPendingCap;
+      }
     }
-  const auto converted = nZstd.load() + nRaw.load();
-  if (list.empty()) {
-    UCACHE_DEBUG("cold run for %s converted nothing; no replica", key.key.c_str());
+    state[i].store(kReady, std::memory_order_release);
+    takeWaitersLocked(i, wake);
+  }
+  for (auto& w : wake)
+    w(true);
+  if (now)
+    commit();
+  else if (kick)
+    queueCommit();
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> ColdFill::storableRuns(uint64_t rs, uint64_t re,
+                                                                  uint64_t ps) {
+  {
+    std::lock_guard<std::mutex> g(mu);
+    if (relocatedOrig.empty() && !L.slots.empty()) {
+      relocatedOrig.reserve(L.slots.size());
+      for (const auto& s : L.slots)
+        relocatedOrig.emplace_back(s.origSeek, s.origSeek + s.origLen);
+      std::sort(relocatedOrig.begin(), relocatedOrig.end());
+    }
+  }
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  for (uint64_t p = rs; p < re; p += ps) {
+    const uint64_t pe = std::min(re, p + ps);
+    // Is [p, pe) inside one relocated basket? Baskets do not overlap, so the
+    // last one starting at or before p is the only candidate.
+    auto it = std::upper_bound(relocatedOrig.begin(), relocatedOrig.end(),
+                               std::make_pair(p, UINT64_MAX));
+    const bool dead = it != relocatedOrig.begin() && std::prev(it)->second >= pe;
+    if (dead)
+      continue;
+    if (!out.empty() && out.back().second == p)
+      out.back().second = pe;
+    else
+      out.emplace_back(p, pe);
+  }
+  return out;
+}
+
+void ColdFill::queueCommit() {
+  if (commitQueued.exchange(true))
+    return;
+  {
+    std::lock_guard<std::mutex> g(g_cmtMu);
+    ++g_cmtPending;
+  }
+  auto self = shared_from_this();
+  commitPool().post([self] {
+    self->commit();
+    std::lock_guard<std::mutex> g(g_cmtMu);
+    if (--g_cmtPending == 0)
+      g_cmtCv.notify_all();
+  });
+}
+
+void ColdFill::dropRecords(const std::vector<SlotRecord>& recs, const std::string& why) {
+  static std::atomic<bool> warned{false};
+  if (!warned.exchange(true))
+    UCACHE_WARN("slot records for %s not kept (%s); they are converted again when read "
+                "(further such cases are not reported)",
+                key.key.c_str(), why.c_str());
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (const auto& r : recs) {
+      auto it = info.find(r.slot);
+      if (it != info.end() && !it->second.inStore)
+        forgetLocked(r.slot);
+    }
+  }
+  if (auto store = globalStore())
+    store->stats().coldReplicaDeclined.fetch_add(recs.size(), std::memory_order_relaxed);
+}
+
+// Commit what waits in memory. Under the store's lock, entries other processes
+// committed meanwhile are applied first and their slots skipped -- so no slot
+// is written twice -- then the rest goes to the store as one block.
+void ColdFill::commit() try {
+  std::lock_guard<std::mutex> cg(commitMu);
+  commitQueued.store(false);
+  std::vector<SlotRecord> recs;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (uint32_t i : pending) {
+      auto it = info.find(i);
+      if (it == info.end())
+        continue; // forgotten meanwhile
+      Info& s = it->second;
+      if (!s.persist || s.inStore || state[i].load(std::memory_order_acquire) != kReady ||
+          (!s.mem && s.kind != tp::ConvertedBasket::kOriginal))
+        continue;
+      SlotRecord r;
+      r.slot = i;
+      r.kind = entryKind(s.kind);
+      if (r.kind != SlotEntry::kKept)
+        r.bytes = *s.mem;
+      recs.push_back(std::move(r));
+    }
+    pending.clear();
+    g_pendingTotal.fetch_sub(pendingBytes, std::memory_order_relaxed);
+    pendingBytes = 0;
+  }
+  if (recs.empty() || !store || storeGone.load())
+    return;
+  uint64_t bytes = 0;
+  for (const auto& r : recs)
+    bytes += r.bytes.size();
+  auto cs = globalStore();
+  if (cs && bytes > CacheStore::headroomToFloor(cs->config(), RealIO::instance())) {
+    dropRecords(recs, "no room above the free-space floor");
     return;
   }
-  tp::Overlay ov;
-  if (rnt) {
-    // Pages are addressed by (range, page) here and by original offset in the
-    // slots: a page several records share has one slot.
-    std::unordered_map<uint64_t, uint32_t> byOffset;
-    for (uint32_t i = 0; i < L.slots.size(); ++i)
-      byOffset.emplace(L.slots[i].origSeek, i);
-    auto slotOf = [&](size_t ri, size_t pi) -> int64_t {
-      auto it = byOffset.find(rm.ranges[ri].pages[pi].offset);
-      if (it == byOffset.end() || slots[it->second].state.load(std::memory_order_acquire) != kReady)
-        return -1;
-      return it->second;
-    };
-    auto rw = tp::buildRNTupleRewriteFromPages(
-        rm, L.originSize, 1, [&](size_t ri, size_t pi) { return slotOf(ri, pi) >= 0; },
-        [&](size_t ri, size_t pi, std::vector<uint8_t>& enc) {
-          const int64_t i = slotOf(ri, pi);
-          if (i < 0)
-            return false;
-          enc.resize(slots[i].len);
-          return readRecord(static_cast<uint32_t>(i), enc.data(), 0, enc.size());
-        });
-    ov = tp::rnTupleOverlay(rm, rw);
-  } else {
-    ov = tp::buildOverlayFromRecords(fm, treeKeyHeader, keysList, list,
-                                     [&](size_t j, std::vector<uint8_t>& out) {
-                                       out.resize(slots[idx[j]].len);
-                                       return readRecord(idx[j], out.data(), 0, out.size());
-                                     });
-  }
-  if (!ov.error.empty()) {
-    UCACHE_WARN("cold run for %s: replica not built (%s)", key.key.c_str(), ov.error.c_str());
-    if (auto store = globalStore())
-      store->stats().coldReplicaDeclined.fetch_add(1, std::memory_order_relaxed);
+  std::vector<SlotEntry> committed;
+  const int64_t n = store->commit(
+      recs, [this](const std::vector<SlotEntry>& es) { apply(es); },
+      [this](uint32_t slot) {
+        std::lock_guard<std::mutex> g(mu);
+        auto it = info.find(slot);
+        return it != info.end() && it->second.inStore;
+      },
+      globalConfig().fsync != FsyncMode::kOff, committed);
+  if (n == -ESTALE) {
+    // Dropped or replaced (evicted, removed, another build's): this process
+    // keeps serving what it holds, and commits nothing more to it.
+    if (!storeGone.exchange(true))
+      UCACHE_INFO("slot store for %s was removed; nothing more is committed to it",
+                  key.key.c_str());
     return;
   }
-  ReplicaMeta meta = ov.meta;
-  meta.originMtime = originMtime;
-  meta.cksumKind = cksumKind;
-  meta.originCksum = originCksum;
-  auto store = globalStore();
-  if (!store)
-    return;
-  // Never evict for a replica: the reader's working set was cached for a
-  // reason, and a replica written past the floor makes the next fill evict it.
-  const uint64_t head = CacheStore::headroomToFloor(store->config(), RealIO::instance());
-  if (ov.tdata.size() > head) {
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true))
-      UCACHE_WARN("cold run for %s: replica not published, %llu bytes do not fit the %llu "
-                  "bytes above the free-space floor (further such files are not reported)",
-                  key.key.c_str(), static_cast<unsigned long long>(ov.tdata.size()),
-                  static_cast<unsigned long long>(head));
-    store->stats().coldReplicaDeclined.fetch_add(1, std::memory_order_relaxed);
+  if (n < 0) {
+    dropRecords(recs, std::strerror(static_cast<int>(-n)));
     return;
   }
-  ReplicaStore rs(RealIO::instance(), store->config(), store->stats());
-  // One publisher per file at a time, across processes: the entry's own data
-  // file is the lock. The first complete publish wins; a later one would only
-  // replace a valid replica with another.
-  int lk = ::open(key.dataPath(cacheDir).c_str(), O_RDONLY | O_CLOEXEC);
-  if (lk >= 0)
-    ::flock(lk, LOCK_EX);
-  struct ::stat sb;
-  const bool exists = ::stat(ReplicaStore::tmetaPath(key, cacheDir).c_str(), &sb) == 0;
-  int rc = exists ? 0 : rs.publish(key, meta, ov.tdata.data(), ov.tdata.size());
-  if (lk >= 0) {
-    ::flock(lk, LOCK_UN);
-    ::close(lk);
+  std::vector<std::pair<uint64_t, uint64_t>> punch;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (const auto& e : committed) {
+      Info& s = info[e.slot];
+      s.inStore = true;
+      s.e = e;
+      if (s.fromCache && !keepOriginals) {
+        const uint64_t a = std::max<uint64_t>(L.slots[e.slot].origSeek, kKeepHead);
+        const uint64_t b = L.slots[e.slot].origSeek + L.slots[e.slot].origLen;
+        if (a < b)
+          punch.emplace_back(a, b - a);
+      }
+      s.fromCache = false;
+      s.persist = false;
+      s.mem.reset();
+    }
+    for (const auto& r : recs) { // skipped: another process's record serves
+      auto it = info.find(r.slot);
+      if (it != info.end() && it->second.inStore) {
+        it->second.persist = false;
+        it->second.mem.reset();
+      }
+    }
   }
-  if (exists)
-    UCACHE_INFO("cold run for %s: a replica was published meanwhile; this one is dropped",
-                key.key.c_str());
-  else if (rc != 0) {
-    UCACHE_WARN("cold run for %s: replica publish failed (%s)", key.key.c_str(),
-                std::strerror(-rc));
-    store->stats().coldReplicaDeclined.fetch_add(1, std::memory_order_relaxed);
-  }
-  else
-    UCACHE_INFO("cold run for %s: replica published, %zu baskets (%llu converted, %llu kept as "
-                "stored), %llu -> %llu bytes, %.1f s converting",
-                key.key.c_str(), list.size(), static_cast<unsigned long long>(converted),
-                static_cast<unsigned long long>(nOrig.load()),
-                static_cast<unsigned long long>(inBytes.load()),
-                static_cast<unsigned long long>(outBytes.load()), convertUs.load() / 1e6);
+  // Outside the store's lock: accounting may evict, punching takes the byte
+  // cache's own lock.
+  if (cs && n > 0)
+    cs->noteStoredBytes(static_cast<uint64_t>(n));
+  // The converted record is the copy now: the original's whole pages go.
+  if (!punch.empty() && entry)
+    entry->releaseRanges(punch);
+} catch (const std::exception& e) {
+  UCACHE_WARN("slot store commit for %s failed (%s)", key.key.c_str(), e.what());
+}
+
+namespace {
+
+// Which layout this process has shown each file in, for the process's whole
+// life: a reader may hold offsets from any open it made, and must never be
+// shown a different address space later. Leaked.
+std::mutex g_shownMu;
+std::unordered_map<std::string, std::pair<ShownLayout, uint64_t>>& shownMap() {
+  static auto* m = new std::unordered_map<std::string, std::pair<ShownLayout, uint64_t>>();
+  return *m;
+}
+
+// At exit: every record still in memory is committed, with a bounded wait. A
+// hard _exit() skips this, and loses at most what the periodic checkpoint had
+// not yet committed.
+void commitAtExit() {
+  coldCheckpoint();
+  std::unique_lock<std::mutex> lk(g_cmtMu);
+  if (!g_cmtCv.wait_for(lk, std::chrono::minutes(2), [] { return g_cmtPending == 0; }))
+    UCACHE_WARN("exiting with %d slot-store commit(s) unfinished after 2 min", g_cmtPending);
+}
+
+} // namespace
+
+ShownLayout shownLayout(const std::string& key, uint64_t& hash) {
+  std::lock_guard<std::mutex> g(g_shownMu);
+  auto it = shownMap().find(key);
+  if (it == shownMap().end())
+    return ShownLayout::kNone;
+  hash = it->second.second;
+  return it->second.first;
+}
+
+void noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash) {
+  std::lock_guard<std::mutex> g(g_shownMu);
+  auto& v = shownMap()[key];
+  // Original may later become compact or slot (the original region reads the
+  // same in both); nothing else changes once shown.
+  if (v.first == ShownLayout::kNone || v.first == ShownLayout::kOriginal)
+    v = {s, hash};
 }
 
 // -------------------------------------------------------------------- API
 
 std::shared_ptr<ColdFill> coldAttach(const std::shared_ptr<HandleState>& st,
                                      const std::shared_ptr<FileEntry>& entry, const UrlKey& key,
-                                     uint64_t originMtime, uint8_t cksumKind,
-                                     uint32_t originCksum) {
+                                     uint64_t originMtime, uint8_t cksumKind, uint32_t originCksum,
+                                     AttachMode mode, uint64_t matchHash) {
   {
     std::lock_guard<std::mutex> g(g_regMu);
     auto it = registry().find(key.key);
-    if (it != registry().end()) {
+    // Joined only if it is the same file: an entry replaced at the origin
+    // meanwhile gets a run of its own.
+    if (it != registry().end() && it->second->L.originSize == entry->fileSize() &&
+        it->second->entry == entry &&
+        (mode != AttachMode::kMatch || it->second->store->header().layoutHash == matchHash)) {
       std::lock_guard<std::mutex> g2(it->second->mu);
       ++it->second->handles;
       return it->second;
     }
   }
-  auto cf = build(st, entry, key); // network reads: outside the registry lock
+  std::shared_ptr<ColdFill> cf;
+  try { // network reads: outside the registry lock
+    cf = build(st, entry, key, originMtime, cksumKind, originCksum, mode, matchHash);
+  } catch (const std::exception& e) {
+    UCACHE_WARN("slot run for %s not set up (%s); the file is served as stored", key.key.c_str(),
+                e.what());
+    return nullptr;
+  }
   if (!cf)
     return nullptr;
   // Registered after the store exists, so it runs before the store is torn down.
   static std::once_flag once;
-  std::call_once(once, [] { std::atexit(waitForPublishes); });
-  cf->originMtime = originMtime;
-  cf->cksumKind = cksumKind;
-  cf->originCksum = originCksum;
+  std::call_once(once, [] { std::atexit(commitAtExit); });
+  noteShownLayout(key.key, ShownLayout::kSlot, cf->store->header().layoutHash);
   std::lock_guard<std::mutex> g(g_regMu);
   auto [it, inserted] = registry().emplace(key.key, cf);
+  if (!inserted && (it->second->L.originSize != entry->fileSize() || it->second->entry != entry))
+    it->second = cf; // the old run keeps serving its own handles
   std::lock_guard<std::mutex> g2(it->second->mu);
   ++it->second->handles; // a racing handle built it first: join that one, drop ours
   return it->second;
@@ -1076,20 +1757,22 @@ void coldDetach(const std::shared_ptr<ColdFill>& cf) {
         registry().erase(it);
     }
   }
-  if (last) {
-    {
-      std::lock_guard<std::mutex> g(g_pubMu);
-      ++g_pubPending;
-    }
-    auto keep = cf;
-    convertPool().post([keep] {
-      keep->publish();
-      std::lock_guard<std::mutex> g(g_pubMu);
-      if (--g_pubPending == 0)
-        g_pubCv.notify_all();
-    });
-  }
+  if (last)
+    cf->queueCommit(); // what this process converted goes to the store now
 }
+
+void coldCheckpoint() {
+  std::vector<std::shared_ptr<ColdFill>> all;
+  {
+    std::lock_guard<std::mutex> g(g_regMu);
+    for (const auto& [k, cf] : registry())
+      all.push_back(cf);
+  }
+  for (const auto& cf : all)
+    cf->queueCommit();
+}
+
+uint64_t coldLayoutHash(const ColdFill& cf) { return cf.store->header().layoutHash; }
 
 uint64_t coldVirtualSize(const ColdFill& cf) { return cf.L.virtualSize; }
 

@@ -1,4 +1,5 @@
 #include "ReplicaStore.h"
+#include "SlotStore.h"
 
 #include "IOBackend.h"
 #include "Log.h"
@@ -236,6 +237,13 @@ int ReplicaStore::publish(const UrlKey& key, ReplicaMeta meta, const void* tdata
 
   if (int rc = io_.mkdirs(key.objectDir(cfg_.cacheDir), 0700); rc < 0)
     return rc;
+  // A file with a slot store is served in that store's layout, by every
+  // process that has shown it: a compact replica beside it could be shown to
+  // one of them instead, at offsets that mean something else there.
+  if (SlotStore::serving(io_, key.objectDir(cfg_.cacheDir), key.hashHex)) {
+    UCACHE_INFO("replica publish for %s declined: the file has a slot store", key.key.c_str());
+    return -EEXIST;
+  }
   const std::string dPath = tdataPath(key, cfg_.cacheDir);
   const std::string dTmp = dPath + ".tmp";
   int fd = io_.open(dTmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);

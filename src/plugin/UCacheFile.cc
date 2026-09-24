@@ -16,6 +16,7 @@
 #include "Trace.h"
 #include "vendor/crc32c.h"
 
+#include <functional>
 #include <XProtocol/XProtocol.hh> // kXR_* wire codes for the OpenRetry drift asserts
 
 #include <cstdio>
@@ -1356,6 +1357,47 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
 // Runs on the caller's (app/IMT) thread — never an XrdCl callback thread —
 // so the synchronous inner Stat here is allowed (§5.3). Serialized by
 // setupMu so concurrent first-reads set up exactly once.
+#ifdef UCACHE_HAVE_COLDRUN
+namespace {
+// Which layout of the file this handle is shown. A process never shows a file
+// in a layout it has not shown it in before -- a reader may hold offsets from
+// any of its opens -- except that the original may become a replica, whose
+// original region reads the same. Otherwise: a slot store first, then a
+// compact replica, then a new store when recompression is on.
+void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
+                  const UrlKey& key, const Config& cfg, uint64_t mtime, uint8_t cksumKind,
+                  uint32_t cksum, const std::function<std::shared_ptr<ReplicaView>()>& openView,
+                  std::shared_ptr<ReplicaView>& view, std::shared_ptr<ColdFill>& cold) {
+  uint64_t hash = 0;
+  const ShownLayout shown = shownLayout(key.key, hash);
+  if (shown == ShownLayout::kSlot) {
+    cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kMatch, hash);
+    if (!cold)
+      UCACHE_WARN("%s was shown in a slot layout earlier in this process and that layout is "
+                  "gone; it is served as stored, and offsets read from the layout fail",
+                  key.key.c_str());
+    return;
+  }
+  if (shown == ShownLayout::kCompact) {
+    view = openView();
+    return;
+  }
+  cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kExisting);
+  if (cold)
+    return;
+  view = openView();
+  if (view) {
+    noteShownLayout(key.key, ShownLayout::kCompact);
+    return;
+  }
+  if (cfg.recompress)
+    cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kCreate);
+  if (!cold)
+    noteShownLayout(key.key, ShownLayout::kOriginal);
+}
+} // namespace
+#endif
+
 std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
   if (passthroughOnly_ || !st_->store)
     return nullptr;
@@ -1404,13 +1446,20 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
                                                       meta->originMtime);
         if (cfg.transpose) {
           ReplicaStore rs(RealIO::instance(), cfg, st_->store->stats());
-          view = rs.openView(*key, meta->fileSize, meta->originMtime, meta->cksumKind,
-                             meta->originCksum);
+          auto openView = [&] {
+            return rs.openView(*key, meta->fileSize, meta->originMtime, meta->cksumKind,
+                               meta->originCksum);
+          };
+#ifdef UCACHE_HAVE_COLDRUN
+          chooseLayout(st_, entry, *key, cfg, meta->originMtime, meta->cksumKind,
+                       meta->originCksum, openView, view, cold);
+#else
+          view = openView();
+#endif
           if (view)
             statClone->SetSize(view->virtualSize());
 #ifdef UCACHE_HAVE_COLDRUN
-          else if (cfg.recompress && (cold = coldAttach(st_, entry, *key, meta->originMtime,
-                                                        meta->cksumKind, meta->originCksum)))
+          else if (cold)
             statClone->SetSize(coldVirtualSize(*cold));
 #endif
         }
@@ -1458,7 +1507,13 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
       // the stitched fEND' so ROOT's fBEGIN <= fEND <= size check holds.
       if (entry && cfg.transpose) {
         ReplicaStore rs(RealIO::instance(), cfg, st_->store->stats());
-        view = rs.openView(*key, si->GetSize(), si->GetModTime());
+        auto openView = [&] { return rs.openView(*key, si->GetSize(), si->GetModTime()); };
+#ifdef UCACHE_HAVE_COLDRUN
+        chooseLayout(st_, entry, *key, cfg, si->GetModTime(), MetaData::kCksumNone, 0, openView,
+                     view, cold);
+#else
+        view = openView();
+#endif
         if (view) {
           statClone->SetSize(view->virtualSize());
           UCACHE_INFO("serving stitched replica view for %s (virtual %llu bytes)",
@@ -1466,10 +1521,7 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
                       static_cast<unsigned long long>(view->virtualSize()));
         }
 #ifdef UCACHE_HAVE_COLDRUN
-        // No replica yet and recompression on: the replica is created on this
-        // pass, from what the reader asks for.
-        else if (cfg.recompress &&
-                 (cold = coldAttach(st_, entry, *key, si->GetModTime(), MetaData::kCksumNone, 0)))
+        else if (cold)
           statClone->SetSize(coldVirtualSize(*cold));
 #endif
       }
@@ -2175,13 +2227,13 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
 #endif
   if (view) {
     // Stitched entry: whole vector served on the executor.
+    // A chunk past the view's end is the reader's error, answered here: the
+    // origin does not have this layout, so relaying the vector would send it
+    // offsets it does not have. A zero-length chunk (ROOT sends them) is
+    // served as the empty chunk it is.
     for (const auto& c : chunks)
-      if (c.length == 0 || c.offset + c.length > view->virtualSize()) {
-        noteRelayChunks(st_, chunks);
-        return relayToInner(st_, handler, [&](XrdCl::File* f, ResponseHandler* rh) {
-          return f->VectorRead(chunks, buffer, rh, timeout);
-        });
-      }
+      if (c.offset + c.length < c.offset || c.offset + c.length > view->virtualSize())
+        return XRootDStatus(XrdCl::stError, XrdCl::errInvalidArgs);
     auto st = st_;
     noteVectorRequest(st_, chunks);
     ChunkList userChunks = chunks;

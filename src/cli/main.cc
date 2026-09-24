@@ -7,6 +7,7 @@
 #include "HelperPath.h"
 #include "IOBackend.h"
 #include "MetaFile.h"
+#include "SlotStore.h"
 #include "ReplicaStore.h"
 #include "RunLog.h"
 #include "DiskBench.h"
@@ -381,10 +382,11 @@ void printStats(const StatsTotals& t) {
               human(t.relayBytes).c_str(), human(t.missBytes).c_str(),
               human(t.ramHitBytes).c_str(), human(diskB).c_str(),
               human(t.replicaBytesServed).c_str());
-  if (t.coldReplicaFiles)
-    std::printf("  cold replica run   %llu files, %s converted to %s (%llu baskets, %llu kept as "
-                "stored), %.1f s converting, %llu not published\n",
-                (unsigned long long)t.coldReplicaFiles, human(t.coldReplicaInBytes).c_str(),
+  if (t.coldReplicaFiles || t.coldReplicaBaskets || t.coldReplicaBasketsKept)
+    std::printf("  converted on read  %llu new store%s, %s converted to %s (%llu baskets, %llu kept "
+                "as stored), %.1f s converting, %llu not kept\n",
+                (unsigned long long)t.coldReplicaFiles, t.coldReplicaFiles == 1 ? "" : "s",
+                human(t.coldReplicaInBytes).c_str(),
                 human(t.coldReplicaOutBytes).c_str(), (unsigned long long)t.coldReplicaBaskets,
                 (unsigned long long)t.coldReplicaBasketsKept, static_cast<double>(t.coldReplicaConvertUs) / 1e6,
                 (unsigned long long)t.coldReplicaDeclined);
@@ -1143,7 +1145,8 @@ bool anyReplicaExists(const std::string& cacheDir) {
       continue;
     while (dirent* f = ::readdir(sd)) {
       const std::string n = f->d_name;
-      if (n.size() > 6 && n.compare(n.size() - 6, 6, ".tmeta") == 0) {
+      if ((n.size() > 6 && n.compare(n.size() - 6, 6, ".tmeta") == 0) ||
+          (n.size() > 6 && n.compare(n.size() - 6, 6, ".slots") == 0)) {
         found = true;
         break;
       }
@@ -2937,8 +2940,9 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
       }
       {
         struct ::stat st;
-        if (io.stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir), &st) == 0) {
-          ++already; // replica exists (or appeared while this pass ran)
+        if (io.stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir), &st) == 0 ||
+            SlotStore::serving(io, key->objectDir(cfg.cacheDir), key->hashHex)) {
+          ++already; // replica or slot store exists (or appeared while this pass ran)
           continue;
         }
       }
@@ -3431,11 +3435,17 @@ int cmdUntranspose(CacheStore& store, const Config& cfg, IOBackend& io, const ch
   }
   ReplicaStore rs(io, cfg, store.stats());
   struct ::stat st;
-  if (io.stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir), &st) != 0) {
+  const std::string slots = SlotStore::path(key->objectDir(cfg.cacheDir), key->hashHex);
+  const bool compact = io.stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir), &st) == 0;
+  const bool slotted = io.stat(slots, &st) == 0;
+  if (!compact && !slotted) {
     std::fprintf(stderr, "%s: no replica (nothing to drop)\n", url);
     return 1;
   }
-  rs.drop(*key);
+  if (compact)
+    rs.drop(*key);
+  if (slotted)
+    SlotStore::drop(io, key->objectDir(cfg.cacheDir), key->hashHex);
   std::printf("dropped replica for %s (byte cache kept; punched pages refetch on demand)\n",
               key->key.c_str());
   return 0;

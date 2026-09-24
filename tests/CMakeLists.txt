@@ -26,6 +26,7 @@ add_executable(ucache-unit-tests
   unit/read_rounding_test.cc
   unit/cachestore_test.cc
   unit/replica_test.cc
+  unit/slotstore_test.cc
   unit/differential_test.cc
   unit/concurrency_test.cc
   unit/fault_test.cc

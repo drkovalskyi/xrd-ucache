@@ -74,6 +74,10 @@ class IOBackend {
   // treat that as best-effort space reclaim, never a correctness failure
   // (replica punch-and-clear).
   virtual int punchHole(int fd, uint64_t offset, uint64_t length) = 0;
+  // Hard-link `from` as `to`; -EEXIST if `to` exists. Creating a file whole
+  // (write a private file, link it into place) is how a store is made visible
+  // with its header already complete. POSIX by default.
+  virtual int link(const std::string& from, const std::string& to);
 
   // Complete pwrite loop: retries short writes; negative -errno on failure.
   int64_t pwriteFull(int fd, const void* buf, uint64_t count, uint64_t offset);

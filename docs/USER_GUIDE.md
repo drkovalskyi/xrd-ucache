@@ -645,7 +645,7 @@ overriding your defaults. Common keys:
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
-| `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when a replica is created on the first pass, keep the original bytes in the byte cache too (by default they are not kept: the cache would hold the same data twice) |
+| `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
 | `trace = off` | `UCACHE_TRACE` | `io` = write a sampled per-operation JSON trace next to the process's stats file (deep-dive forensics; zero cost when off). Best set per job: `UCACHE_TRACE=io python3 my_analysis.py` |
@@ -770,35 +770,54 @@ ucache set recompress on   # or `recompress = on` in ucache.conf as your default
 
 With it on, a file that has no replica yet gets one **on its first pass**,
 TTree and RNTuple alike. uCache fetches exactly what your job asks for, as it
-would anyway, converts each basket or page to ZSTD-1 as it arrives, and
-publishes the replica when the job closes the file; the next run reads the
-replica. Nothing extra is fetched and no command is needed. That first pass
-costs CPU — everything it reads is converted — so on a machine short of cores
-it can be slower than a pass with recompression off.
+would anyway, converts each basket or page to ZSTD-1 as it arrives, and keeps
+the converted records in the file's replica as it goes; the next run reads
+them. Nothing extra is fetched and no command is needed. That first pass costs
+CPU — everything it reads is converted — so on a machine short of cores it can
+be slower than a pass with recompression off.
+
+While a file is recompressed this way your jobs see it in a layout of its own,
+in which every basket has room to be converted: the same data and the same
+results, in a larger file. That layout is the file's for good — every process,
+every open — so a job can close and reopen a file at any point, several
+processes can read different parts of one file at once and build one replica
+between them, and a job that ends abruptly loses at most the last few seconds
+of conversion. Branches a later job reads for the first time are converted as
+it reads them. Two consequences:
+
+- A copy of such a file made through the cache (`xrdcp`) is that larger
+  layout. Copy with the cache out of the way: `UCACHE_DISABLE=1 xrdcp ...`.
+- Do not share a cache directory with uCache 1.2.0 or older. It does not know
+  these replicas: it serves such files from the byte cache and the origin
+  (correctly, but slowly) and can leave the replicas behind when it evicts.
 
 Only branches whose source codec is in `recompress_codecs` (default
 `lzma,zlib`) are converted; recompressing already-fast codecs would waste CPU
 and disk. Everything else — other codecs, the file's own records, and the rare
 basket whose converted form does not fit — is kept in the byte cache as usual.
-What was converted is not ALSO kept in the byte cache; set
+What was converted is not ALSO kept in the byte cache, and a copy the byte cache
+held from before is released once its basket is converted; set
 `recompress_keep_originals = on` if you want both, for instance to compare the
-two tiers on one cache. A replica is never published by evicting cached data:
-if it does not fit above the free-space floor it is skipped, and `ucache stats`
-counts it as not published.
+two tiers on one cache. Converted records never evict cached data: if they do
+not fit above the free-space floor they are not kept (a later read converts
+them again), and `ucache stats` counts them as not kept.
+
+`recompress = off` only stops files that have no replica from getting one. A
+file that has one keeps being served from it, and what a job reads of it for
+the first time is still converted.
 
 A file the first pass cannot lay out (an unusual structure; the log says why)
 is still recompressed by a detached, nice'd background worker after your job
 closes it (log: `<cache-dir>/recompress.log`; totals: `ucache status`).
 
 `ucache recompress` runs one foreground sweep, with live progress, over what is
-already in the byte cache. You need it for data cached before recompression was
-switched on, and for branches a later job reads for the first time from a file
-that already has a replica: those are read from the byte cache until a sweep
-converts them. Check where you stand with `ucache status` (the `recompressed:`
-line) or per file with `ucache ls` (the `RECOMP` column). The sweep's own summary
-gives each outcome its own words — `recompressed`, `declined` (with the codec it
-found and the one-line fix), `already recompressed`, `incomplete`, `failed` —
-and background passes add `deferred` when they decline for want of disk space.
+already in the byte cache: you need it only for data cached before
+recompression was switched on and never read since. Check where you stand with
+`ucache status` (the `recompressed:` line) or per file with `ucache ls` (the
+`RECOMP` column). The sweep's own summary gives each outcome its own words —
+`recompressed`, `declined` (with the codec it found and the one-line fix),
+`already recompressed`, `incomplete`, `failed` — and background passes add
+`deferred` when they decline for want of disk space.
 `ucache doctor` will tell you why nothing is being built if that is what you are
 seeing (see Troubleshooting).
 
@@ -824,8 +843,8 @@ its own compute may gain 10%. One instrumented run with ROOT's
 original pages are hole-punched so the data is not stored twice). `ucache
 branches <url>` shows exactly which branches you read and their codecs.
 Escape hatches: `ucache set transpose off` stops serving replicas; `ucache
-untranspose <url>` drops one (they are derived data, rebuildable from the
-byte cache).
+untranspose <url>` drops one (a replica made on a first pass is rebuilt from the
+origin the next time the file is read).
 
 Stuck? See **`docs/TROUBLESHOOTING.md`**.
 

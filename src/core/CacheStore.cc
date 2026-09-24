@@ -1,4 +1,5 @@
 #include "CacheStore.h"
+#include "SlotStore.h"
 
 #include "Log.h"
 #include "Trace.h"
@@ -326,10 +327,18 @@ void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
       s.artifacts |= kArtVal;
     if (names.count(stem + ".cost"))
       s.artifacts |= kArtCost;
+    if (names.count(stem + ".slots"))
+      s.artifacts |= kArtSlots;
     struct ::stat tst; // replica overlay counts toward usage
     if ((s.artifacts & kArtTdata) &&
         io_.stat(objRoot + "/" + shard + "/" + stem + ".tdata", &tst) == 0)
       s.replicaBytes = static_cast<uint64_t>(tst.st_size);
+    // A slot store counts as a replica once it is more than its header: a
+    // store marked DECLINED is one header long and holds nothing.
+    if ((s.artifacts & kArtSlots) &&
+        io_.stat(objRoot + "/" + shard + "/" + stem + ".slots", &tst) == 0 &&
+        static_cast<uint64_t>(tst.st_size) > SlotStore::kHeaderBytes)
+      s.replicaBytes += static_cast<uint64_t>(tst.st_size);
     out.push_back(std::move(s));
   }
 }
@@ -506,6 +515,8 @@ int CacheStore::evictNow() {
         io_.unlink(base + ".val"); // cache-freshness marker (UCACHE_REVALIDATE_S)
       if (s.artifacts & kArtCost)
         io_.unlink(base + ".cost"); // CPU-span evidence
+      if (s.artifacts & kArtSlots)
+        io_.unlink(base + ".slots"); // the slot store goes with its entry
       const uint64_t reclaimed = s.cachedBytes + s.replicaBytes;
       usage -= std::min(usage, reclaimed);
       avail += reclaimed; // reclaimed disk (approx; ignored when !haveSpace)
@@ -550,6 +561,7 @@ void CacheStore::invalidate(const UrlKey& key) {
   io_.unlink(base + ".tmeta");
   io_.unlink(base + ".tok");
   io_.unlink(base + ".val");
+  io_.unlink(base + ".slots");
   UCACHE_INFO("invalidated cache entry for %s", key.key.c_str());
 }
 
@@ -560,7 +572,7 @@ bool CacheStore::removeEntry(const UrlKey& key) {
   // bare `rm` should still report it removed rather than "not cached".
   bool existed = io_.stat(key.metaPath(cfg_.cacheDir), &st) == 0 ||
                  io_.stat(key.dataPath(cfg_.cacheDir), &st) == 0 ||
-                 io_.stat(base + ".tdata", &st) == 0;
+                 io_.stat(base + ".tdata", &st) == 0 || io_.stat(base + ".slots", &st) == 0;
   invalidate(key); // detaches the registry + unlinks byte cache and replica
   if (existed)
     approxUsage_.store(usageBytes(), std::memory_order_relaxed);
@@ -686,6 +698,8 @@ CacheStore::CleanupReport CacheStore::cleanup(CleanupMode mode, uint64_t arg, bo
           io_.unlink(base + ".val");
         if (s->artifacts & kArtCost)
           io_.unlink(base + ".cost");
+        if (s->artifacts & kArtSlots)
+          io_.unlink(base + ".slots");
         stats_.evictedEntries.fetch_add(1, std::memory_order_relaxed);
         stats_.evictedBytes.fetch_add(s->cachedBytes + s->replicaBytes,
                                       std::memory_order_relaxed);
@@ -740,13 +754,19 @@ void CacheStore::sweepReplicaOrphans() {
     for (const auto& f : files) {
       bool replicaArtifact = false;
       std::string hash;
-      for (const char* suf : {".tdata", ".tmeta", ".tok", ".val", ".cost", ".tdata.tmp", ".tmeta.tmp"}) {
+      for (const char* suf : {".tdata", ".tmeta", ".tok", ".val", ".cost", ".tdata.tmp", ".tmeta.tmp",
+                              ".slots"}) {
         size_t sl = ::strlen(suf);
         if (f.size() > sl && f.compare(f.size() - sl, sl, suf) == 0) {
           replicaArtifact = true;
           hash = f.substr(0, f.size() - sl);
           break;
         }
+      }
+      // A slot store's creation file: <hash>.slots.tmp.<pid>.<n>
+      if (const size_t at = f.find(".slots.tmp."); !replicaArtifact && at != std::string::npos) {
+        replicaArtifact = true;
+        hash = f.substr(0, at);
       }
       if (!replicaArtifact || metas.count(hash))
         continue;

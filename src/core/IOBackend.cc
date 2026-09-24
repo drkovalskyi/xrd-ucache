@@ -172,4 +172,8 @@ IOBackend& RealIO::instance() {
   return *io;
 }
 
+int IOBackend::link(const std::string& from, const std::string& to) {
+  return ::link(from.c_str(), to.c_str()) == 0 ? 0 : -errno;
+}
+
 } // namespace ucache

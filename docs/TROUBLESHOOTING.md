@@ -155,6 +155,14 @@ free-disk floor is the hard guard against actually filling the volume.
 
 ## `recompress = on` but no replicas ever appear
 
+With `recompress = on`, a file your job reads gets its replica while it is read
+(`ucache ls` shows its size under RECOMP as soon as records are committed:
+every few seconds, and when the job closes the file). If a file stays at 0,
+the INFO log names why its layout was declined (`UCACHE_LOG=info`). Declined
+files, and data cached before recompression was switched on, are left to the
+background worker and to `ucache recompress`, and that is what the rest of this
+section is about.
+
 **Ask the tools first — they diagnose this for you:**
 
 ```sh

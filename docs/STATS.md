@@ -21,7 +21,7 @@ how to read the printed summary.
 | What is the cache disk being asked to do? | `hit_disk_reads`, `hit_disk_bytes`, `replica_reads`, `replica_read_bytes`, `hist_*_read_bytes` |
 | Is the cache disk keeping up? | `buffer_stalls`, `buffer_stall_us`, `hist_hit_read_us`, `hist_flush_write_us` |
 | Did the replica tier get used? | `replica_opens`, `replica_published`, `replica_bytes_served` |
-| Were replicas created on the first pass? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined` |
+| Were replicas created as files were read? | `cold_replica_files`, `cold_replica_in_bytes`, `cold_replica_baskets_kept`, `cold_replica_declined` |
 
 ## Where the numbers are written
 
@@ -156,27 +156,32 @@ rejected, or cleaned up. See the replica section of [FORMAT.md](FORMAT.md).
 - `replica_orphans_swept` — leftover overlay files removed by eviction, after a
   crash or a version change.
 
-### Replicas created on the first pass
+### Replicas created as files are read
 
-With `recompress = on`, a file that has no replica is converted as the job
-reads it and its replica is published when the job closes it. All zero
-otherwise. `ucache stats` prints them on one `cold replica run` line. For an
-RNTuple file, read "page" wherever these say "basket".
+With `recompress = on`, a file that has no replica gets a slot store on its
+first open, and every basket a job reads that the store does not hold yet is
+converted as it arrives -- on the first pass, and later for branches read for
+the first time. All zero otherwise. `ucache stats` prints them on one
+`converted on read` line. For an RNTuple file, read "page" wherever these say
+"basket".
 
-- `cold_replica_files` — files served this way.
+- `cold_replica_files` — slot stores created.
 - `cold_replica_in_bytes` / `cold_replica_out_bytes` — original basket bytes
   converted, and the converted records they became (ZSTD-1, or uncompressed
   where ZSTD could not shrink a basket).
-- `cold_replica_baskets` — baskets staged converted.
-- `cold_replica_baskets_kept` — baskets kept exactly as stored: their converted form
-  did not fit, their codec is not in `recompress_codecs`, or they could not be
-  decoded. These are the byte cache's share of such a file.
+- `cold_replica_baskets` — baskets converted.
+- `cold_replica_baskets_kept` — baskets kept exactly as stored because their
+  converted form did not fit their slot, or they could not be decoded. Their
+  original bytes are the byte cache's share of such a file. (Branches whose
+  codec is not in `recompress_codecs` are not counted: they are never
+  converted.)
 - `cold_replica_convert_us` — time spent converting, summed over the threads that did
-  it; it is CPU the first pass spends that a pass without recompression does
-  not.
-- `cold_replica_declined` — replicas not published: they did not fit above the
-  free-space floor (a replica never evicts cached data), or building or
-  publishing failed (the log says which).
+  it; it is CPU a pass spends that a pass without recompression does not.
+- `cold_replica_declined` — converted records not kept: they did not fit above the
+  free-space floor (records never evict cached data), or writing them failed
+  (the log says which). A later read converts them again.
+
+Bytes served from a slot store count in `replica_bytes_served`.
 
 `ucache summary` never takes a run that converted baskets this way as its
 baseline: its time includes the cache's own conversion work. A plain first pass

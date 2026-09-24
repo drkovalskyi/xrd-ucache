@@ -1,26 +1,27 @@
-// The cold replica run: with `recompress = on`, a TTree file with no replica
-// yet is served to its reader in a TRANSIENT layout (transpose/FillLayout.h)
-// in which every basket of a convertible branch sits in a slot four times its
-// stored length. The reader's first request for a slot fetches the ORIGINAL
-// basket from the origin (the same bytes, in the same requests, a plain cold
-// pass would fetch), converts it to ZSTD-1 as it arrives and answers from the
-// converted record. When the process's last handle on the file closes, the
-// converted baskets become today's compact replica through today's publish,
-// and from then on the file is served warm by the ordinary replica path.
+// The slot run. A TTree (or RNTuple) file is shown to its reader in its SLOT
+// layout (transpose/FillLayout.h): every basket of a convertible branch sits
+// in a slot k times its stored length past the original end. The reader's
+// first request for a slot fetches the ORIGINAL basket -- the same bytes, in
+// the same requests, a plain cold pass would fetch -- converts it to ZSTD-1 as
+// it arrives and answers from the converted record.
 //
-// What is NOT stored: a converted basket's original bytes never enter the
-// byte cache (the cache would otherwise hold the same data twice). The byte
-// cache takes only what cannot be converted: the file's own records (header,
-// keys list, streamers), branches whose codec is not listed, and baskets whose
-// conversion does not fit their slot.
+// The layout is the file's address space for good: the first open fixes it in
+// the file's slot store (core/SlotStore.h), and every later open, in any
+// process, is shown the same one. Converted records go to the store in
+// batches and are served from it; a slot nobody has read yet is converted when
+// someone does. So a reader can close and reopen at any time, several
+// processes reading different parts of a file build one store between them,
+// and a process that ends abruptly loses at most its last few seconds of work.
 //
-// Nothing persists before the publish. Converted baskets are staged in an
-// already-unlinked file next to the entry, so a crash leaves no trace and the
-// file simply has no replica yet. Two processes reading one file cold each
-// stage their own copy; the first complete publish wins.
+// What is NOT stored: a converted basket's original never enters the byte
+// cache, and one that was there already is released once its record is
+// committed. The byte cache holds only what cannot be converted: the file's
+// own records (header, keys list, streamers), branches whose codec is not
+// listed, and baskets whose conversion does not fit their slot.
 //
-// A handle keeps the layout it was shown for its whole life: a replica
-// published meanwhile (by another handle or process) serves FUTURE opens.
+// A file with a store is always served in its layout, whatever `recompress`
+// says; with recompression off, a slot not yet converted is served its
+// original record, and nothing is added to the store.
 //
 // Thread-safety: every entry point is thread-safe. The per-file state is shared
 // by every handle of the file in the process and guards itself; requests run
@@ -31,6 +32,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -41,17 +43,39 @@ class FileEntry;
 class UrlKey;
 class ColdFill;
 
-// Join (or start) the cold run of `key` for a handle that just set up `entry`.
-// Null when the file is not served this way: not a TTree, nothing convertible,
-// a layout the reader could not be shown, or no room to stage. The origin
-// validators are the ones the entry was opened with; the published replica
-// carries them.
+// How a slot run may be set up.
+enum class AttachMode : uint8_t {
+  kExisting, // only from a store that exists and fits the file
+  kCreate,   // that, or a new store (recompression on, no replica)
+  kMatch,    // only the layout this process already showed (its hash given)
+};
+
+// Join (or start) the slot run of `key` for a handle that just set up `entry`.
+// Null when the file is not served this way: no fitting store (and, for
+// kCreate, not a TTree or RNTuple, nothing convertible, a layout the reader
+// could not be shown, or a store that cannot be created). The origin
+// validators are the ones the entry was opened with; the store carries them.
 std::shared_ptr<ColdFill> coldAttach(const std::shared_ptr<HandleState>& st,
                                      const std::shared_ptr<FileEntry>& entry, const UrlKey& key,
-                                     uint64_t originMtime, uint8_t cksumKind, uint32_t originCksum);
+                                     uint64_t originMtime, uint8_t cksumKind, uint32_t originCksum,
+                                     AttachMode mode, uint64_t matchHash = 0);
 
-// The handle is done with the run. The last handle's detach publishes.
+// Which layout this process has shown a file (by key) in. A reader may hold
+// offsets from any open it made, so a file is never shown a different layout
+// later in the same process: a slot layout stays that slot layout; a compact
+// replica's stays compact (or falls back to the original); only the original
+// may later become either. `hash` = the slot layout's hash.
+enum class ShownLayout : uint8_t { kNone, kOriginal, kCompact, kSlot };
+ShownLayout shownLayout(const std::string& key, uint64_t& hash);
+void noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash = 0);
+
+// The handle is done with the run. The process's last handle on the file
+// commits what it converted.
 void coldDetach(const std::shared_ptr<ColdFill>& cf);
+
+// Commit every record still in memory, for every file. The plugin's periodic
+// checkpoint calls it, and so does exit.
+void coldCheckpoint();
 
 // The file size the reader is shown.
 uint64_t coldVirtualSize(const ColdFill& cf);

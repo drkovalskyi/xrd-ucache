@@ -10,6 +10,8 @@ $UCACHE_DIR/                         (0700)
   objects/<hh>/<sha256(key)>.meta.tmp  # transient during atomic rewrite
   objects/<hh>/<sha256(key)>.cost    # CPU-span evidence sidecar (recompression;
                                      #  tmp+rename at close, best-effort)
+  objects/<hh>/<sha256(key)>.slots   # slot store: a replica built as the file is read
+  objects/<hh>/<sha256(key)>.slots.tmp.<pid>.<n>  # transient during its creation
   stats/<host>-<pid>-<start_ts>-<seq>.jsonl  # per-process stats dumps (docs/STATS.md)
   stats/<stem>.files.jsonl           # per-file lifetime records (docs/STATS.md)
   stats/<stem>.trace.jsonl           # sampled IO trace, `trace = io` (docs/STATS.md)
@@ -166,6 +168,85 @@ Rules:
   the open-time full overlay scan (a 32-process batch scans once, not 32×).
   Stale/torn/absent markers just re-run the scan; the per-read page CRC is
   never skipped, so served bytes are always verified regardless.
+
+## Slot store: `<hash>.slots`, format_version 1
+
+The replica of a file recompressed as it is read (`recompress = on`). The file
+is served to readers in its SLOT layout: every convertible basket (TTree) or
+page (RNTuple) of the original sits in a slot past the original end, sized so
+its converted record fits, followed by zeros. That layout is fixed when the
+store is created and never changes, so a reader may reopen the file at any
+time and find its offsets unchanged. All integers little-endian.
+
+```
+[0, 4096)            header (written once)
+[4096, 4096+blob)    layout blob (written once): the layout, as its creator computed it
+then, each at a 4096-aligned offset: commit blocks
+```
+
+Header:
+
+| offset | size | field | notes |
+|---|---|---|---|
+| 0 | 8 | magic | `"UCSLOTS1"` |
+| 8 | 4 | format_version u32 | = 1; other → store not used |
+| 12 | 4 | layout_version u32 | the layout algorithm; other → store replaced |
+| 16 | 1 | container u8 | 0 = TTree, 1 = RNTuple |
+| 17 | 1 | slot_factor u8 | TTree slot = factor × stored basket length |
+| 18 | 1 | declined u8 | 1 = the file is not served this way (nothing else follows) |
+| 20 | 4 | n_slots u32 | |
+| 24 | 8 | origin_size u64 | validators, compared like a replica's (`validate`) |
+| 32 | 8 | origin_mtime u64 | |
+| 40 | 1 | cksum_kind u8 | |
+| 44 | 4 | origin_cksum u32 | |
+| 48 | 8 | virtual_size u64 | the file size readers are shown |
+| 56 | 8 | layout_hash u64 | XXH3-64 of the layout |
+| 64 | 8 | store_id u64 | random, chosen at creation |
+| 72 | 8 | blob_len u64 | |
+| 80 | 4 | blob_crc u32 | CRC32C of the blob |
+| 84 | 2 | codecs_len u16 | then the codecs list the store converts (ASCII, ≤ 256) |
+| 4092 | 4 | header_crc u32 | CRC32C of bytes [0, 4092) |
+
+The layout blob is `[raw_len u64][ZSTD frames]` (or the raw bytes when
+`raw_len` equals the stored length). Raw, it holds the patch windows, the
+relocated metadata record, the read-footprint ranges, the relocated branch or
+column-range list and, per slot, its original seek and length, its virtual
+seek and length, and its branch and basket indices (for RNTuple also the
+page's stored size and checksum flag). It is decoded and checked, never
+trusted: every slot must lie inside the layout and in order.
+
+Commit block, at a 4096-aligned offset:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 8 | magic `"USBLOCK1"` |
+| 8 | 8 | store_id u64 (must match the header) |
+| 16 | 8 | block_len u64 (header + entries + records) |
+| 24 | 4 | n_entries u32 |
+| 28 | 4 | entries_crc u32 (CRC32C of the entries) |
+| 60 | 4 | block_header_crc u32 (CRC32C of bytes [0, 60)) |
+| 64 | 24 × n | entries: slot u32, kind u8 (1 ZSTD, 2 raw, 3 kept as stored), 3 pad, record offset u64, record length u32, record crc u32 |
+| … | | the records |
+
+A record's CRC32C is seeded with (store_id u64, slot u32, length u32), so it
+validates only as the record it was written as, in the store it was written
+to. A kept-as-stored entry has no record: the slot is served from the byte
+cache's copy of the original basket, with its `fSeekKey` pointing at the slot.
+The last valid entry for a slot wins.
+
+- **Creation:** header and blob are written to `.slots.tmp.<pid>.<n>`, then
+  `link()`ed into place. That fails if the store already exists, so a store is
+  never visible without its layout.
+- **Commit:** under an exclusive `flock` on the file:
+  1. read the blocks written since;
+  2. skip slots already committed;
+  3. write one block at the 4096-aligned offset past both the file's end and
+     every block read.
+
+  A commit whose open file is no longer the one at the path (the store was
+  dropped or replaced) writes nothing.
+- **Reading new blocks** takes the shared lock without waiting. A block that
+  fails its checks is debris of a commit that died, and is stepped over.
 
 ## Cache-freshness marker (optional): `<hash>.val`
 

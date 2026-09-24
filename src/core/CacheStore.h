@@ -180,6 +180,9 @@ class CacheStore {
   // hard exit is at most one period short. Writes no counter line in a CLI
   // process (disableStatsDump).
   void checkpoint();
+  // Bytes written to the cache outside the byte cache's own page path (a slot
+  // store's records): counted in usage, and an eviction check may follow.
+  void noteStoredBytes(uint64_t bytes) { notePersisted(bytes, true); }
   // Per-file record for a handle the cache never served (pass-through:
   // UCACHE_DISABLE, write-opened, no store entry). Same companion file and
   // shape as FileEntry's lifetime records, with the bytes under `wire_bytes` —
@@ -231,12 +234,13 @@ class CacheStore {
     kArtTok = 1u << 2,
     kArtVal = 1u << 3,
     kArtCost = 1u << 4,
+    kArtSlots = 1u << 5, // a slot store (SlotStore.h)
   };
   struct MetaScan {
     std::string dataPath, metaPath, hashHex, key;
     uint64_t fileSize = 0; // origin size (listEntries reporting)
     uint64_t atime = 0, cachedBytes = 0;
-    uint64_t replicaBytes = 0; // .tdata size (0 = none) — evicted with the entry
+    uint64_t replicaBytes = 0; // .tdata + .slots size (0 = none) — evicted with the entry
     double coverage = 0.0;     // fraction of pages present [0,1]
     uint8_t artifacts = 0;     // kArt* bits present in the shard listing
     bool pinned = false;

@@ -11,6 +11,7 @@ add_library(ucache-core STATIC
   MetaFile.cc
   ReplicaFile.cc
   ReplicaStore.cc
+  SlotStore.cc
   Stats.cc
   Trace.cc
   UrlKey.cc

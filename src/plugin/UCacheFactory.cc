@@ -1,3 +1,6 @@
+#ifdef UCACHE_HAVE_COLDRUN
+#include "ColdRun.h"
+#endif
 #include <cstdio>
 #include <cstdlib>
 // Plugin factory + entry point. XrdCl resolves XrdClGetPlugIn
@@ -110,6 +113,9 @@ void scheduleCheckpoint() {
   Executor::instance().postAfter(periodMs, [] {
     if (gStore && *gStore)
       (*gStore)->checkpoint();
+#ifdef UCACHE_HAVE_COLDRUN
+    coldCheckpoint(); // slot records still in memory go to their stores
+#endif
     scheduleCheckpoint();
   });
 }
