@@ -13,6 +13,7 @@
 #include "OriginInFlight.h"
 #include "PluginSupport.h"
 #include "ReadRounding.h"
+#include "ReplicaFile.h"
 #include "Trace.h"
 #include "vendor/crc32c.h"
 
@@ -1364,36 +1365,74 @@ namespace {
 // any of its opens -- except that the original may become a replica, whose
 // original region reads the same. Otherwise: a slot store first, then a
 // compact replica, then a new store when recompression is on.
+// Which compact replica a view is: a rebuild from a different cache state can
+// relocate a different set of branches, to other offsets. Within one process.
+uint64_t compactId(const ReplicaView& v) {
+  const auto img = ReplicaFile::serialize(v.meta());
+  return (static_cast<uint64_t>(crc32c(img.data(), img.size())) << 32) ^ v.virtualSize();
+}
+
 void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<FileEntry>& entry,
                   const UrlKey& key, const Config& cfg, uint64_t mtime, uint8_t cksumKind,
                   uint32_t cksum, const std::function<std::shared_ptr<ReplicaView>()>& openView,
                   std::shared_ptr<ReplicaView>& view, std::shared_ptr<ColdFill>& cold) {
-  uint64_t hash = 0;
-  const ShownLayout shown = shownLayout(key.key, hash);
-  if (shown == ShownLayout::kSlot) {
-    cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kMatch, hash);
-    if (!cold)
-      UCACHE_WARN("%s was shown in a slot layout earlier in this process and that layout is "
-                  "gone; it is served as stored, and offsets read from the layout fail",
-                  key.key.c_str());
-    return;
+  // Each pass either settles on a layout this process has not contradicted, or
+  // learns which layout another handle settled on meanwhile and follows it.
+  for (int pass = 0;; ++pass) {
+    uint64_t hash = 0;
+    const ShownLayout shown = shownLayout(key.key, hash);
+    if (shown == ShownLayout::kSlot) {
+      cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kMatch, hash);
+      if (!cold)
+        UCACHE_WARN("%s was shown in a slot layout earlier in this process and that layout is "
+                    "gone; it is served as stored, and offsets read from the layout fail",
+                    key.key.c_str());
+      return;
+    }
+    if (shown == ShownLayout::kCompact) {
+      std::shared_ptr<ReplicaView> v = openView();
+      if (v && compactId(*v) == hash)
+        view = std::move(v);
+      else
+        UCACHE_WARN("%s was shown as a replica earlier in this process and that replica is "
+                    "gone or rebuilt; it is served as stored, and offsets read from the "
+                    "replica fail",
+                    key.key.c_str());
+      return;
+    }
+    if (pass >= 3) // cannot happen: a shown layout only ever moves away from original
+      return;
+    std::shared_ptr<ColdFill> c =
+        coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kExisting);
+    if (!c) {
+      std::shared_ptr<ReplicaView> v = openView();
+      if (v) {
+        const uint64_t id = compactId(*v);
+        uint64_t won = 0;
+        if (noteShownLayout(key.key, ShownLayout::kCompact, id, &won) == ShownLayout::kCompact &&
+            won == id) {
+          view = std::move(v);
+          return;
+        }
+        continue;
+      }
+      if (cfg.recompress)
+        c = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kCreate);
+    }
+    if (c) {
+      const uint64_t mine = coldLayoutHash(*c);
+      uint64_t won = 0;
+      if (noteShownLayout(key.key, ShownLayout::kSlot, mine, &won) == ShownLayout::kSlot &&
+          won == mine) {
+        cold = std::move(c);
+        return;
+      }
+      coldDetach(c);
+      continue;
+    }
+    if (noteShownLayout(key.key, ShownLayout::kOriginal) == ShownLayout::kOriginal)
+      return;
   }
-  if (shown == ShownLayout::kCompact) {
-    view = openView();
-    return;
-  }
-  cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kExisting);
-  if (cold)
-    return;
-  view = openView();
-  if (view) {
-    noteShownLayout(key.key, ShownLayout::kCompact);
-    return;
-  }
-  if (cfg.recompress)
-    cold = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kCreate);
-  if (!cold)
-    noteShownLayout(key.key, ShownLayout::kOriginal);
 }
 } // namespace
 #endif
@@ -2012,7 +2051,11 @@ XrdCl::XRootDStatus UCacheFile::PgRead(uint64_t offset, uint32_t size, void* buf
     // produce one for a file that is larger here than it is there.
     const uint64_t pgVsize = shownSize();
     if (offset >= pgVsize || size == 0) {
-      complete(handler, okStatus(), new AnyObject());
+      // An empty page set, as the origin answers: the caller reads the
+      // response's PageInfo unconditionally.
+      auto* obj = new AnyObject();
+      obj->Set(new XrdCl::PageInfo(offset, 0, buffer, {}));
+      complete(handler, okStatus(), obj);
       return XRootDStatus();
     }
     if (offset + size > pgVsize)
@@ -2197,6 +2240,18 @@ XrdCl::XRootDStatus UCacheFile::VectorRead(const ChunkList& chunks, void* buffer
   // the replica's -- a WRONG signature rather than an absent one.
   auto view = currentView();
   auto cold = currentCold();
+  // The combined-buffer variant, where this handle shows a layout the origin
+  // does not have (relaying it would send offsets the origin lacks): served as
+  // the per-chunk form, each chunk given its place in the buffer.
+  if (entry && buffer && !chunks.empty() && (view || cold)) {
+    ChunkList placed = chunks;
+    auto* at = static_cast<char*>(buffer);
+    for (auto& c : placed) {
+      c.buffer = at;
+      at += c.length;
+    }
+    return VectorRead(placed, nullptr, handler, timeout);
+  }
   for (const auto& c : chunks)
     noteAppRead(st_, entry, view, c.offset, c.length, cold);
   // The combined-buffer variant is legacy and rare: pass through unchanged.

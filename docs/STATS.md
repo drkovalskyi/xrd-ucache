@@ -177,11 +177,17 @@ the first time. All zero otherwise. `ucache stats` prints them on one
   converted.)
 - `cold_replica_convert_us` — time spent converting, summed over the threads that did
   it; it is CPU a pass spends that a pass without recompression does not.
-- `cold_replica_declined` — converted records not kept: they did not fit above the
-  free-space floor (records never evict cached data), or writing them failed
-  (the log says which). A later read converts them again.
+- `cold_replica_declined` — converted records not kept: they still did not fit
+  above the free-space floor after an eviction pass, writing them failed (the
+  log says which), the store was removed meanwhile, or the process already held
+  its limit of records waiting to be written. They were served to the job that
+  read them; a later read converts them again.
 
-Bytes served from a slot store count in `replica_bytes_served`.
+Records a job reads from a slot store count in `replica_bytes_served` (and
+their reads from the cache disk in `replica_reads` / `replica_read_bytes`);
+records it converts from what the origin sends count in `miss_bytes`, as any
+first read does, so the pass that makes a store reads as a fill. The zeros
+that pad each slot count in neither.
 
 `ucache summary` never takes a run that converted baskets this way as its
 baseline: its time includes the cache's own conversion work. A plain first pass

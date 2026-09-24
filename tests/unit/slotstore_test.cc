@@ -10,7 +10,11 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <sys/file.h>
+#include <thread>
 #include <set>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -253,11 +257,81 @@ TEST(SlotStore, ABlockCutShortIsSteppedOverAndTheNextOneFound) {
   EXPECT_GT(out[0].off, before);
   auto last = lastEntries(io, t.path());
   EXPECT_EQ(last.count(1), 1u);
-  EXPECT_EQ(last.count(2), 0u); // cut short: never valid
   ASSERT_EQ(last.count(3), 1u);
   std::vector<uint8_t> got;
   ASSERT_TRUE(c->readRecord(last[3], got));
   EXPECT_EQ(got, rec(3, 400, 3).bytes);
+  // Cut short: its header may pass once the file grows past its extent, but
+  // its record never does.
+  if (last.count(2)) {
+    EXPECT_FALSE(c->readRecord(last[2], got));
+  }
+}
+
+// The same, with a follow-up long enough to reach past the torn block's
+// claimed extent: had it been written inside that extent, the torn header
+// would pass its checks once the file grew, and a reader would jump over it.
+TEST(SlotStore, NothingIsWrittenInsideATornBlocksExtent) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  std::vector<SlotEntry> out;
+  ASSERT_GT(commitAll(*s, {rec(1, 300, 1)}, out), 0);
+  const std::string p = SlotStore::path(t.path(), kHash);
+  {
+    auto b2 = SlotStore::open(io, t.path(), kHash);
+    ASSERT_GT(commitAll(*b2, {rec(2, 9000, 2)}, out), 0);
+  }
+  ASSERT_EQ(::truncate(p.c_str(), static_cast<off_t>(out[0].off + 100)), 0);
+  auto c = SlotStore::open(io, t.path(), kHash);
+  ASSERT_TRUE(c);
+  ASSERT_GT(commitAll(*c, {rec(3, 12000, 3)}, out), 0);
+  ASSERT_GT(commitAll(*c, {rec(4, 500, 4)}, out), 0);
+  auto last = lastEntries(io, t.path());
+  EXPECT_EQ(last.count(1), 1u);
+  ASSERT_EQ(last.count(3), 1u);
+  ASSERT_EQ(last.count(4), 1u);
+  std::vector<uint8_t> got;
+  ASSERT_TRUE(c->readRecord(last[3], got));
+  EXPECT_EQ(got, rec(3, 12000, 3).bytes);
+  if (last.count(2)) { // its header may now pass, but its record never does
+    EXPECT_FALSE(c->readRecord(last[2], got));
+  }
+}
+
+// Reading others' commits never waits: not for another process's commit, and
+// not for this process's own commit that is waiting for the file lock.
+TEST(SlotStore, ARefreshNeverWaitsForACommit) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  std::vector<SlotEntry> out;
+  ASSERT_GT(commitAll(*s, {rec(1, 100, 1)}, out), 0);
+  // Another holder of the exclusive lock, as a stopped process would be.
+  int fd = ::open(SlotStore::path(t.path(), kHash).c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::flock(fd, LOCK_EX), 0);
+  auto r = SlotStore::open(io, t.path(), kHash);
+  ASSERT_TRUE(r);
+  std::atomic<bool> committing{false}, done{false};
+  std::thread committer([&] {
+    std::vector<SlotEntry> o;
+    committing = true;
+    std::vector<SlotRecord> recs = {rec(2, 100, 2)};
+    r->commit(recs, nullptr, nullptr, false, o); // blocks on the lock
+    done = true;
+  });
+  while (!committing)
+    std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_TRUE(r->refresh().empty());
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(100));
+  EXPECT_FALSE(done.load());
+  ::flock(fd, LOCK_UN);
+  ::close(fd);
+  committer.join();
+  EXPECT_TRUE(done.load());
 }
 
 TEST(SlotStore, AStoreBeingCreatedIsNotUsedAndOldDebrisIsReplaced) {
@@ -296,6 +370,36 @@ TEST(SlotStore, ADroppedOrReplacedStoreTakesNoMoreRecords) {
   EXPECT_NE(fresh->header().storeId, s->header().storeId);
   EXPECT_EQ(commitAll(*s, {rec(3, 64, 3)}, out), -ESTALE); // replaced
   EXPECT_TRUE(fresh->refresh(true).empty()); // nothing of the old store's reached it
+}
+
+// A drop decided on one store never removes another: the one that replaced
+// it, or one a commit holds right now.
+TEST(SlotStore, ADropRemovesOnlyTheStoreItExamined) {
+  TempDir t;
+  RealIO io;
+  auto s = make(io, t.path());
+  ASSERT_TRUE(s);
+  // Replaced meanwhile: the drop leaves the new store alone.
+  SlotStore::drop(io, t.path(), kHash);
+  auto fresh = make(io, t.path());
+  ASSERT_TRUE(fresh);
+  EXPECT_FALSE(s->dropIfCurrent());
+  auto again = SlotStore::open(io, t.path(), kHash);
+  ASSERT_TRUE(again);
+  EXPECT_EQ(again->header().storeId, fresh->header().storeId);
+  // Held by a commit (another process's lock on the file): not now.
+  const int fd = ::open(SlotStore::path(t.path(), kHash).c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::flock(fd, LOCK_EX), 0);
+  EXPECT_FALSE(fresh->dropIfCurrent());
+  EXPECT_TRUE(SlotStore::open(io, t.path(), kHash));
+  ::flock(fd, LOCK_UN);
+  ::close(fd);
+  // Its own, and free: removed, and its commits refused from then on.
+  EXPECT_TRUE(fresh->dropIfCurrent());
+  EXPECT_FALSE(SlotStore::open(io, t.path(), kHash));
+  std::vector<SlotEntry> out;
+  EXPECT_EQ(commitAll(*fresh, {rec(1, 64, 1)}, out), -ESTALE);
 }
 
 TEST(SlotStore, ADeclinedStoreHoldsNoRecords) {

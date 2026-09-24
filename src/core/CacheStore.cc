@@ -289,7 +289,7 @@ void CacheStore::maybeEvict() {
 }
 
 void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
-                           std::vector<MetaScan>& out) {
+                           std::vector<MetaScan>& out, bool replicated) {
   std::vector<std::string> files;
   if (io_.listDir(objRoot + "/" + shard, files) < 0)
     return;
@@ -331,19 +331,38 @@ void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
       s.artifacts |= kArtSlots;
     struct ::stat tst; // replica overlay counts toward usage
     if ((s.artifacts & kArtTdata) &&
-        io_.stat(objRoot + "/" + shard + "/" + stem + ".tdata", &tst) == 0)
+        io_.stat(objRoot + "/" + shard + "/" + stem + ".tdata", &tst) == 0) {
       s.replicaBytes = static_cast<uint64_t>(tst.st_size);
-    // A slot store counts as a replica once it is more than its header: a
-    // store marked DECLINED is one header long and holds nothing.
+      s.replicated = true;
+    }
+    // A slot store's size is the space it takes (a store marked DECLINED is
+    // one header long and holds nothing). It has recompressed something once
+    // it runs past its layout: only commit blocks lie there.
     if ((s.artifacts & kArtSlots) &&
         io_.stat(objRoot + "/" + shard + "/" + stem + ".slots", &tst) == 0 &&
-        static_cast<uint64_t>(tst.st_size) > SlotStore::kHeaderBytes)
-      s.replicaBytes += static_cast<uint64_t>(tst.st_size);
+        static_cast<uint64_t>(tst.st_size) > SlotStore::kHeaderBytes) {
+      const uint64_t size = static_cast<uint64_t>(tst.st_size);
+      s.replicaBytes += size;
+      if (replicated && !s.replicated) {
+        const std::string sp = objRoot + "/" + shard + "/" + stem + ".slots";
+        std::vector<uint8_t> hb(SlotStore::kHeaderBytes);
+        SlotStoreHeader h;
+        if (int fd = io_.open(sp, O_RDONLY, 0); fd >= 0) {
+          if (io_.preadFull(fd, hb.data(), hb.size(), 0) == static_cast<int64_t>(hb.size()) &&
+              decodeSlotHeader(hb.data(), hb.size(), h) && !h.declined) {
+            const uint64_t layoutEnd = (SlotStore::kHeaderBytes + h.blobLen + SlotStore::kAlign - 1) /
+                                       SlotStore::kAlign * SlotStore::kAlign;
+            s.replicated = size > layoutEnd;
+          }
+          io_.close(fd);
+        }
+      }
+    }
     out.push_back(std::move(s));
   }
 }
 
-std::vector<CacheStore::MetaScan> CacheStore::scanObjects() {
+std::vector<CacheStore::MetaScan> CacheStore::scanObjects(bool replicated) {
   std::vector<MetaScan> out;
   const std::string objRoot = cfg_.cacheDir + "/objects";
   std::vector<std::string> shards;
@@ -354,7 +373,7 @@ std::vector<CacheStore::MetaScan> CacheStore::scanObjects() {
   std::atomic<size_t> next{0};
   auto worker = [&] {
     for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < shards.size();)
-      scanShard(objRoot, shards[i], perShard[i]);
+      scanShard(objRoot, shards[i], perShard[i], replicated);
   };
   size_t hw = std::thread::hardware_concurrency();
   size_t nThreads = std::min({size_t(16), shards.size(), hw ? hw : size_t(1)});
@@ -388,7 +407,7 @@ uint64_t CacheStore::usageBytes() {
 
 std::vector<CacheStore::EntryInfo> CacheStore::listEntries() {
   std::vector<EntryInfo> out;
-  auto scans = scanObjects(); // parallel summary walk
+  auto scans = scanObjects(/*replicated=*/true); // parallel summary walk
   out.reserve(scans.size());
   for (auto& s : scans) {
     EntryInfo e;
@@ -396,6 +415,7 @@ std::vector<CacheStore::EntryInfo> CacheStore::listEntries() {
     e.fileSize = s.fileSize;
     e.cachedBytes = s.cachedBytes;
     e.replicaBytes = s.replicaBytes;
+    e.replicated = s.replicated;
     e.atime = s.atime;
     e.coverage = s.coverage;
     e.pinned = s.pinned;
@@ -763,12 +783,16 @@ void CacheStore::sweepReplicaOrphans() {
           break;
         }
       }
-      // A slot store's creation file: <hash>.slots.tmp.<pid>.<n>
+      // A slot store's creation file: <hash>.slots.tmp.<pid>.<n>. Debris once
+      // it is old, whether or not its entry lives: a creation is one write
+      // and a link, so nothing is still writing it an hour later.
+      bool creationDebris = false;
       if (const size_t at = f.find(".slots.tmp."); !replicaArtifact && at != std::string::npos) {
         replicaArtifact = true;
+        creationDebris = true;
         hash = f.substr(0, at);
       }
-      if (!replicaArtifact || metas.count(hash))
+      if (!replicaArtifact || (metas.count(hash) && !creationDebris))
         continue;
       // Age guard: never sweep a concurrent publisher's in-flight files.
       const std::string path = objRoot + "/" + sh + "/" + f;

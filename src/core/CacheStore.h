@@ -104,7 +104,10 @@ class CacheStore {
     std::string key;         // full normalized key
     uint64_t fileSize = 0;   // origin size
     uint64_t cachedBytes = 0;
-    uint64_t replicaBytes = 0; // .tdata overlay size; 0 = no replica
+    uint64_t replicaBytes = 0; // .tdata overlay + .slots size; 0 = none
+    // A replica serves: a compact overlay, or a slot store holding records (a
+    // store with only its layout takes space, and has recompressed nothing).
+    bool replicated = false;
     uint64_t atime = 0;
     double coverage = 0.0;   // fraction of the file present in cache [0,1]
     bool pinned = false;
@@ -241,6 +244,7 @@ class CacheStore {
     uint64_t fileSize = 0; // origin size (listEntries reporting)
     uint64_t atime = 0, cachedBytes = 0;
     uint64_t replicaBytes = 0; // .tdata + .slots size (0 = none) — evicted with the entry
+    bool replicated = false;   // see EntryInfo::replicated
     double coverage = 0.0;     // fraction of pages present [0,1]
     uint8_t artifacts = 0;     // kArt* bits present in the shard listing
     bool pinned = false;
@@ -252,10 +256,12 @@ class CacheStore {
   // sorted-shard order (deterministic given a quiescent cache). Requires the
   // IOBackend to be thread-safe (RealIO: stateless syscalls; FaultIO: internal
   // mutex). Threads are joined before return — none escape the call.
-  std::vector<MetaScan> scanObjects();
+  // `replicated` = also fill MetaScan::replicated (one header read per slot
+  // store): only listings need it.
+  std::vector<MetaScan> scanObjects(bool replicated = false);
   // One shard directory's entries, appended to `out` (worker body of the scan).
   void scanShard(const std::string& objRoot, const std::string& shard,
-                 std::vector<MetaScan>& out);
+                 std::vector<MetaScan>& out, bool replicated = false);
   // Remove replica artifacts (.tdata/.tmeta/*.tmp) whose v1 .meta is gone —
   // debris of a crash mid-publish or of a v1.0.0 process evicting an entry
   // without knowing about replica files (D1 mixed-version caveat). Age-guarded

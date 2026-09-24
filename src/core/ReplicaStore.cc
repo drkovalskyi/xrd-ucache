@@ -272,6 +272,16 @@ int ReplicaStore::publish(const UrlKey& key, ReplicaMeta meta, const void* tdata
     io_.unlink(dPath); // no orphan when we know the sidecar never landed
     return rc;
   }
+  // A store created while this was written: one form per file, and the store
+  // may already be serving. Whoever creates a store checks for a sidecar after
+  // it, so of two racing, at least one sees the other.
+  if (SlotStore::serving(io_, key.objectDir(cfg_.cacheDir), key.hashHex)) {
+    io_.unlink(tmetaPath(key, cfg_.cacheDir));
+    io_.unlink(dPath);
+    UCACHE_INFO("replica publish for %s withdrawn: a slot store appeared meanwhile",
+                key.key.c_str());
+    return -EEXIST;
+  }
   // Verify-once marker: the publisher computed the page CRCs from the bytes
   // it just wrote+synced, so the overlay is verified by construction.
   struct ::stat dst;

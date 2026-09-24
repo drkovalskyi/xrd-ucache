@@ -2,6 +2,7 @@
 
 #include "vendor/crc32c.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -273,6 +274,20 @@ void SlotStore::drop(IOBackend& io, const std::string& objectDir, const std::str
   io.unlink(path(objectDir, hashHex));
 }
 
+bool SlotStore::dropIfCurrent() {
+  std::unique_lock<std::mutex> g(mu_, std::try_to_lock);
+  if (!g.owns_lock() || io_.flock(fd_, LOCK_EX | LOCK_NB) != 0)
+    return false;
+  // A commit waiting for the lock sees the file unlinked once it has it.
+  struct ::stat st, sp;
+  const bool same = io_.fstat(fd_, &st) == 0 && st.st_nlink > 0 && io_.stat(path_, &sp) == 0 &&
+                    st.st_ino == sp.st_ino && st.st_dev == sp.st_dev;
+  if (same)
+    io_.unlink(path_);
+  io_.flock(fd_, LOCK_UN);
+  return same;
+}
+
 std::vector<SlotEntry> SlotStore::readBlocks(uint64_t end) {
   std::vector<SlotEntry> out;
   uint64_t pos = readOff_;
@@ -284,14 +299,17 @@ std::vector<SlotEntry> SlotStore::readBlocks(uint64_t end) {
                        get<uint32_t>(h, 60) == crc32c(h, 60);
     const uint64_t blockLen = okHdr ? get<uint64_t>(h, 16) : 0;
     const uint32_t n = okHdr ? get<uint32_t>(h, 24) : 0;
-    if (!okHdr || blockLen < kBlockHeader + n * kEntry || pos + blockLen > end) {
+    if (okHdr && blockLen >= kBlockHeader && blockLen < (1ull << 40))
+      claimedEnd_ = std::max(claimedEnd_, pos + blockLen);
+    if (!okHdr || blockLen < kBlockHeader + static_cast<uint64_t>(n) * kEntry ||
+        pos + blockLen > end) {
       // Not a block: debris of a commit that died (we hold a lock no writer
       // holds, so nothing is being written). The next block starts on a later
       // boundary.
       pos += kAlign;
       continue;
     }
-    std::vector<uint8_t> ents(n * kEntry);
+    std::vector<uint8_t> ents(static_cast<size_t>(n) * kEntry);
     if (n && (io_.preadFull(fd_, ents.data(), ents.size(), pos + kBlockHeader) !=
                   static_cast<int64_t>(ents.size()) ||
               crc32c(ents.data(), ents.size()) != get<uint32_t>(h, 28))) {
@@ -311,7 +329,13 @@ std::vector<SlotEntry> SlotStore::readBlocks(uint64_t end) {
 }
 
 std::vector<SlotEntry> SlotStore::refresh(bool wait) {
-  std::lock_guard<std::mutex> g(mu_);
+  // Without `wait`, never queue behind this process's own commit either: it
+  // holds mu_ while it waits for the file lock another process may hold.
+  std::unique_lock<std::mutex> g(mu_, std::defer_lock);
+  if (wait)
+    g.lock();
+  else if (!g.try_lock())
+    return {};
   struct ::stat st;
   if (io_.fstat(fd_, &st) != 0 || static_cast<uint64_t>(st.st_size) < readOff_ + kBlockHeader)
     return {};
@@ -360,9 +384,11 @@ int64_t SlotStore::commit(std::vector<SlotRecord>& recs,
   if (write.empty())
     return 0;
 
-  // Past everything anyone has written, even if the file came back shorter
-  // than its blocks say (a crash without fsync).
-  const uint64_t base = alignUp(std::max<uint64_t>(static_cast<uint64_t>(st.st_size), readOff_));
+  // Past everything anyone has written or claimed: the file's end, the blocks
+  // read, and the extent of any block cut short (a crash without fsync can
+  // leave a header whose records never landed).
+  const uint64_t base = alignUp(
+      std::max({static_cast<uint64_t>(st.st_size), readOff_, claimedEnd_}));
   const uint32_t n = static_cast<uint32_t>(write.size());
   const uint64_t blockLen = kBlockHeader + n * kEntry + dataLen;
   std::vector<uint8_t> blk(blockLen, 0);
@@ -396,6 +422,7 @@ int64_t SlotStore::commit(std::vector<SlotRecord>& recs,
   if (fsync)
     io_.fdatasync(fd_);
   readOff_ = alignUp(base + blockLen);
+  claimedEnd_ = std::max(claimedEnd_, base + blockLen);
   return static_cast<int64_t>(dataLen);
 }
 

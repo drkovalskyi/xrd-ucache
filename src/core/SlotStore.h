@@ -107,14 +107,20 @@ class SlotStore {
   // their commits are refused.
   static void drop(IOBackend& io, const std::string& objectDir, const std::string& hashHex);
 
+  // Remove THIS store: only while the path still names it, and only under its
+  // exclusive lock, taken without waiting -- so a store someone replaced it
+  // with is never removed, and neither is one a commit holds. False when it
+  // did not remove it.
+  bool dropIfCurrent();
+
   ~SlotStore();
   const SlotStoreHeader& header() const { return hdr_; }
   const std::vector<uint8_t>& layoutBlob() const { return blob_; }
 
   // Entries committed (by anyone) since the last refresh or commit, in commit
-  // order. `wait` = take the shared lock even if a commit holds it; otherwise
-  // a busy store returns nothing now and the same entries next time. Cheap
-  // when nothing is new: one fstat.
+  // order. `wait` = wait for a commit in progress (in this process or
+  // another); otherwise a busy store returns nothing now and the same entries
+  // next time -- it never waits. Cheap when nothing is new: one fstat.
   std::vector<SlotEntry> refresh(bool wait = false);
 
   // Commit records, under the exclusive lock (this call may wait for it):
@@ -149,8 +155,13 @@ class SlotStore {
   std::string path_;
   SlotStoreHeader hdr_;
   std::vector<uint8_t> blob_;
-  std::mutex mu_;     // guards readOff_ and serializes this process's use of the lock
+  std::mutex mu_;     // guards the members below and serializes this process's use of the lock
   uint64_t readOff_ = 0; // next block boundary not yet read
+  // The furthest end any block header claims, valid block or not: a block cut
+  // short by a crash still owns its extent, and nothing may be written inside
+  // it -- once the file grows past it, that header passes its checks and a
+  // reader jumps over everything the extent contains.
+  uint64_t claimedEnd_ = 0;
 };
 
 // Header (de)serialization, exposed for tests.

@@ -11,6 +11,7 @@
 #endif
 #include "PluginSupport.h"
 #include "ReadRounding.h"
+#include "ReplicaStore.h"
 #include "SlotStore.h"
 #include "Transposer.h"
 #include "UCacheFile.h"
@@ -26,6 +27,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -105,9 +107,14 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
     bool inStore = false;   // `e` is a committed entry (anyone's)
     bool persist = false;   // `mem` is to be committed
     bool fromCache = false; // converted from the byte cache's copy of the original
+    bool transient = false; // `mem` is served, not to be committed (counted in transientBytes)
     SlotEntry e;
     std::shared_ptr<const std::vector<uint8_t>> mem; // the record, until committed
   };
+  using Rec = std::shared_ptr<const std::vector<uint8_t>>;
+  // Told when a slot it waited on is ready (with the record, when the one who
+  // converted it has it in hand) or was given up.
+  using Waiter = std::function<void(bool, Rec)>;
   // RNTuple only: what decoding a page needs, per slot.
   struct Page {
     uint32_t nbytes = 0;
@@ -132,16 +139,27 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
 
   std::mutex mu; // guards `info` and everything below
   std::unordered_map<uint32_t, Info> info;
-  std::unordered_map<uint32_t, std::vector<std::function<void(bool)>>> waiters;
+  std::unordered_map<uint32_t, std::vector<Waiter>> waiters;
   std::vector<uint32_t> pending;
   uint64_t pendingBytes = 0;
+  // Records served but not to be committed (the store is gone, or the
+  // process's pending cap is reached): kept for the requests that need them,
+  // oldest dropped first past kTransientBytes.
+  std::deque<uint32_t> transient;
+  uint64_t transientBytes = 0;
   int handles = 0;
   // Original ranges of relocated baskets, sorted: bytes the reader never reads
   // in this layout, so never worth keeping (built on first need).
   std::vector<std::pair<uint64_t, uint64_t>> relocatedOrig;
+  // Slot indices in the order of their original offsets (built on first need).
+  std::vector<uint32_t> origOrder;
+  // Is page `pg` wholly inside baskets that are committed and converted -- so
+  // the byte cache's copy of it serves nothing? Caller holds mu.
+  bool pageDeadLocked(uint64_t pg, uint64_t ps);
 
   std::mutex commitMu; // one commit of this file at a time in this process
   std::atomic<bool> commitQueued{false};
+  std::atomic<bool> commitAgain{false}; // asked for while one was running
 
   std::atomic<uint64_t> nZstd{0}, nRaw{0}, nOrig{0}, inBytes{0}, outBytes{0}, convertUs{0},
       wireBytes{0};
@@ -192,7 +210,7 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
 
   // Entries committed by anyone: the slots they name are ready from the store.
   void apply(const std::vector<SlotEntry>& es) {
-    std::vector<std::function<void(bool)>> wake;
+    std::vector<Waiter> wake;
     {
       std::lock_guard<std::mutex> g(mu);
       for (const auto& e : es) {
@@ -201,8 +219,10 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
         Info& s = info[e.slot];
         s.inStore = true;
         s.e = e;
-        if (!s.mem)
-          s.kind = basketKind(e.kind);
+        s.kind = basketKind(e.kind);
+        // Committed by someone: the store's copy serves, ours is not kept.
+        releaseMemLocked(s);
+        s.persist = false;
         if (state[e.slot].load(std::memory_order_acquire) != kReady) {
           state[e.slot].store(kReady, std::memory_order_release);
           takeWaitersLocked(e.slot, wake);
@@ -210,7 +230,7 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
       }
     }
     for (auto& w : wake)
-      w(true);
+      w(true, nullptr);
   }
 
   // Pick up what other processes committed since we last looked -- unless a
@@ -224,12 +244,12 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   }
 
   // A converted record for slot i: served from memory until it is committed.
-  void stage(uint32_t i, uint8_t kind, std::vector<uint8_t>&& rec, bool fromCache);
+  void stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache);
 
   // A fetch that claimed slot i failed: give the claim back and tell whoever
   // waited on it, so they can fetch it themselves.
   void abandon(uint32_t i) {
-    std::vector<std::function<void(bool)>> wake;
+    std::vector<Waiter> wake;
     {
       std::lock_guard<std::mutex> g(mu);
       uint8_t expect = kFetching;
@@ -237,14 +257,14 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
       takeWaitersLocked(i, wake);
     }
     for (auto& w : wake)
-      w(false);
+      w(false, nullptr);
   }
 
   // Claim slot i for fetching (true), or register `cb` to hear when whoever
   // holds it is done (false). A slot found ready returns false with `ready`
   // set and registers nothing. Both looks are compare-and-swaps: a slot
   // released between them is claimed by exactly one caller.
-  bool claimOrWait(uint32_t i, std::function<void(bool)> cb, bool& ready) {
+  bool claimOrWait(uint32_t i, Waiter cb, bool& ready) {
     ready = false;
     uint8_t expect = kAbsent;
     if (state[i].compare_exchange_strong(expect, kFetching, std::memory_order_acq_rel))
@@ -267,14 +287,20 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
 
   void queueCommit();
   void commit();
+  ~ColdFill();
 
  private:
   void forgetLocked(uint32_t i) {
     uint8_t expect = kReady;
     state[i].compare_exchange_strong(expect, kAbsent, std::memory_order_acq_rel);
-    info.erase(i);
+    if (auto it = info.find(i); it != info.end()) {
+      releaseMemLocked(it->second);
+      info.erase(it);
+    }
   }
-  void takeWaitersLocked(uint32_t i, std::vector<std::function<void(bool)>>& out) {
+  // Drop this process's copy of a record, and its share of the transient budget.
+  void releaseMemLocked(Info& s);
+  void takeWaitersLocked(uint32_t i, std::vector<Waiter>& out) {
     auto it = waiters.find(i);
     if (it != waiters.end()) {
       out.swap(it->second);
@@ -282,6 +308,9 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
     }
   }
   void dropRecords(const std::vector<SlotRecord>& recs, const std::string& why);
+  // Records collected for a commit that will not happen: this process's copy
+  // goes (a request that still needs one holds its own), counted as not kept.
+  void releaseCollected(const std::vector<SlotRecord>& recs);
 };
 
 namespace {
@@ -647,7 +676,9 @@ bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k, bo
     tp::RNTupleMeta rm = tp::parseRNTuple(src, static_cast<int64_t>(size), "");
     if (!rm.error.empty() || !src.read(header.data(), header.size(), 0)) {
       UCACHE_DEBUG("slot run declined for %s: %s", cf.key.key.c_str(), fm.error.c_str());
-      declined = !rm.error.empty() && rm.error.find("cannot read") == std::string::npos;
+      // Remembered only when the file has neither container: any other
+      // parse failure may be a read that failed, and is tried again next time.
+      declined = rm.error.find("not found") != std::string::npos;
       return false;
     }
     cf.rnt = true;
@@ -665,8 +696,7 @@ bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k, bo
   } else {
     if (!fm.error.empty()) {
       UCACHE_DEBUG("slot run declined for %s: %s", cf.key.key.c_str(), fm.error.c_str());
-      declined = fm.error.find("read") == std::string::npos; // the file's nature, not an I/O failure
-      return false;
+      return false; // perhaps a failed read: tried again next time, not remembered
     }
     std::vector<uint8_t> treeKeyHeader(fm.treeKey.keylen), keysList;
     uint8_t klLen[4];
@@ -742,16 +772,27 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   if (store && !adoptable(store->header(), size, originMtime, cksumKind, originCksum)) {
     UCACHE_INFO("slot store for %s was made for another version of the file; replaced",
                 key.key.c_str());
+    store->dropIfCurrent(); // busy: the stale store is found again below, and declined
     store.reset();
-    SlotStore::drop(io, dir, key.hashHex);
   }
-  if (store && store->header().declined)
-    return nullptr; // served as stored, as decided when the store was made
+  if (store && store->header().declined) {
+    // Served as stored, as decided when the store was made -- unless the codec
+    // list it was decided with has changed, which can change the decision.
+    if (mode != AttachMode::kCreate || store->header().codecs == joinCodecs(cfg.recompressCodecs))
+      return nullptr;
+    store->dropIfCurrent(); // busy: found again below, and served as stored this time
+    store.reset();
+  }
   if (store && mode == AttachMode::kMatch && store->header().layoutHash != matchHash)
     return nullptr; // not the layout this process has shown: never mix two
   bool created = false;
   if (!store) {
     if (mode == AttachMode::kExisting)
+      return nullptr;
+    // A compact replica is served in its own layout, to readers who may hold
+    // its offsets: a store is never made beside one.
+    struct ::stat tst;
+    if (io.stat(ReplicaStore::tmetaPath(key, cfg.cacheDir), &tst) == 0)
       return nullptr;
     SetupSource src;
     src.st = st;
@@ -781,6 +822,14 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
       if (mode == AttachMode::kMatch && want.layoutHash != matchHash)
         return nullptr; // this build cannot reproduce what was shown
       blob = encodeLayout(*cf);
+      // Everyone after us serves what this blob decodes to: make sure it does.
+      ColdFill check;
+      check.slotFactor = cf->slotFactor;
+      if (!decodeLayout(blob, check) || layoutHash(check.L, check.rnt) != want.layoutHash) {
+        UCACHE_WARN("slot run declined for %s: its layout does not survive storing",
+                    key.key.c_str());
+        return nullptr;
+      }
     }
     std::string err;
     store = SlotStore::openOrCreate(io, dir, key.hashHex, want, blob, created, err);
@@ -790,6 +839,16 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     }
     if (store->header().declined)
       return nullptr;
+    // A replica published while the layout was computed: one form per file.
+    // Every publish checks for a store after its sidecar lands, so of two
+    // racing, at least one sees the other.
+    if (created && io.stat(ReplicaStore::tmetaPath(key, cfg.cacheDir), &tst) == 0) {
+      store->dropIfCurrent();
+      store.reset();
+      UCACHE_INFO("slot store for %s withdrawn: a replica was published meanwhile",
+                  key.key.c_str());
+      return nullptr;
+    }
     if (!created) { // someone else made it first: theirs is the layout
       if (!adoptable(store->header(), size, originMtime, cksumKind, originCksum) ||
           (mode == AttachMode::kMatch && store->header().layoutHash != matchHash))
@@ -856,6 +915,31 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
   };
   std::vector<OrigPiece> origPieces;
   std::vector<uint32_t> claimed; // slots this request fetches
+  // Slots whose records reach this reader from the origin, not from the cache:
+  // fetched by this request, or by another one it waited on. Their bytes are
+  // the fill; everything else in a slot is the replica tier.
+  std::vector<uint32_t> fetched;
+  // The records this request copies from, held from the moment they were
+  // converted (or found ready) until it has copied them: the file's own copy
+  // may be dropped meanwhile -- a commit refused at the free-space floor, the
+  // transient budget -- and a request must not lose what it already has.
+  std::unordered_map<uint32_t, ColdFill::Where> held; // guarded by emu
+  std::vector<uint32_t> converted; // claimed slots this request staged; guarded by emu
+  void hold(uint32_t i, ColdFill::Rec r) {
+    ColdFill::Where w;
+    w.mem = std::move(r);
+    std::lock_guard<std::mutex> g(emu);
+    held[i] = std::move(w);
+  }
+  // Slot i is ready now: keep where its bytes are -- the record in memory, or
+  // the store entry (whose file stays readable), or the kept original.
+  void holdReady(uint32_t i) {
+    ColdFill::Where w;
+    if (!cf->where(i, w))
+      return;
+    std::lock_guard<std::mutex> g(emu);
+    held.emplace(i, std::move(w)); // a record already held is at least as good
+  }
 
   std::atomic<int> outstanding{1}; // the issuing stage holds one
   std::atomic<bool> failed{false};
@@ -884,10 +968,15 @@ struct ColdRequest : std::enable_shared_from_this<ColdRequest> {
 // Copy bytes [from, from+len) of slot i -- its record, then zeros -- to dest.
 // False when the slot's bytes are not to be had after all: the slot is then
 // absent again, and serving the request again fetches it.
-bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest) {
+bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
+              uint64_t& recBytes, const ColdFill::Where* held) {
+  recBytes = 0;
   ColdFill::Where w;
-  if (!cf.where(i, w))
+  if (held) {
+    w = *held; // what the request took when the slot was ready: nothing else is consulted
+  } else if (!cf.where(i, w)) {
     return false;
+  }
   const tp::FillSlot& fs = cf.L.slots[i];
   if (from + len > fs.vLen)
     return false;
@@ -911,6 +1000,12 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest)
       cf.forget(i);
       return false;
     }
+    if (auto cs = globalStore()) { // the replica tier's disk reads, as for a compact replica
+      auto& stats = cs->stats();
+      stats.replicaReads.fetch_add(1, std::memory_order_relaxed);
+      stats.replicaReadBytes.fetch_add(buf->size(), std::memory_order_relaxed);
+      stats.replicaReadSize.add(buf->size());
+    }
     rec = buf;
   }
   if (cf.rnt) {
@@ -918,6 +1013,7 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest)
     // is exactly the slot's length.
     if (rec->size() == fs.vLen) {
       std::memcpy(dest, rec->data() + from, len);
+      recBytes = len;
       return true;
     }
     std::vector<uint8_t> raw = tp::decompressFrames(rec->data(), rec->size(), fs.vLen);
@@ -926,6 +1022,7 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest)
       return false;
     }
     std::memcpy(dest, raw.data() + from, len);
+    recBytes = len;
     return true;
   }
   const uint64_t recLen = rec->size();
@@ -935,7 +1032,8 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest)
     std::memcpy(dest, rec->data() + from, n);
   }
   if (n < len)
-    std::memset(dest + n, 0, len - n);
+    std::memset(dest + n, 0, len - n); // the slot's padding
+  recBytes = n;
   return true;
 }
 
@@ -955,8 +1053,17 @@ void ColdRequest::again(bool mayParkAgain) {
 
 void ColdRequest::finish() {
   if (failed.load()) {
+    // Give back the claims this request still holds -- those it never staged.
+    // A slot it staged may have been dropped and claimed by another request
+    // since: that claim is not this request's to give back.
+    std::vector<uint32_t> done;
+    {
+      std::lock_guard<std::mutex> g(emu);
+      done = converted;
+    }
+    std::sort(done.begin(), done.end());
     for (uint32_t i : claimed)
-      if (cf->state[i].load(std::memory_order_acquire) != ColdFill::kReady)
+      if (!std::binary_search(done.begin(), done.end(), i))
         cf->abandon(i);
     XRootDStatus s;
     {
@@ -971,12 +1078,24 @@ void ColdRequest::finish() {
     return;
   }
   bool lost = retry.load(); // another request's fetch failed
+  uint64_t fillRec = 0, replicaRec = 0;
+  std::sort(fetched.begin(), fetched.end());
+  std::unordered_map<uint32_t, ColdFill::Where> mine;
+  {
+    std::lock_guard<std::mutex> g(emu);
+    mine.swap(held);
+  }
   if (!lost)
-    for (const auto& p : slotPieces)
-      if (!copySlot(*cf, p.slot, p.from, p.len, p.dest)) {
+    for (const auto& p : slotPieces) {
+      uint64_t rec = 0;
+      auto h = mine.find(p.slot);
+      if (!copySlot(*cf, p.slot, p.from, p.len, p.dest, rec,
+                    h == mine.end() ? nullptr : &h->second)) {
         lost = true; // a record failed its check, or a kept original is gone
         break;
       }
+      (std::binary_search(fetched.begin(), fetched.end(), p.slot) ? fillRec : replicaRec) += rec;
+    }
   if (lost) {
     if (attempt < 2) {
       again(false);
@@ -986,17 +1105,21 @@ void ColdRequest::finish() {
     return;
   }
   if (st->store) {
-    uint64_t total = 0, slotBytes = 0;
+    uint64_t total = 0, origFetched = 0;
     for (const auto& c : chunks)
       total += c.length;
-    for (const auto& p : slotPieces)
-      slotBytes += p.len;
+    for (const auto& p : origPieces)
+      origFetched += p.len;
     auto& stats = st->store->stats();
+    // Every byte handed to the reader is served, as on every other path. Of
+    // them, records already in the store (or converted from the byte cache)
+    // are the replica tier's; records converted from what the origin just
+    // sent, and original bytes fetched, are the fill. A slot's padding is
+    // neither: zeros made here, which no tier holds.
     stats.servedBytes.fetch_add(total, std::memory_order_relaxed);
-    // Slot bytes are the replica tier's share: converted records (and their
-    // padding), not the byte cache's.
-    stats.replicaBytesServed.fetch_add(slotBytes, std::memory_order_relaxed);
-    entry->obs().replicaBytes.fetch_add(slotBytes, std::memory_order_relaxed);
+    stats.missBytes.fetch_add(fillRec + origFetched, std::memory_order_relaxed);
+    stats.replicaBytesServed.fetch_add(replicaRec, std::memory_order_relaxed);
+    entry->obs().replicaBytes.fetch_add(replicaRec, std::memory_order_relaxed);
   }
   entry->noteActivity();
   st->noteCacheOk();
@@ -1046,8 +1169,18 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     if (cf.keepOriginals) {
       req->entry->writePages(rStart, rounded->size(), rounded->data());
       req->entry->flushMeta(false);
+    } else if (!fromCache) {
+      // Fetched for this file, kept only as its record: the file's origin tier
+      // (staging counts what goes to the byte cache).
+      req->entry->obs().wireBytes.fetch_add(recLen, std::memory_order_relaxed);
     }
-    cf.stage(i, kind, std::move(p.enc), fromCache);
+    auto rec = std::make_shared<const std::vector<uint8_t>>(std::move(p.enc));
+    req->hold(i, rec);
+    cf.stage(i, kind, std::move(rec), fromCache);
+    { // staged: the claim is no longer this request's to give back
+      std::lock_guard<std::mutex> g(req->emu);
+      req->converted.push_back(i);
+    }
     req->done();
     return;
   }
@@ -1080,15 +1213,28 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
     req->done();
     return;
   }
-  if ((c.kind == tp::ConvertedBasket::kOriginal && !fromCache) || cf.keepOriginals) {
+  // A kept basket is served from the byte cache, so it is written there even
+  // when it came from it: taken from read-ahead's stage, its pages left the
+  // stage when used, or are still only speculative.
+  if (c.kind == tp::ConvertedBasket::kOriginal || cf.keepOriginals) {
     // Cannot be converted: the one kind of basket the byte cache keeps --
     // unless keeping every original was asked for, to compare the tiers.
     req->entry->writePages(rStart, rounded->size(), rounded->data());
     req->entry->flushMeta(false);
+  } else if (!fromCache) {
+    // Fetched for this file, kept only as its record: the file's origin tier
+    // (staging counts what goes to the byte cache).
+    req->entry->obs().wireBytes.fetch_add(recLen, std::memory_order_relaxed);
   }
+  auto held = std::make_shared<const std::vector<uint8_t>>(std::move(c.record));
+  req->hold(i, held);
   // A kept original is not punched from the byte cache: it is the only copy.
-  cf.stage(i, static_cast<uint8_t>(c.kind), std::move(c.record),
+  cf.stage(i, static_cast<uint8_t>(c.kind), std::move(held),
            fromCache && c.kind != tp::ConvertedBasket::kOriginal);
+  { // staged: the claim is no longer this request's to give back
+    std::lock_guard<std::mutex> g(req->emu);
+    req->converted.push_back(i);
+  }
   req->done();
 } catch (const std::exception& e) {
   UCACHE_WARN("slot run for %s: conversion failed (%s)", req->cf->key.key.c_str(), e.what());
@@ -1300,8 +1446,11 @@ void classify(const std::shared_ptr<ColdRequest>& req, std::vector<uint32_t>& ne
         const uint64_t n = std::min<uint64_t>(end, s.vSeek + s.vLen) - pos;
         req->slotPieces.push_back({i, from, n, d});
         if (cf.state[i].load(std::memory_order_acquire) != ColdFill::kReady ||
-            cf.keptOriginalGone(i))
+            cf.keptOriginalGone(i)) {
           need.push_back(i);
+        } else {
+          req->holdReady(i); // may be dropped from the file's copy before it is copied
+        }
         pos += n;
       }
     }
@@ -1320,8 +1469,11 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     cf.sync();
     need.erase(std::remove_if(need.begin(), need.end(),
                               [&](uint32_t i) {
-                                return cf.state[i].load(std::memory_order_acquire) ==
-                                       ColdFill::kReady;
+                                if (cf.state[i].load(std::memory_order_acquire) !=
+                                    ColdFill::kReady)
+                                  return false;
+                                req->holdReady(i);
+                                return true;
                               }),
                need.end());
   }
@@ -1377,16 +1529,21 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
   for (uint32_t i : need) {
     bool ready = false;
     req->outstanding.fetch_add(1, std::memory_order_relaxed);
-    auto cb = [req](bool ok) {
+    auto cb = [req, i](bool ok, ColdFill::Rec r) {
       if (!ok)
         req->retry.store(true);
+      else if (r)
+        req->hold(i, std::move(r));
       req->done();
     };
     if (cf.claimOrWait(i, cb, ready)) {
       req->claimed.push_back(i);
       req->outstanding.fetch_sub(1, std::memory_order_relaxed); // counted per conversion instead
     } else if (ready) {
+      req->holdReady(i); // converted meanwhile, as in classify
       req->outstanding.fetch_sub(1, std::memory_order_relaxed);
+    } else {
+      req->fetched.push_back(i); // converting elsewhere, from wherever that request got it
     }
   }
 
@@ -1399,17 +1556,22 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
     const tp::FillSlot& s = cf.L.slots[i];
     auto [rs, re] = roundSpan(ps, fs, s.origSeek, s.origLen);
     if (req->entry->hasRange(s.origSeek, s.origLen)) {
-      auto buf = std::make_shared<std::vector<char>>(s.origLen);
-      if (req->entry->readCached(s.origSeek, s.origLen, buf->data(), /*account=*/false)) {
+      // Its whole pages: a basket kept as stored is written back from them, so
+      // none of its bytes stay only in read-ahead's stage.
+      auto buf = std::make_shared<std::vector<char>>(re - rs);
+      if (req->entry->readCached(rs, re - rs, buf->data(), /*account=*/false)) {
         // Read ahead into the stage: used now, so it leaves the stage as served
         // rather than being written or dropped as never used.
         req->entry->consumeSpeculative(s.origSeek, s.origLen);
         req->outstanding.fetch_add(1, std::memory_order_relaxed);
-        convertPool().post(
-            [req, i, buf, s] { convertOne(req, i, buf, s.origSeek, 0, s.origLen, /*fromCache=*/true); });
+        const uint64_t rStart = rs;
+        convertPool().post([req, i, buf, s, rStart] {
+          convertOne(req, i, buf, rStart, s.origSeek - rStart, s.origLen, /*fromCache=*/true);
+        });
         continue;
       }
     }
+    req->fetched.push_back(i);
     items.push_back({true, i, s.origSeek, s.origLen, rs, re});
   }
   for (uint32_t k = 0; k < req->origPieces.size(); ++k) {
@@ -1459,6 +1621,12 @@ Executor& commitPool() {
 // memory growth.
 std::atomic<uint64_t> g_pendingTotal{0};
 constexpr uint64_t kPendingCap = 512ull << 20;
+// Records served but not committed (see ColdFill::transient): a cache for a
+// reader that reads a slot again, nothing more -- every request holds the
+// records it needs itself. Per file, and for the whole process.
+constexpr uint64_t kTransientBytes = 16ull << 20;
+std::atomic<uint64_t> g_transientTotal{0};
+constexpr uint64_t kTransientCap = 256ull << 20;
 
 // The file's first 128 KiB is never punched: ROOT reads it as one block, and
 // a hole there sends every open to the origin.
@@ -1466,13 +1634,39 @@ constexpr uint64_t kKeepHead = 128 * 1024;
 
 } // namespace
 
-void ColdFill::stage(uint32_t i, uint8_t kind, std::vector<uint8_t>&& rec, bool fromCache) {
-  std::vector<std::function<void(bool)>> wake;
-  bool kick = false, now = false;
+ColdFill::~ColdFill() {
+  g_pendingTotal.fetch_sub(std::min(pendingBytes, g_pendingTotal.load()), std::memory_order_relaxed);
+  g_transientTotal.fetch_sub(std::min(transientBytes, g_transientTotal.load()),
+                             std::memory_order_relaxed);
+  // Served, never committed (the store was gone): not kept.
+  uint64_t lost = 0;
+  for (const auto& [slot, s] : info)
+    lost += s.transient && s.mem && !s.inStore;
+  if (lost)
+    if (auto store = globalStore())
+      store->stats().coldReplicaDeclined.fetch_add(lost, std::memory_order_relaxed);
+}
+
+void ColdFill::releaseMemLocked(Info& s) {
+  if (s.transient && s.mem) {
+    const uint64_t b = std::min<uint64_t>(transientBytes, s.mem->size());
+    transientBytes -= b;
+    g_transientTotal.fetch_sub(std::min(b, g_transientTotal.load()), std::memory_order_relaxed);
+  }
+  s.transient = false;
+  s.mem.reset();
+}
+
+void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache) {
+  std::vector<Waiter> wake;
+  bool kick = false;
+  uint64_t lost = 0; // records no longer held anywhere: converted again if read
   {
     std::lock_guard<std::mutex> g(mu);
     Info& s = info[i];
+    bool keep = true;
     if (!s.inStore) { // someone committed it meanwhile: theirs serves
+      releaseMemLocked(s); // staged twice: the newer record replaces the older
       s.kind = kind;
       // A basket kept as stored is served from the byte cache's copy of its
       // original, just written; memory keeps it only if that write did not
@@ -1480,26 +1674,98 @@ void ColdFill::stage(uint32_t i, uint8_t kind, std::vector<uint8_t>&& rec, bool 
       const tp::FillSlot& fs = L.slots[i];
       const bool inCache = !rnt && kind == tp::ConvertedBasket::kOriginal &&
                            entry->hasRange(fs.origSeek, fs.origLen);
-      s.mem = inCache ? nullptr : std::make_shared<const std::vector<uint8_t>>(std::move(rec));
+      const uint64_t b = inCache ? 0 : rec->size();
       s.fromCache = fromCache;
-      s.persist = !storeGone.load(std::memory_order_relaxed);
+      // Committed, unless the store is gone or the process already holds its
+      // cap of records waiting: then it is served to the requests that asked
+      // for it (they hold it) and kept only while the transient budget allows
+      // -- memory never grows to cope, and nothing that serves reads waits
+      // for a commit.
+      s.persist = !storeGone.load(std::memory_order_relaxed) &&
+                  g_pendingTotal.load(std::memory_order_relaxed) + b <= kPendingCap;
       if (s.persist) {
+        s.mem = inCache ? nullptr : rec;
         pending.push_back(i);
-        const uint64_t b = s.mem ? s.mem->size() : 0;
         pendingBytes += b;
-        kick = pendingBytes >= kCommitBytes;
-        now = g_pendingTotal.fetch_add(b, std::memory_order_relaxed) + b > kPendingCap;
+        g_pendingTotal.fetch_add(b, std::memory_order_relaxed);
+        kick = pendingBytes >= kCommitBytes || handles == 0;
+      } else if (inCache) {
+        // Served from the byte cache: nothing to hold. Committed the next time
+        // this slot is staged with room.
+      } else {
+        // Oldest first, never the record being staged, until both budgets fit.
+        while ((transientBytes + b > kTransientBytes ||
+                g_transientTotal.load(std::memory_order_relaxed) + b > kTransientCap) &&
+               !transient.empty()) {
+          const uint32_t j = transient.front();
+          transient.pop_front();
+          if (j == i)
+            continue;
+          auto it = info.find(j);
+          if (it != info.end() && it->second.transient && !it->second.inStore) {
+            forgetLocked(j);
+            ++lost;
+          }
+        }
+        keep = transientBytes + b <= kTransientBytes &&
+               g_transientTotal.load(std::memory_order_relaxed) + b <= kTransientCap;
+        if (!keep)
+          ++lost;
+        if (keep) {
+          s.mem = rec;
+          s.transient = true;
+          transient.push_back(i);
+          transientBytes += b;
+          g_transientTotal.fetch_add(b, std::memory_order_relaxed);
+        }
+        kick = !storeGone.load(std::memory_order_relaxed); // drain what waits
       }
     }
-    state[i].store(kReady, std::memory_order_release);
     takeWaitersLocked(i, wake);
+    if (keep) {
+      state[i].store(kReady, std::memory_order_release);
+    } else { // served to whoever asked, and not kept: absent again
+      info.erase(i);
+      state[i].store(kAbsent, std::memory_order_release);
+    }
   }
   for (auto& w : wake)
-    w(true);
-  if (now)
-    commit();
-  else if (kick)
+    w(true, rec);
+  if (lost)
+    if (auto store = globalStore())
+      store->stats().coldReplicaDeclined.fetch_add(lost, std::memory_order_relaxed);
+  if (kick)
     queueCommit();
+}
+
+bool ColdFill::pageDeadLocked(uint64_t pg, uint64_t ps) {
+  if (origOrder.empty() && !L.slots.empty()) {
+    origOrder.resize(L.slots.size());
+    for (uint32_t k = 0; k < origOrder.size(); ++k)
+      origOrder[k] = k;
+    std::sort(origOrder.begin(), origOrder.end(), [this](uint32_t x, uint32_t y) {
+      return L.slots[x].origSeek < L.slots[y].origSeek;
+    });
+  }
+  const uint64_t a = pg * ps, b = std::min(a + ps, L.originSize);
+  if (a < kKeepHead || a >= b)
+    return false;
+  // The first basket that may reach into the page, then each one in order:
+  // every byte must be covered, with no gap, by committed converted baskets.
+  auto it = std::lower_bound(origOrder.begin(), origOrder.end(), a, [this](uint32_t k, uint64_t v) {
+    return L.slots[k].origSeek + L.slots[k].origLen <= v;
+  });
+  uint64_t covered = a;
+  for (; it != origOrder.end() && covered < b; ++it) {
+    const tp::FillSlot& fs = L.slots[*it];
+    if (fs.origSeek > covered)
+      return false; // bytes in no relocated basket: the file's own records
+    auto in = info.find(*it);
+    if (in == info.end() || !in->second.inStore || in->second.kind == tp::ConvertedBasket::kOriginal)
+      return false; // not converted yet, or kept as stored: its original serves
+    covered = std::max<uint64_t>(covered, fs.origSeek + fs.origLen);
+  }
+  return covered >= b;
 }
 
 std::vector<std::pair<uint64_t, uint64_t>> ColdFill::storableRuns(uint64_t rs, uint64_t re,
@@ -1507,20 +1773,29 @@ std::vector<std::pair<uint64_t, uint64_t>> ColdFill::storableRuns(uint64_t rs, u
   {
     std::lock_guard<std::mutex> g(mu);
     if (relocatedOrig.empty() && !L.slots.empty()) {
-      relocatedOrig.reserve(L.slots.size());
+      std::vector<std::pair<uint64_t, uint64_t>> r;
+      r.reserve(L.slots.size());
       for (const auto& s : L.slots)
-        relocatedOrig.emplace_back(s.origSeek, s.origSeek + s.origLen);
-      std::sort(relocatedOrig.begin(), relocatedOrig.end());
+        r.emplace_back(s.origSeek, s.origSeek + s.origLen);
+      std::sort(r.begin(), r.end());
+      // As merged runs: a page covered by two adjacent baskets is as dead as
+      // one inside a single basket.
+      for (const auto& [a, b] : r) {
+        if (!relocatedOrig.empty() && a <= relocatedOrig.back().second)
+          relocatedOrig.back().second = std::max(relocatedOrig.back().second, b);
+        else
+          relocatedOrig.emplace_back(a, b);
+      }
     }
   }
   std::vector<std::pair<uint64_t, uint64_t>> out;
   for (uint64_t p = rs; p < re; p += ps) {
     const uint64_t pe = std::min(re, p + ps);
-    // Is [p, pe) inside one relocated basket? Baskets do not overlap, so the
-    // last one starting at or before p is the only candidate.
+    // Is [p, pe) inside the relocated baskets? (The head is always kept: ROOT
+    // reads it as one block, and a hole there sends every open to the origin.)
     auto it = std::upper_bound(relocatedOrig.begin(), relocatedOrig.end(),
                                std::make_pair(p, UINT64_MAX));
-    const bool dead = it != relocatedOrig.begin() && std::prev(it)->second >= pe;
+    const bool dead = p >= kKeepHead && it != relocatedOrig.begin() && std::prev(it)->second >= pe;
     if (dead)
       continue;
     if (!out.empty() && out.back().second == p)
@@ -1553,11 +1828,16 @@ void ColdFill::dropRecords(const std::vector<SlotRecord>& recs, const std::strin
     UCACHE_WARN("slot records for %s not kept (%s); they are converted again when read "
                 "(further such cases are not reported)",
                 key.key.c_str(), why.c_str());
+  releaseCollected(recs);
+}
+
+void ColdFill::releaseCollected(const std::vector<SlotRecord>& recs) {
   {
     std::lock_guard<std::mutex> g(mu);
     for (const auto& r : recs) {
       auto it = info.find(r.slot);
-      if (it != info.end() && !it->second.inStore)
+      // Not if someone committed it meanwhile, or it was staged again since.
+      if (it != info.end() && !it->second.inStore && !it->second.persist)
         forgetLocked(r.slot);
     }
   }
@@ -1569,8 +1849,26 @@ void ColdFill::dropRecords(const std::vector<SlotRecord>& recs, const std::strin
 // committed meanwhile are applied first and their slots skipped -- so no slot
 // is written twice -- then the rest goes to the store as one block.
 void ColdFill::commit() try {
-  std::lock_guard<std::mutex> cg(commitMu);
+  // One commit of a file at a time, and a second never waits for the first on
+  // a pool thread: the one running goes round again instead.
+  // (Flag, then try again: a holder that unlocks after the flag is set sees
+  // it; one that unlocked before leaves the lock to this try.)
+  std::unique_lock<std::mutex> cg(commitMu, std::defer_lock);
   commitQueued.store(false);
+  if (!cg.try_lock()) {
+    commitAgain.store(true);
+    if (!cg.try_lock())
+      return;
+  }
+  struct Again {
+    ColdFill* self;
+    std::unique_lock<std::mutex>& lk;
+    ~Again() {
+      lk.unlock();
+      if (self->commitAgain.exchange(false))
+        self->queueCommit();
+    }
+  } again{this, cg};
   std::vector<SlotRecord> recs;
   {
     std::lock_guard<std::mutex> g(mu);
@@ -1579,9 +1877,15 @@ void ColdFill::commit() try {
       if (it == info.end())
         continue; // forgotten meanwhile
       Info& s = it->second;
-      if (!s.persist || s.inStore || state[i].load(std::memory_order_acquire) != kReady ||
+      if (s.inStore) { // committed by someone meanwhile: ours is not kept
+        s.persist = false;
+        releaseMemLocked(s);
+        continue;
+      }
+      if (!s.persist || state[i].load(std::memory_order_acquire) != kReady ||
           (!s.mem && s.kind != tp::ConvertedBasket::kOriginal))
         continue;
+      s.persist = false; // collected once, even if the slot was staged twice
       SlotRecord r;
       r.slot = i;
       r.kind = entryKind(s.kind);
@@ -1592,16 +1896,50 @@ void ColdFill::commit() try {
     pending.clear();
     g_pendingTotal.fetch_sub(pendingBytes, std::memory_order_relaxed);
     pendingBytes = 0;
+    // Records served while there was no room to commit them go with this
+    // batch, now that it is being written: out of the transient budget, kept
+    // in memory until committed.
+    if (!storeGone.load()) {
+      for (uint32_t j : transient) {
+        auto it = info.find(j);
+        if (it == info.end() || !it->second.transient || !it->second.mem || it->second.inStore)
+          continue;
+        Info& s = it->second;
+        SlotRecord r;
+        r.slot = j;
+        r.kind = entryKind(s.kind);
+        r.bytes = *s.mem;
+        auto keep = s.mem;
+        releaseMemLocked(s); // out of the budget ...
+        s.mem = std::move(keep); // ... still served until the commit lands
+        recs.push_back(std::move(r));
+      }
+      transient.clear();
+    }
   }
-  if (recs.empty() || !store || storeGone.load())
+  if (recs.empty())
     return;
+  if (!store || storeGone.load()) {
+    releaseCollected(recs);
+    return;
+  }
   uint64_t bytes = 0;
   for (const auto& r : recs)
     bytes += r.bytes.size();
   auto cs = globalStore();
   if (cs && bytes > CacheStore::headroomToFloor(cs->config(), RealIO::instance())) {
-    dropRecords(recs, "no room above the free-space floor");
-    return;
+    // Records are cached like any fill: make room the way a fill does, by
+    // eviction (at most every 30 s per process: it scans the cache), and keep
+    // them only if that found the room.
+    static std::atomic<uint64_t> lastEvictUs{0};
+    const uint64_t now = nowUs();
+    uint64_t last = lastEvictUs.load(std::memory_order_relaxed);
+    if (now - last > 30'000'000 && lastEvictUs.compare_exchange_strong(last, now))
+      cs->evictNow();
+    if (bytes > CacheStore::headroomToFloor(cs->config(), RealIO::instance())) {
+      dropRecords(recs, "no room above the free-space floor");
+      return;
+    }
   }
   std::vector<SlotEntry> committed;
   const int64_t n = store->commit(
@@ -1618,6 +1956,7 @@ void ColdFill::commit() try {
     if (!storeGone.exchange(true))
       UCACHE_INFO("slot store for %s was removed; nothing more is committed to it",
                   key.key.c_str());
+    releaseCollected(recs);
     return;
   }
   if (n < 0) {
@@ -1625,29 +1964,63 @@ void ColdFill::commit() try {
     return;
   }
   std::vector<std::pair<uint64_t, uint64_t>> punch;
+  std::vector<SlotEntry> forgotten;
   {
     std::lock_guard<std::mutex> g(mu);
     for (const auto& e : committed) {
-      Info& s = info[e.slot];
+      auto it = info.find(e.slot);
+      if (it == info.end()) { // forgotten meanwhile: its new entry makes it ready
+        forgotten.push_back(e);
+        continue;
+      }
+      Info& s = it->second;
       s.inStore = true;
       s.e = e;
-      if (s.fromCache && !keepOriginals) {
-        const uint64_t a = std::max<uint64_t>(L.slots[e.slot].origSeek, kKeepHead);
-        const uint64_t b = L.slots[e.slot].origSeek + L.slots[e.slot].origLen;
-        if (a < b)
-          punch.emplace_back(a, b - a);
-      }
+      s.kind = basketKind(e.kind);
+      // A kept basket's original is the only copy: never punched.
+      if (s.fromCache && !keepOriginals && e.kind != SlotEntry::kKept)
+        punch.emplace_back(L.slots[e.slot].origSeek,
+                           L.slots[e.slot].origSeek + L.slots[e.slot].origLen);
       s.fromCache = false;
       s.persist = false;
-      s.mem.reset();
+      releaseMemLocked(s);
     }
     for (const auto& r : recs) { // skipped: another process's record serves
       auto it = info.find(r.slot);
       if (it != info.end() && it->second.inStore) {
         it->second.persist = false;
-        it->second.mem.reset();
+        releaseMemLocked(it->second);
       }
     }
+  }
+  if (!forgotten.empty())
+    apply(forgotten);
+  // Converted baskets that touch are released as one range, so a page they
+  // share goes too -- and so does a page one of them shares with a basket
+  // committed earlier. The file's first 128 KiB never does.
+  std::sort(punch.begin(), punch.end());
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  for (const auto& [a, b] : punch) {
+    if (!runs.empty() && a <= runs.back().second)
+      runs.back().second = std::max(runs.back().second, b);
+    else
+      runs.emplace_back(a, b);
+  }
+  punch.clear();
+  if (!runs.empty() && entry) {
+    const uint64_t ps = entry->pageSize();
+    std::lock_guard<std::mutex> g(mu);
+    for (auto& [a, b] : runs) {
+      if (a % ps && pageDeadLocked(a / ps, ps))
+        a -= a % ps;
+      if (b % ps && b < L.originSize && pageDeadLocked(b / ps, ps))
+        b = std::min<uint64_t>(b + (ps - b % ps), L.originSize);
+    }
+  }
+  for (auto [a, b] : runs) {
+    a = std::max<uint64_t>(a, kKeepHead);
+    if (a < b)
+      punch.emplace_back(a, b - a);
   }
   // Outside the store's lock: accounting may evict, punching takes the byte
   // cache's own lock.
@@ -1692,13 +2065,20 @@ ShownLayout shownLayout(const std::string& key, uint64_t& hash) {
   return it->second.first;
 }
 
-void noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash) {
+ShownLayout noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash,
+                            uint64_t* winnerHash) {
   std::lock_guard<std::mutex> g(g_shownMu);
   auto& v = shownMap()[key];
   // Original may later become compact or slot (the original region reads the
-  // same in both); nothing else changes once shown.
-  if (v.first == ShownLayout::kNone || v.first == ShownLayout::kOriginal)
+  // same in both); nothing else changes once shown -- not even to another
+  // compact replica or slot layout of the same file. The caller learns which
+  // layout won, and must serve that one.
+  if (v.first == ShownLayout::kNone || v.first == ShownLayout::kOriginal ||
+      (v.first == s && v.second == hash))
     v = {s, hash};
+  if (winnerHash)
+    *winnerHash = v.second;
+  return v.first;
 }
 
 // -------------------------------------------------------------------- API
@@ -1733,10 +2113,11 @@ std::shared_ptr<ColdFill> coldAttach(const std::shared_ptr<HandleState>& st,
   // Registered after the store exists, so it runs before the store is torn down.
   static std::once_flag once;
   std::call_once(once, [] { std::atexit(commitAtExit); });
-  noteShownLayout(key.key, ShownLayout::kSlot, cf->store->header().layoutHash);
   std::lock_guard<std::mutex> g(g_regMu);
   auto [it, inserted] = registry().emplace(key.key, cf);
-  if (!inserted && (it->second->L.originSize != entry->fileSize() || it->second->entry != entry))
+  if (!inserted && (it->second->L.originSize != entry->fileSize() || it->second->entry != entry ||
+                    (mode == AttachMode::kMatch &&
+                     it->second->store->header().layoutHash != matchHash)))
     it->second = cf; // the old run keeps serving its own handles
   std::lock_guard<std::mutex> g2(it->second->mu);
   ++it->second->handles; // a racing handle built it first: join that one, drop ours
@@ -1772,9 +2153,8 @@ void coldCheckpoint() {
     cf->queueCommit();
 }
 
-uint64_t coldLayoutHash(const ColdFill& cf) { return cf.store->header().layoutHash; }
-
 uint64_t coldVirtualSize(const ColdFill& cf) { return cf.L.virtualSize; }
+uint64_t coldLayoutHash(const ColdFill& cf) { return cf.store->header().layoutHash; }
 
 void coldOriginRanges(const ColdFill& cf, uint64_t off, uint64_t len,
                       std::vector<std::pair<uint64_t, uint64_t>>& out) {

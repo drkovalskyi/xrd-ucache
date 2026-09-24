@@ -207,13 +207,33 @@ Header:
 | 84 | 2 | codecs_len u16 | then the codecs list the store converts (ASCII, ≤ 256) |
 | 4092 | 4 | header_crc u32 | CRC32C of bytes [0, 4092) |
 
-The layout blob is `[raw_len u64][ZSTD frames]` (or the raw bytes when
-`raw_len` equals the stored length). Raw, it holds the patch windows, the
-relocated metadata record, the read-footprint ranges, the relocated branch or
-column-range list and, per slot, its original seek and length, its virtual
-seek and length, and its branch and basket indices (for RNTuple also the
-page's stored size and checksum flag). It is decoded and checked, never
-trusted: every slot must lie inside the layout and in order.
+The layout blob is `raw_len u64` followed by the raw layout compressed as
+ROOT-style ZSTD chunks — each a 9-byte header (`'Z' 'S' 1`, compressed size
+u24, uncompressed size u24, little-endian) then one zstd frame, the raw bytes
+cut into chunks under 16 MiB — or followed by the raw bytes themselves, which
+is recognised by `raw_len` equalling what follows. (A plain zstd decoder does
+not read the chunked form.) All integers are little-endian. The raw layout:
+
+| field | encoding |
+|---|---|
+| magic | `"UCLAYT02"` |
+| container | u8 (0 TTree, 1 RNTuple) |
+| origin size, virtual size, metadata seek, slots begin | u64 each |
+| windows | u32 count, then per window: offset u64, bytes (u64 length + bytes) |
+| relocated metadata record | u64 length + bytes |
+| read-footprint ranges | u32 count, then per range: offset u64, length u64 |
+| relocated branches or column ranges | u32 count, then u32 each |
+| slot table | u32 count, then per slot the six varints below |
+| RNTuple pages | per slot: stored size u32, checksum flag u8 |
+
+Per slot, in this order, against the slot before (the first against zeros
+and against `slots begin`): the branch index delta and the basket index delta
+minus one, as zigzag varints; the original seek delta, a zigzag varint; the
+original length, a plain varint; the slot length, a varint that is 0 for the
+plain factor × original length (TTree only) and length + 1 otherwise; and the
+slot's virtual seek minus the previous slot's END, a zigzag varint (0 when
+slots follow one another). The layout is decoded and checked, never trusted:
+the slots must lie inside the virtual size, in order and without overlap.
 
 Commit block, at a 4096-aligned offset:
 
@@ -240,8 +260,11 @@ The last valid entry for a slot wins.
 - **Commit:** under an exclusive `flock` on the file:
   1. read the blocks written since;
   2. skip slots already committed;
-  3. write one block at the 4096-aligned offset past both the file's end and
-     every block read.
+  3. write one block at the 4096-aligned offset past the file's end, every
+     block read, and the furthest end any block header CLAIMS — valid or not.
+     A block cut short by a crash still owns its claimed extent: once the file
+     grows past it, its header passes its checks and a reader steps over
+     everything inside it, so nothing may be written there.
 
   A commit whose open file is no longer the one at the path (the store was
   dropped or replaced) writes nothing.

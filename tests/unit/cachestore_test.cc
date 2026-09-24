@@ -1,4 +1,5 @@
 #include "CacheStore.h"
+#include "SlotStore.h"
 #include "testing/FaultIO.h"
 
 #include "TestUtil.h"
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <sys/file.h>
+#include <sys/time.h>
 #include <chrono>
 #include <thread>
 
@@ -1153,4 +1155,95 @@ TEST(CacheStore, CheckpointWritesNoCounterLineForACliStore) {
   store.disableStatsDump(); // a `ucache` invocation, not a job
   store.checkpoint();
   EXPECT_TRUE(counterFile(io, td.path()).empty());
+}
+
+namespace {
+// An entry with a sidecar on disk, closed again.
+void cachedEntry(CacheStore& store, const UrlKey& key) {
+  auto e = store.open(key, 100000);
+  ASSERT_TRUE(e);
+  std::vector<char> page(4096, 'x');
+  e->writePages(0, page.size(), page.data());
+  e->flushMeta(true);
+}
+SlotStoreHeader slotHeader(bool declined) {
+  SlotStoreHeader h;
+  h.layoutVersion = 1;
+  h.slotFactor = 3;
+  h.codecs = "lzma,zlib";
+  h.originSize = 100000;
+  h.declined = declined;
+  if (!declined) {
+    h.virtualSize = 400000;
+    h.nSlots = 10;
+    h.layoutHash = 42;
+  }
+  return h;
+}
+} // namespace
+
+// A store takes space from its creation on, but has recompressed something
+// only once it holds records: `status` must not count a layout as a replica.
+TEST(CacheStore, ASlotStoreIsRecompressedOnlyOnceItHoldsRecords) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const UrlKey a = keyN(0), d = keyN(1);
+  cachedEntry(store, a);
+  cachedEntry(store, d);
+  bool created = false;
+  std::string err;
+  auto sa = SlotStore::openOrCreate(io, a.objectDir(cfg.cacheDir), a.hashHex, slotHeader(false),
+                                    std::vector<uint8_t>(20000, 7), created, err);
+  ASSERT_TRUE(sa && created) << err;
+  auto sd = SlotStore::openOrCreate(io, d.objectDir(cfg.cacheDir), d.hashHex, slotHeader(true),
+                                    {}, created, err);
+  ASSERT_TRUE(sd && created) << err;
+
+  auto find = [&](const UrlKey& k) {
+    for (const auto& e : store.listEntries())
+      if (e.key == k.key)
+        return e;
+    ADD_FAILURE() << "entry not listed";
+    return CacheStore::EntryInfo{};
+  };
+  auto ea = find(a);
+  EXPECT_GT(ea.replicaBytes, 20000u); // header + layout: real space
+  EXPECT_FALSE(ea.replicated);        // ... and nothing recompressed yet
+  auto ed = find(d);
+  EXPECT_EQ(ed.replicaBytes, 0u); // DECLINED: one header, nothing in it
+  EXPECT_FALSE(ed.replicated);
+
+  std::vector<SlotRecord> recs(1);
+  recs[0].slot = 3;
+  recs[0].kind = SlotEntry::kZstd;
+  recs[0].bytes.assign(500, 9);
+  std::vector<SlotEntry> out;
+  ASSERT_GT(sa->commit(recs, nullptr, nullptr, false, out), 0);
+  EXPECT_TRUE(find(a).replicated);
+}
+
+// A creation file is written once and linked: an old one is debris even while
+// its entry lives, and the orphan sweep takes it; a fresh one may be in use.
+TEST(CacheStore, SlotStoreCreationDebrisIsSweptBesideALiveEntry) {
+  TempDir td;
+  RealIO io;
+  Config cfg;
+  cfg.cacheDir = td.path();
+  CacheStore store(io, cfg);
+  const UrlKey k = keyN(0);
+  cachedEntry(store, k);
+  const std::string base = k.objectDir(cfg.cacheDir) + "/" + k.hashHex;
+  const std::string oldTmp = base + ".slots.tmp.123.0", newTmp = base + ".slots.tmp.124.0";
+  std::ofstream(oldTmp) << "x";
+  std::ofstream(newTmp) << "x";
+  struct ::timeval tv[2] = {{::time(nullptr) - 7200, 0}, {::time(nullptr) - 7200, 0}};
+  ASSERT_EQ(::utimes(oldTmp.c_str(), tv), 0);
+  store.evictNow();
+  struct ::stat st;
+  EXPECT_NE(io.stat(oldTmp, &st), 0);
+  EXPECT_EQ(io.stat(newTmp, &st), 0);
+  EXPECT_EQ(io.stat(base + ".meta", &st), 0); // the entry itself is untouched
 }

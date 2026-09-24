@@ -67,7 +67,13 @@ std::shared_ptr<ColdFill> coldAttach(const std::shared_ptr<HandleState>& st,
 // may later become either. `hash` = the slot layout's hash.
 enum class ShownLayout : uint8_t { kNone, kOriginal, kCompact, kSlot };
 ShownLayout shownLayout(const std::string& key, uint64_t& hash);
-void noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash = 0);
+// Record that `s` is being shown, with its identity `hash` (a slot layout's
+// hash; a compact replica's id; 0 for the original); returns the layout that
+// holds for the file in this process from now on (and its identity). When that
+// is not `s` and `hash`, another handle got there first, and the caller must
+// serve the winner instead.
+ShownLayout noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash = 0,
+                            uint64_t* winnerHash = nullptr);
 
 // The handle is done with the run. The process's last handle on the file
 // commits what it converted.
@@ -79,6 +85,8 @@ void coldCheckpoint();
 
 // The file size the reader is shown.
 uint64_t coldVirtualSize(const ColdFill& cf);
+// The hash of the layout the run serves.
+uint64_t coldLayoutHash(const ColdFill& cf);
 
 // The ORIGINAL-file ranges a read of [off, off+len) of the layout carries: a
 // slot is its basket, the relocated tree record is the original tree key, the

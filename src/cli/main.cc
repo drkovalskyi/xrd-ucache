@@ -1145,8 +1145,12 @@ bool anyReplicaExists(const std::string& cacheDir) {
       continue;
     while (dirent* f = ::readdir(sd)) {
       const std::string n = f->d_name;
+      // A slot store counts only if files are served from it: one marked
+      // DECLINED says recompression looked and did nothing.
       if ((n.size() > 6 && n.compare(n.size() - 6, 6, ".tmeta") == 0) ||
-          (n.size() > 6 && n.compare(n.size() - 6, 6, ".slots") == 0)) {
+          (n.size() > 6 && n.compare(n.size() - 6, 6, ".slots") == 0 &&
+           SlotStore::serving(RealIO::instance(), root + "/" + shard->d_name,
+                              n.substr(0, n.size() - 6)))) {
         found = true;
         break;
       }
@@ -1820,10 +1824,9 @@ int cmdSummary(CacheStore& store, int argc, char** argv) {
   uint64_t used = 0, replicaTotal = 0, replicaN = 0;
   for (const auto& e : entries) {
     used += e.cachedBytes;
-    if (e.replicaBytes) {
-      replicaTotal += e.replicaBytes;
+    replicaTotal += e.replicaBytes;
+    if (e.replicated)
       ++replicaN;
-    }
   }
   uint64_t avail = 0, totalSpace = 0, headroom = 0;
   if (RealIO::instance().spaceInfo(cfg.cacheDir, avail, totalSpace) == 0 && totalSpace)
@@ -2209,14 +2212,15 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
   // Footprint summary: what fraction of the original files the
   // cache holds — the at-a-glance answer to "did my analysis read most of
   // the data or a thin slice", aggregated and as a per-file median.
-  uint64_t origTotal = 0, replicaTotal = 0;
+  uint64_t origTotal = 0, replicaTotal = 0, replicatedBytes = 0;
   size_t replicaN = 0;
   std::vector<double> covs;
   covs.reserve(entries.size());
   for (const auto& e : entries) {
     origTotal += e.fileSize;
-    if (e.replicaBytes) {
-      replicaTotal += e.replicaBytes;
+    replicaTotal += e.replicaBytes; // on disk, whatever it holds
+    if (e.replicated) {
+      replicatedBytes += e.replicaBytes;
       ++replicaN;
     }
     covs.push_back(e.coverage);
@@ -2249,7 +2253,7 @@ int cmdStatus(CacheStore& store, IOBackend& io) {
   if (replicaN)
     std::printf("recompressed: %zu entr%s, %s (recompress %s; codecs:%s%s)\n",
                 replicaN,
-                replicaN == 1 ? "y" : "ies", human(replicaTotal).c_str(),
+                replicaN == 1 ? "y" : "ies", human(replicatedBytes).c_str(),
                 cfg.recompress ? "on" : "off — manual `ucache recompress` only",
                 [&] {
                   std::string s;
@@ -2999,9 +3003,18 @@ int cmdRecompress(CacheStore& store, const Config& cfg, IOBackend& io, int jobs,
         meta.originMtime = cm->originMtime;
         meta.cksumKind = cm->cksumKind;
         meta.originCksum = cm->originCksum;
-        if (meta.originSize != cm->fileSize ||
-            rs.publish(*key, meta, ov.tdata.data(), ov.tdata.size()) != 0)
+        if (meta.originSize != cm->fileSize)
           return false;
+        if (int prc = rs.publish(*key, meta, ov.tdata.data(), ov.tdata.size()); prc == -EEXIST) {
+          // A slot store appeared while this was built. Racing its creation,
+          // both may have stepped back: then the file has neither yet.
+          if (!SlotStore::serving(io, key->objectDir(cfg.cacheDir), key->hashHex))
+            return false;
+          ++already; // the file is served from the store
+          return true;
+        } else if (prc != 0) {
+          return false;
+        }
         decB += ov.decodeBytes;
         decNs += ov.decodeNs;
         auto view = rs.openView(*key, meta.originSize, meta.originMtime, cm->cksumKind,
@@ -4251,8 +4264,13 @@ int cmdDoctor(const Config& cfg) {
 
 // Run one pass through a real XrdCl client. The child gets
 // XRD_CPUSEPGWRTRD=0 because plain xrdcp transfers with PgRead, which the
-// cache deliberately passes through (§4.7) — everything else is inherited
-// untouched: the point is to exercise the user's setup as-is.
+// cache deliberately passes through, and UCACHE_TRANSPOSE=0 plus
+// UCACHE_RECOMPRESS=off because a whole-file copy is a byte-cache test: a
+// copy shown the file in its recompressed layout reads the original baskets
+// too, which that layout never keeps, and a replica built behind the test
+// would release pages the warm pass then fetches again.
+// Everything else is inherited untouched: the point is to exercise the
+// user's setup as-is.
 uint64_t nowUs() {
   struct timespec ts;
   ::clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -4265,6 +4283,8 @@ int runTestPass(const std::string& url, std::vector<pid_t>& pids) {
     return -1;
   if (pid == 0) {
     ::setenv("XRD_CPUSEPGWRTRD", "0", 1);
+    ::setenv("UCACHE_TRANSPOSE", "0", 1);
+    ::setenv("UCACHE_RECOMPRESS", "off", 1);
     ::execlp("xrdcp", "xrdcp", "-f", url.c_str(), "/dev/null", static_cast<char*>(nullptr));
     std::fprintf(stderr, "test: cannot run xrdcp: %s — XRootD client tools must be on PATH\n",
                  std::strerror(errno));
@@ -4329,6 +4349,16 @@ int cmdTest(CacheStore& store, const Config& cfg, int argc, char** argv) {
 
   const std::string statsDir = cfg.cacheDir + "/stats";
   const bool existed = fileExists(key->objectDir(cfg.cacheDir) + "/" + key->hashHex + ".meta");
+  // A recompressed entry no longer keeps every byte of the original file, so
+  // a whole-file copy would fetch the rest again -- and store it a second time.
+  if (existed && (fileExists(ReplicaStore::tmetaPath(*key, cfg.cacheDir)) ||
+                  SlotStore::serving(RealIO::instance(), key->objectDir(cfg.cacheDir),
+                                     key->hashHex))) {
+    std::printf("test: %s is cached and recompressed, and a whole-file copy would read bytes "
+                "it no longer keeps. Test with a file that is not cached yet.\n",
+                url.c_str());
+    return 2;
+  }
   if (existed)
     std::printf("note: already cached — verifying warm serving only; the entry is yours "
                 "and will be KEPT.\n");

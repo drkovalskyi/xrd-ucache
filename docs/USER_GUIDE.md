@@ -292,7 +292,9 @@ progress shown. It PASSes only if the warm pass is served entirely from
 cache with **zero origin contact**, then removes the entry it created (a
 file that was already cached is verified warm-only and kept). Exit 0 = the
 whole chain works: conf → plugin loaded → interception → caching → warm
-serving.
+serving. It tests the byte cache: its copies run with recompression's layout
+switched off, because a whole-file copy of a file in that layout would read
+baskets the layout never keeps.
 
 Then run your normal ROOT / RDataFrame / uproot job **twice**:
 
@@ -798,9 +800,10 @@ basket whose converted form does not fit — is kept in the byte cache as usual.
 What was converted is not ALSO kept in the byte cache, and a copy the byte cache
 held from before is released once its basket is converted; set
 `recompress_keep_originals = on` if you want both, for instance to compare the
-two tiers on one cache. Converted records never evict cached data: if they do
-not fit above the free-space floor they are not kept (a later read converts
-them again), and `ucache stats` counts them as not kept.
+two tiers on one cache. Converted records are held to the cache's limits like
+any other cached data, so keeping them can evict least-recently-used entries.
+What still does not fit above the free-space floor is not kept (a later read
+converts it again), and `ucache stats` counts it as not kept.
 
 `recompress = off` only stops files that have no replica from getting one. A
 file that has one keeps being served from it, and what a job reads of it for
