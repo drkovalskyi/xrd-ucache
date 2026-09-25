@@ -158,22 +158,24 @@ free-disk floor is the hard guard against actually filling the volume.
 With `recompress = on`, a file your job reads gets its replica while it is read
 (`ucache ls` shows its size under RECOMP as soon as records are committed:
 every few seconds, and when the job closes the file). If a file stays at 0,
-the INFO log names why its layout was declined (`UCACHE_LOG=info`). Declined
-files, and data cached before recompression was switched on, are left to the
-background worker and to `ucache recompress`, and that is what the rest of this
-section is about.
+the INFO log names why its layout was declined (`UCACHE_LOG=info`), and
+`ucache status` counts declined files on its `declined` line. A file declined
+for its codec is decided again at the next read once `recompress_codecs`
+lists that codec; data cached before recompression was switched on and not
+read since gets a replica only from `ucache recompress`. The rest of this
+section covers both.
 
 **Ask the tools first — they diagnose this for you:**
 
 ```sh
 ucache doctor      # names the cause, and exits nonzero on it
-ucache status      # queue depth + the reason, cheaply
+ucache status      # the reason, cheaply
 ```
 
-`doctor` reports `recompress = on but no replicas exist (N queued)` together with
-the specific cause. Full detail always lands in `<cache-dir>/recompress.log`, but
-you should no longer need to read it to find out *why* nothing happened. The
-causes, in order of likelihood:
+`doctor` reports `recompress = on but no replicas exist` together with the
+specific cause, when it can identify one; a cache whose data simply predates the
+switch has no replica yet and nothing wrong with it. The causes, in order of
+likelihood:
 
 1. **The source codec is not in `recompress_codecs`.** The default is
    `lzma,zlib`, the two codecs that are expensive to decode. Data already
@@ -189,17 +191,16 @@ causes, in order of likelihood:
 
    `ucache branches <url>` shows the codec per branch if you want to look first.
 
-2. **The `ucache` CLI is not reachable.** The plugin builds replicas by spawning
-   `ucache` itself, resolved from `PATH`. When it cannot be found you get one
-   warning — ``recompress is on but the `ucache` helper is not executable`` — and
-   nothing is queued, since nothing could drain it. Either make the CLI reachable
-   by the process running your analysis (`which ucache` from the same shell), or
-   point at it explicitly with `UCACHE_RECOMPRESS_HELPER=/path/to/ucache`. An
-   explicit `ucache recompress` needs no helper and works regardless.
+2. **`transpose = off`.** A replica is created on the first pass only where
+   replicas are served, so with the replica tier switched off a job's first pass
+   neither creates nor serves one. `ucache set transpose on` (or
+   `ucache unset transpose`) lets recompression work again.
 
-3. **There is no headroom above the eviction floor.** Background builds are
-   declined rather than pushing your cache into eviction, and the log records
-   what was deferred and by how much. Free some space, or set
+3. **There is no headroom above the eviction floor.** Converted records that
+   still do not fit above the floor after an eviction pass are not kept
+   (`ucache stats` counts them as `cold_replica_declined`), and a sweep defers
+   each file that would not fit rather than pushing your cache into eviction,
+   saying so in its summary. Free some space, or set
    `recompress_reclaim = full` so replicas replace byte copies instead of adding
    to them. See "The cache is filling my disk".
 
@@ -212,7 +213,13 @@ If replicas exist but you see no speedup, coverage is probably partial — see
 the recompression section of the User Guide: unreplicated files pace the loop,
 so finish with an explicit `ucache recompress`.
 
-## `failed` vs `incomplete` vs `deferred` in `recompress.log`
+**Files an older uCache left in the cache directory.** `recompress.pending`,
+`recompress.working` and `recompress.log` belonged to the background worker that
+uCache 1.2.0 and earlier ran; nothing reads them now. `ucache recompress` removes
+the first two (it scans the whole cache, so it covers every file they listed);
+`recompress.log` is safe to delete.
+
+## `failed` vs `incomplete` vs `deferred` in `ucache recompress` output
 
 Only `failed` means something is wrong. The others are ordinary states with
 their own words, because conflating them made healthy runs look broken:
@@ -221,8 +228,8 @@ their own words, because conflating them made healthy runs look broken:
   could not vouch for: not fetched yet, or reclaimed while the build was running.
   It retries for free on the next pass and needs no action. The message reads
   `not built yet, will retry`.
-- **`deferred (no space)`** — no headroom above the eviction floor; the entry
-  stays queued for a pass that has room. See cause 3 above.
+- **`deferred (no space)`** — no headroom above the eviction floor; the file is
+  left for a later `ucache recompress` once there is room. See cause 3 above.
 - **`declined (source codec …)`** — working as configured; see cause 1 above.
 - **`failed`** — a real build failure: a malformed file, a cache entry whose
   bytes no longer match their checksum (the message then points at
@@ -231,7 +238,7 @@ their own words, because conflating them made healthy runs look broken:
   is only ever served after it has been verified. Confirm serving is clean with
   `ucache stats` — `crc_failures 0`, `failopen_events 0`, `validations_failed 0`.
   If failures persist for the same file and coverage never completes, report it
-  with the branch name from the log.
+  with the branch name from the sweep's output.
 
 ## Corruption / CRC
 

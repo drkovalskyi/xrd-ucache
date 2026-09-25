@@ -1,9 +1,13 @@
 #include "Config.h"
+#include "Log.h"
 
 #include "TestUtil.h"
 #include <cstdlib>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <iterator>
+#include <map>
+#include <sys/stat.h>
 
 using namespace ucache;
 
@@ -15,6 +19,9 @@ struct EnvGuard {
   ~EnvGuard() {
     for (const auto& k : Config::knownKeys())
       ::unsetenv(k.envName);
+    for (const auto& r : Config::retiredKeys())
+      if (r.envName)
+        ::unsetenv(r.envName);
   }
 };
 } // namespace
@@ -280,6 +287,69 @@ TEST(Config, StateSettableVocabulary) {
   EXPECT_FALSE(Config::stateSettable("dir"));           // lives outside the state file
   EXPECT_FALSE(Config::stateSettable("no_such_key"));   // typo protection
   EXPECT_FALSE(Config::stateSettable("recompress_min_share")); // retired key
+}
+
+namespace {
+std::string slurp(const std::string& path) {
+  std::ifstream in(path);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+size_t countOf(const std::string& hay, const std::string& needle) {
+  size_t n = 0;
+  for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+    ++n;
+  return n;
+}
+} // namespace
+
+// A setting that no longer exists is named, with its reason, wherever it is
+// still set — never reported as a typo, never recorded as a source, never
+// offered by `ucache set`.
+TEST(Config, RetiredDrainJobsKeyIsNamed) {
+  EnvGuard g;
+  test::TempDir td;
+  const std::string log = td.path() + "/log.txt";
+  Log::configure("warn:" + log);
+  const std::string cache = td.path() + "/cache";
+  ::mkdir(cache.c_str(), 0755);
+  std::ofstream(Config::statePath(cache)) << "recompress_drain_jobs = 4\n";
+  std::map<std::string, std::string> conf = {{"dir", cache}, {"recompress_drain_jobs", "4"}};
+  ::setenv("UCACHE_RECOMPRESS_DRAIN_JOBS", "4", 1);
+  Config c = Config::fromEnv(&conf);
+  Log::configure("warn");
+  const std::string all = slurp(log);
+  EXPECT_NE(all.find("ucache.conf: 'recompress_drain_jobs' is no longer a setting"),
+            std::string::npos)
+      << all;
+  EXPECT_NE(all.find("state: 'recompress_drain_jobs' is no longer a setting"), std::string::npos);
+  EXPECT_NE(all.find("`ucache unset recompress_drain_jobs` removes it"), std::string::npos);
+  EXPECT_NE(all.find("background recompression worker"), std::string::npos); // the reason
+  EXPECT_EQ(countOf(all, "UCACHE_RECOMPRESS_DRAIN_JOBS is no longer used"), 1u);
+  EXPECT_EQ(all.find("unknown key"), std::string::npos); // named, not a typo
+  EXPECT_EQ(c.sources.count("recompress_drain_jobs"), 0u);
+  EXPECT_FALSE(Config::stateSettable("recompress_drain_jobs"));
+  for (const auto& k : Config::knownKeys())
+    EXPECT_STRNE(k.key, "recompress_drain_jobs");
+  EXPECT_NE(Config::retiredReason("recompress_drain_jobs"), nullptr);
+  EXPECT_EQ(Config::retiredReason("recompress"), nullptr); // a live key is not retired
+}
+
+// The helper override has no key at all: only the environment can carry it, so
+// the environment layer names it — once per process, however often the
+// settings are loaded.
+TEST(Config, RetiredHelperEnvIsNamedOnce) {
+  EnvGuard g;
+  test::TempDir td;
+  const std::string log = td.path() + "/log.txt";
+  Log::configure("warn:" + log);
+  ::setenv("UCACHE_RECOMPRESS_HELPER", "/x/ucache", 1);
+  Config::fromEnv();
+  Config::fromEnv();
+  Log::configure("warn");
+  const std::string all = slurp(log);
+  EXPECT_EQ(countOf(all, "UCACHE_RECOMPRESS_HELPER is no longer used"), 1u) << all;
+  EXPECT_NE(all.find("background recompression worker"), std::string::npos);
+  EXPECT_NE(Config::retiredReason("UCACHE_RECOMPRESS_HELPER"), nullptr);
 }
 
 TEST(Config, ValidPageSize) {

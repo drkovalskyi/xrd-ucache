@@ -44,7 +44,7 @@ entries   : 1 (0 pinned)
 original  : 2.5 GiB (total size of the cached files at the origin)
 cached    : 450.3 MiB — 17.6% of the original bytes (median file: 17.6%)
 disk used : 450.3 MiB (450.3 MiB cached bytes + 0 B recompressed)
-recompressed: none — `ucache set recompress on` for automatic background builds, …
+recompressed: none — `ucache set recompress on` for replicas created as your jobs read files, …
 stats across 1 process file(s):
   opens              1
   hit_bytes          45632 (44.6 KiB)
@@ -374,27 +374,29 @@ trigger LRU eviction *mid-sweep* — which can evict the very data your next run
 needs and turn a warm loop into an origin-refetch storm. `ucache recompress`
 therefore checks headroom **per file, against live free space**, and defers any
 build that would not fit rather than evicting around it; deferred files are
-queued for a later pass and counted in the summary as `deferred (no space)`. It
-also prints its up-front estimate, which is advisory: at a flat 1.4× it is an
-upper bound on every case measured, so treating it as a verdict refused sweeps
-that would have fit. Check where you stand any time with the
-`headroom` line in `ucache status`.
+left for a later `ucache recompress` and counted in the summary as
+`deferred (no space)`. It also prints its up-front estimate, which is advisory:
+at a flat 1.4× it is an upper bound on every case measured, so treating it as a
+verdict refused sweeps that would have fit. Check where you stand any time with
+the `headroom` line in `ucache status`.
 
-**Background recompression never evicts.** With `recompress = on` the builds
-run in a detached worker while your job is reading, so there is nobody to ask:
-that worker checks each file against the same headroom and simply declines the
-ones that would not fit, leaving them queued for a later pass — one that has
-room because you freed some, or because `recompress_reclaim = full` handed a
-byte copy back. It records what it deferred, and why, in
-`<cache dir>/recompress.log`. So `recompress = on` cannot be the reason a
-volume crosses its free-disk floor; if you want the coverage that a tight volume
-will not give you, free space first and then run `ucache recompress` explicitly.
+**Replicas made on the first pass are cached like any other data.** With
+`recompress = on` a job's first pass keeps the records it converts in the
+cache: they count against the same budget, a batch that does not fit starts an
+eviction pass the way a fill does, and what still does not fit above the
+free-space floor is not kept (the job that read it was served it; a later read
+converts it again, and `ucache stats` counts it as `cold_replica_declined`).
+With `recompress_keep_originals` off, the default, a converted record replaces
+the byte-cache copy of its basket rather than adding to it. So on a tight
+volume the first pass can evict least-recently-used entries, as any fill can;
+if you want the coverage without that, free space first, or leave recompression
+off and run `ucache recompress`, which defers rather than evicts.
 
-One exception, stated plainly: the check is against the **free-disk floor**. If
-you cap the cache with `max_bytes` and set no `min_free_bytes`, eviction runs on
-the byte cap instead, which this check cannot see — background builds are then
-ungoverned, and the worker says so once in its log. Set `min_free_bytes` as well
-if you want background recompression bounded on such a cache.
+One exception, stated plainly: the sweep's check is against the **free-disk
+floor**. If you cap the cache with `max_bytes` and set no `min_free_bytes`,
+eviction runs on the byte cap instead, which this check cannot see — a sweep is
+then bounded only by the cap's own eviction. Set `min_free_bytes` as well if you
+want a sweep to defer rather than evict on such a cache.
 
 With `recompress_reclaim = full`, every pass that builds or finds a valid
 replica drops that entry's **entire** byte-cache copy (holes are punched, so

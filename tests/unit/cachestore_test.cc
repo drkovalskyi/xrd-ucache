@@ -1212,9 +1212,11 @@ TEST(CacheStore, ASlotStoreIsRecompressedOnlyOnceItHoldsRecords) {
   auto ea = find(a);
   EXPECT_GT(ea.replicaBytes, 20000u); // header + layout: real space
   EXPECT_FALSE(ea.replicated);        // ... and nothing recompressed yet
+  EXPECT_FALSE(ea.slotDeclined);      // a store with a layout was not declined
   auto ed = find(d);
   EXPECT_EQ(ed.replicaBytes, 0u); // DECLINED: one header, nothing in it
   EXPECT_FALSE(ed.replicated);
+  EXPECT_TRUE(ed.slotDeclined); // `status` names these: only a sweep builds them
 
   std::vector<SlotRecord> recs(1);
   recs[0].slot = 3;

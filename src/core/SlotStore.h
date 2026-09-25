@@ -103,6 +103,11 @@ class SlotStore {
   // DECLINED)? Reads only the header.
   static bool serving(IOBackend& io, const std::string& objectDir, const std::string& hashHex);
 
+  // Is there a serving store that has recompressed something: one that runs
+  // past its layout (only commit blocks lie there)? A store with its layout and
+  // no records takes space and has converted nothing. Reads only the header.
+  static bool holdsRecords(IOBackend& io, const std::string& objectDir, const std::string& hashHex);
+
   // Remove the store. Processes that still have it open keep reading it;
   // their commits are refused.
   static void drop(IOBackend& io, const std::string& objectDir, const std::string& hashHex);

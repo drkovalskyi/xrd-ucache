@@ -108,6 +108,10 @@ class CacheStore {
     // A replica serves: a compact overlay, or a slot store holding records (a
     // store with only its layout takes space, and has recompressed nothing).
     bool replicated = false;
+    // The file's first-pass layout was DECLINED (a slot store holding only its
+    // header): it is served from the byte cache, and only `ucache recompress`
+    // can give it a replica.
+    bool slotDeclined = false;
     uint64_t atime = 0;
     double coverage = 0.0;   // fraction of the file present in cache [0,1]
     bool pinned = false;
@@ -245,6 +249,7 @@ class CacheStore {
     uint64_t atime = 0, cachedBytes = 0;
     uint64_t replicaBytes = 0; // .tdata + .slots size (0 = none) — evicted with the entry
     bool replicated = false;   // see EntryInfo::replicated
+    bool slotDeclined = false; // see EntryInfo::slotDeclined
     double coverage = 0.0;     // fraction of pages present [0,1]
     uint8_t artifacts = 0;     // kArt* bits present in the shard listing
     bool pinned = false;

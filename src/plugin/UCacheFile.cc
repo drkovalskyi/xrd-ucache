@@ -6,7 +6,6 @@
 #include "ColdRun.h"
 #endif
 
-#include "HelperPath.h"
 #include "Executor.h"
 #include "Log.h"
 #include "OpenRetry.h"
@@ -21,10 +20,8 @@
 #include <XProtocol/XProtocol.hh> // kXR_* wire codes for the OpenRetry drift asserts
 
 #include <cstdio>
-#include <spawn.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-extern char** environ; // POSIX (glibc: not declared without _GNU_SOURCE)
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -32,7 +29,6 @@ extern char** environ; // POSIX (glibc: not declared without _GNU_SOURCE)
 #include <ctime>
 #include <fcntl.h>
 #include <algorithm>
-#include <dirent.h>
 #include <thread>
 
 namespace ucache {
@@ -1621,124 +1617,6 @@ uint64_t UCacheFile::shownSize() const {
 }
 
 
-// ---- Background recompression trigger (recompress = on) -------------------
-// At Close, an entry with cached data and no replica gets its URL appended to
-// <dir>/recompress.pending, and a nice'd drainer helper (`ucache recompress
-// --drain`) is spawned, rate-limited per process. The helper is our own CLI:
-// found via UCACHE_RECOMPRESS_HELPER (tests) or PATH.
-// Runs on the executor, never on the Close path itself.
-// Background transcode jobs: min(cores/2, threads/2), overridable.
-// `threads` is this process's own thread count -- /proc/self/task on Linux,
-// where the analysis's worker pool is visible. Without that we can only see the
-// machine, and a 4-thread job on a 384-thread host would size itself as if it
-// owned the box. Falls back to the core count where /proc is absent.
-int drainJobs(const Config& cfg) {
-  if (cfg.recompressDrainJobs > 0)
-    return cfg.recompressDrainJobs; // explicit override wins, including "1"
-  unsigned cores = std::thread::hardware_concurrency();
-  if (cores == 0)
-    cores = 2;
-  unsigned threads = cores;
-#ifdef __linux__
-  if (DIR* d = ::opendir("/proc/self/task")) {
-    unsigned n = 0;
-    while (struct dirent* e = ::readdir(d))
-      if (e->d_name[0] != '.')
-        ++n;
-    ::closedir(d);
-    if (n > 0)
-      threads = n;
-  }
-#endif
-  unsigned jobs = std::min(cores / 2, threads / 2);
-  return static_cast<int>(jobs < 1 ? 1 : jobs);
-}
-
-void queueRecompress(const std::string& url, const Config& cfg) {
-  auto key = UrlKey::parse(url, cfg.keepCgi);
-  if (!key)
-    return;
-  // No helper, no queueing: nothing in this process could ever drain the queue,
-  // so appending to it would only grow a file nobody reads. An explicit
-  // `ucache recompress` does not read the queue either — it scans the cache — so
-  // no work is lost by declining to record it. Warn once, with the remedy.
-  static std::atomic<bool> warned{false};
-  // Resolved once per process, and the path is deliberately LEAKED. This runs on
-  // the executor, so it can run while the process is tearing down — after a
-  // destructible static would have been destroyed. argv[0] points into this
-  // string, and a dangling argv[0] makes the exec fail in a detached child that
-  // nobody waits for: silently, which is the exact failure the check below
-  // exists to report. Same rule as the other cross-shutdown singletons here.
-  static std::string* helperExe = new std::string();
-  static const bool haveHelper = recompressHelperResolvable(*helperExe);
-  if (!haveHelper) {
-    if (!warned.exchange(true))
-      UCACHE_WARN("recompress is on but the `ucache` helper is not executable "
-                  "(%s): no replicas will be built in the background. Put ucache on PATH, "
-                  "or set UCACHE_RECOMPRESS_HELPER to its full path. "
-                  "`ucache recompress` still works by hand.",
-                  helperExe->c_str());
-    return;
-  }
-  struct ::stat st;
-  if (::stat(ReplicaStore::tmetaPath(*key, cfg.cacheDir).c_str(), &st) == 0)
-    return; // replica already exists
-  if (::stat((key->objectDir(cfg.cacheDir) + "/" + key->hashHex + ".meta").c_str(), &st) != 0)
-    return; // nothing cached — nothing to recompress
-  const std::string pending = cfg.cacheDir + "/recompress.pending";
-  int fd = ::open(pending.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
-  if (fd < 0)
-    return;
-  std::string line = url + "\n";
-  ssize_t r = ::write(fd, line.data(), line.size()); // O_APPEND: atomic line
-  (void)r;
-  ::close(fd);
-
-  // Spawn the drainer at most every 15 s per process; the drainer's own flock
-  // makes concurrent spawns harmless (they exit immediately).
-  static std::atomic<uint64_t> lastSpawn{0};
-  uint64_t now = nowUs();
-  uint64_t prev = lastSpawn.load(std::memory_order_relaxed);
-  if (prev && now - prev < 15'000'000)
-    return;
-  if (!lastSpawn.compare_exchange_strong(prev, now))
-    return;
-  const std::string& exe = *helperExe; // resolved and checked above; outlives exit
-  pid_t pid = 0;
-  // How many transcodes the background drainer may run. A fixed two was far too
-  // few at scale: measured on a 1456-file dataset it reached only 8-18% coverage
-  // by the end of the fill pass, pushing the remainder into a ~400 s foreground
-  // sweep -- the "build it while you work" model barely functioning.
-  //
-  // A fill pass is origin-bound, not CPU-bound: sampling a 384-thread host
-  // during remote-read legs showed only 12-20 threads running. So roughly half
-  // the thread budget is genuinely idle exactly when replicas need building,
-  // and that is what we claim: min(cores/2, threads/2), where `threads` is THIS
-  // process's own thread count (the analysis we are running inside).
-  // Deliberately a share of the caller, not of the machine -- a small job on a
-  // big host must not spawn a machine-sized drainer.
-  const std::string jobsArg = std::to_string(drainJobs(cfg));
-  const char* argv[] = {exe.c_str(), "recompress", "--drain",
-                        "--jobs", jobsArg.c_str(), nullptr};
-  // Fully detach the drainer from the user's terminal: stdin from
-  // /dev/null, stdout+stderr appended to recompress.log — a background worker
-  // must never print onto whatever the user is doing. Spawn proceeds without
-  // the redirections only if file_actions setup itself fails (fail-open).
-  posix_spawn_file_actions_t fa;
-  bool haveFa = ::posix_spawn_file_actions_init(&fa) == 0;
-  if (haveFa) {
-    const std::string log = cfg.cacheDir + "/recompress.log";
-    ::posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-    ::posix_spawn_file_actions_addopen(&fa, 1, log.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
-    ::posix_spawn_file_actions_adddup2(&fa, 1, 2);
-  }
-  if (::posix_spawnp(&pid, exe.c_str(), haveFa ? &fa : nullptr, nullptr,
-                     const_cast<char**>(argv), environ) == 0)
-    UCACHE_INFO("recompress: queued %s; drainer pid %d", url.c_str(), static_cast<int>(pid));
-  if (haveFa)
-    ::posix_spawn_file_actions_destroy(&fa);
-}
-
 XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeout timeout) {
   // Wait for queued page persists before flushing meta, so the cache is
   // complete on disk when the process (which may exit right after Close)
@@ -1755,7 +1633,7 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
     cold.swap(st_->cold);
   }
 #ifdef UCACHE_HAVE_COLDRUN
-  coldDetach(cold); // the process's last handle on the file publishes its replica
+  coldDetach(cold); // the process's last handle on the file commits what it converted
 #endif
 #ifdef UCACHE_HAVE_PREFETCH
   if (globalConfig().prefetch && st_->prefetchSeen.load(std::memory_order_acquire))
@@ -1764,9 +1642,8 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
   if (e)
     e->flushAll(); // synchronous: staged pages + bitmap must hit disk before we may exit
   emitRelayObs(st_, e);
-  // Background recompression: a closed entry's read set is complete —
-  // queue it for the drainer. Off the Close path (executor task); captures
-  // only values, never the plugin object.
+  // CPU-span evidence for the closed entry (the .cost sidecar). Off the Close
+  // path (executor task); captures only values, never the plugin object.
   if (gOpenUCacheHandles.fetch_sub(1) > 1)
     st_->cpuBlended = true; // handles still open: the tail of this span overlaps
   if (e && st_->cpu0Us) {
@@ -1775,10 +1652,6 @@ XrdCl::XRootDStatus UCacheFile::Close(ResponseHandler* handler, ucache::XrdTimeo
     bool blended = st_->cpuBlended;
     Executor::instance().post(
         [url, cpu, blended] { writeCostSidecar(url, globalConfig(), cpu, blended); });
-  }
-  if (e && !v && !cold && globalConfig().recompress) {
-    std::string url = st_->url;
-    Executor::instance().post([url] { queueRecompress(url, globalConfig()); });
   }
   // Read-ahead's own vector reads may still be on the origin. XrdCl answers a
   // Close with requests in flight errInvalidOp, and the application then

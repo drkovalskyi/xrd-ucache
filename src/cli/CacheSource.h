@@ -41,11 +41,15 @@ struct CacheSource : transpose::Source {
   int fd = -1;
   const MetaData* meta = nullptr;
   // Set when a page that the bitmap says IS present failed its checksum: the
-  // bytes rotted (or were punched by something that did not clear the bit).
-  // Distinct from "not cached yet", because it does not heal by waiting — the
-  // serving path demotes such a page on read, a build cannot, so a caller that
-  // reported it as "will retry" would retry forever.
+  // bytes rotted -- or were released after the bitmap was loaded (a first pass
+  // that converted them clears the bit, stores the sidecar, then punches). The
+  // caller tells the two apart by reloading the sidecar and looking at
+  // `rotPage`: released pages are no longer marked present, and heal on the
+  // next pass; rot does not heal by waiting -- the serving path demotes such a
+  // page on read, a build cannot, so reporting it as "will retry" would retry
+  // forever.
   bool sawRot = false;
+  uint64_t rotPage = ~0ull; // the first page that failed, when sawRot
 
   // A range is usable only if every page it touches is marked present. The
   // caller's own coverage check runs earlier and over the same bitmap; this is
@@ -88,6 +92,8 @@ struct CacheSource : transpose::Source {
       const uint32_t nb = meta->pageBytes(i);
       const uint8_t* p = buf_.data() + (i * static_cast<uint64_t>(P) - base);
       if (crc32c(p, nb) != meta->pageCrcs[i]) {
+        if (!sawRot)
+          rotPage = i;
         sawRot = true;
         return false;
       }

@@ -338,25 +338,15 @@ void CacheStore::scanShard(const std::string& objRoot, const std::string& shard,
     // A slot store's size is the space it takes (a store marked DECLINED is
     // one header long and holds nothing). It has recompressed something once
     // it runs past its layout: only commit blocks lie there.
-    if ((s.artifacts & kArtSlots) &&
-        io_.stat(objRoot + "/" + shard + "/" + stem + ".slots", &tst) == 0 &&
-        static_cast<uint64_t>(tst.st_size) > SlotStore::kHeaderBytes) {
+    const bool haveSlots = (s.artifacts & kArtSlots) &&
+                           io_.stat(objRoot + "/" + shard + "/" + stem + ".slots", &tst) == 0;
+    if (haveSlots && static_cast<uint64_t>(tst.st_size) == SlotStore::kHeaderBytes)
+      s.slotDeclined = true; // a store with a layout is longer than its header
+    if (haveSlots && static_cast<uint64_t>(tst.st_size) > SlotStore::kHeaderBytes) {
       const uint64_t size = static_cast<uint64_t>(tst.st_size);
       s.replicaBytes += size;
-      if (replicated && !s.replicated) {
-        const std::string sp = objRoot + "/" + shard + "/" + stem + ".slots";
-        std::vector<uint8_t> hb(SlotStore::kHeaderBytes);
-        SlotStoreHeader h;
-        if (int fd = io_.open(sp, O_RDONLY, 0); fd >= 0) {
-          if (io_.preadFull(fd, hb.data(), hb.size(), 0) == static_cast<int64_t>(hb.size()) &&
-              decodeSlotHeader(hb.data(), hb.size(), h) && !h.declined) {
-            const uint64_t layoutEnd = (SlotStore::kHeaderBytes + h.blobLen + SlotStore::kAlign - 1) /
-                                       SlotStore::kAlign * SlotStore::kAlign;
-            s.replicated = size > layoutEnd;
-          }
-          io_.close(fd);
-        }
-      }
+      if (replicated && !s.replicated)
+        s.replicated = SlotStore::holdsRecords(io_, objRoot + "/" + shard, stem);
     }
     out.push_back(std::move(s));
   }
@@ -416,6 +406,7 @@ std::vector<CacheStore::EntryInfo> CacheStore::listEntries() {
     e.cachedBytes = s.cachedBytes;
     e.replicaBytes = s.replicaBytes;
     e.replicated = s.replicated;
+    e.slotDeclined = s.slotDeclined;
     e.atime = s.atime;
     e.coverage = s.coverage;
     e.pinned = s.pinned;

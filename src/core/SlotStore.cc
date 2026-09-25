@@ -270,6 +270,24 @@ bool SlotStore::serving(IOBackend& io, const std::string& objectDir, const std::
   return ok;
 }
 
+bool SlotStore::holdsRecords(IOBackend& io, const std::string& objectDir,
+                             const std::string& hashHex) {
+  int fd = io.open(path(objectDir, hashHex), O_RDONLY | O_CLOEXEC, 0);
+  if (fd < 0)
+    return false;
+  std::vector<uint8_t> b(kHeaderBytes);
+  SlotStoreHeader h;
+  struct ::stat st;
+  bool ok = io.preadFull(fd, b.data(), b.size(), 0) == static_cast<int64_t>(b.size()) &&
+            decodeSlotHeader(b.data(), b.size(), h) && !h.declined && io.fstat(fd, &st) == 0;
+  if (ok) {
+    const uint64_t layoutEnd = (kHeaderBytes + h.blobLen + kAlign - 1) / kAlign * kAlign;
+    ok = static_cast<uint64_t>(st.st_size) > layoutEnd;
+  }
+  io.close(fd);
+  return ok;
+}
+
 void SlotStore::drop(IOBackend& io, const std::string& objectDir, const std::string& hashHex) {
   io.unlink(path(objectDir, hashHex));
 }

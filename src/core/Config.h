@@ -143,12 +143,14 @@ struct Config {
   bool transpose = true;                  // `transpose` / UCACHE_TRANSPOSE=0/off/
                                           // false: never serve replica views
                                           // (replica-tier kill switch)
-  // Background recompression: ONE switch.
-  // `recompress = on` => files the user's jobs actually read are queued at
-  // close and transcoded by a detached background drainer, no questions asked
-  // (off by default — opt-in CPU/disk; the user flipping the switch IS the
-  // worth-it decision). `recompress_codecs` = which SOURCE codecs qualify
-  // (static fact from basket headers). The default lists the two codecs that
+  // Recompression: ONE switch.
+  // `recompress = on` => a file with no replica gets one on its first pass,
+  // converted as the job reads it (off by default — opt-in CPU/disk; the user
+  // flipping the switch IS the worth-it decision). A file whose layout that
+  // pass declines, and data cached earlier that no job reads again, get one
+  // only from an explicit `ucache recompress`. `recompress_codecs` = which
+  // SOURCE codecs qualify (static fact from basket headers). The default lists
+  // the two codecs that
   // are expensive to decode and are what stored physics data actually uses;
   // lz4 and zstd already decode cheaply, so transcoding them to ZSTD-1 would
   // spend disk to buy nothing.
@@ -170,11 +172,6 @@ struct Config {
   // demand (fail-open). For space-tight replica-primary setups.
   enum class Reclaim { kSuperseded, kFull };
   Reclaim recompressReclaim = Reclaim::kSuperseded; // UCACHE_RECOMPRESS_RECLAIM
-  // Background transcode jobs during a fill pass. 0 = auto, which is
-  // min(cores/2, threads/2) of the process doing the reading; a fixed small
-  // number reached only 8-18% coverage on a large dataset, and the right share
-  // depends on how much of the machine the analysis is actually using.
-  int recompressDrainJobs = 0;                   // UCACHE_RECOMPRESS_DRAIN_JOBS
   // `trace = io` writes a sampled per-operation JSON trace
   // next to the process's stats file; `trace_sample = N` records every Nth
   // read-class op (1 = everything). Off ("") by default — zero cost.
@@ -216,6 +213,19 @@ struct Config {
     const char* envName;
   };
   static const std::vector<KeyInfo>& knownKeys();
+  // Settings that no longer exist, kept so that one still set somewhere is
+  // named with the reason instead of being reported as a typo. `key` is null
+  // for an environment-only name, `envName` null for a file-only key. Every
+  // layer consults the same table: the conf and state files and `ucache set`
+  // by key, the environment by name (warned once per process).
+  struct RetiredKey {
+    const char* key;
+    const char* envName;
+    const char* reason;
+  };
+  static const std::vector<RetiredKey>& retiredKeys();
+  // The reason a key or environment name was retired, or null if it was not.
+  static const char* retiredReason(const std::string& keyOrEnv);
   // Keys `ucache set` may write into the state file: any known key except
   // `dir` (the state file lives INSIDE the cache dir — bootstrap order).
   static bool stateSettable(const std::string& key);

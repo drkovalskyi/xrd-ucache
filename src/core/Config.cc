@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <set>
 #include <sstream>
 
 namespace ucache {
@@ -192,16 +194,6 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompressKeepOriginals = truthy(v);
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
-  else if (k == "recompress_drain_jobs") {
-    // 0 (or unset) = auto: min(cores/2, threads/2) of the reading process.
-    long n = std::strtol(v.c_str(), nullptr, 10);
-    if (n < 0) {
-      UCACHE_WARN("%s: recompress_drain_jobs '%s' must be >= 0 (0 = auto); ignored", src,
-                  v.c_str());
-      return false;
-    }
-    c.recompressDrainJobs = static_cast<int>(n);
-  }
   else if (k == "recompress_reclaim") {
     if (v == "superseded")
       c.recompressReclaim = Config::Reclaim::kSuperseded;
@@ -233,7 +225,16 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     Log::configure(v.c_str());
   else if (pluginConf && (k == "url" || k == "lib" || k == "enable"))
     return false; // XrdCl's own plugin keys — not ours, no warning
-  else {
+  else if (const char* why = Config::retiredReason(k)) {
+    // Named, not "unknown": the user set it on purpose once, and deserves to
+    // hear why it stopped doing anything. No source is recorded.
+    const std::string remedy = std::strcmp(src, "state") == 0
+                                   ? "`ucache unset " + k + "` removes it"
+                                   : std::string("delete it from the file");
+    UCACHE_WARN("%s: '%s' is no longer a setting: it %s; ignored — %s", src, k.c_str(), why,
+                remedy.c_str());
+    return false;
+  } else {
     UCACHE_WARN("%s: unknown key '%s' ignored", src, k.c_str());
     return false;
   }
@@ -279,6 +280,22 @@ void applyEnvLayer(Config& c, bool& explicitMax) {
       continue;
     if (applyKey(c, spec.key, v, explicitMax, spec.envName, /*pluginConf=*/false))
       c.sources[spec.key] = "env";
+  }
+  // A retired name is never applied, and the loop above passes over it in
+  // silence (it visits only the live vocabulary). Say so once per process: the
+  // settings are loaded again by some commands, and a job's log should carry
+  // the line once, not once per load. After the loop, so that UCACHE_LOG
+  // governs these lines too. Leaked, like the plugin's other statics: config
+  // can be loaded while the process is exiting.
+  static auto* mu = new std::mutex;
+  static auto* warned = new std::set<std::string>;
+  for (const auto& r : Config::retiredKeys()) {
+    const char* v = r.envName ? env(r.envName) : nullptr;
+    if (!v || !*v)
+      continue;
+    std::lock_guard<std::mutex> g(*mu);
+    if (warned->insert(r.envName).second)
+      UCACHE_WARN("%s is no longer used: it %s; ignored — unset it", r.envName, r.reason);
   }
 }
 
@@ -379,7 +396,6 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
-      {"recompress_drain_jobs", "UCACHE_RECOMPRESS_DRAIN_JOBS"},
       {"trace", "UCACHE_TRACE"},
       {"trace_sample", "UCACHE_TRACE_SAMPLE"},
       {"keep_cgi", "UCACHE_KEEP_CGI"},
@@ -388,6 +404,26 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"log", "UCACHE_LOG"},
   };
   return kKeys;
+}
+
+const std::vector<Config::RetiredKey>& Config::retiredKeys() {
+  static const std::vector<RetiredKey> kRetired = {
+      {"recompress_drain_jobs", "UCACHE_RECOMPRESS_DRAIN_JOBS",
+       "sized the background recompression worker, which no longer exists (a file's replica is "
+       "created as a job first reads it, and `ucache recompress` builds what is already cached)"},
+      {nullptr, "UCACHE_RECOMPRESS_HELPER",
+       "named the program the background recompression worker ran as, and that worker no longer "
+       "exists (a file's replica is created as a job first reads it, and `ucache recompress` "
+       "builds what is already cached)"},
+  };
+  return kRetired;
+}
+
+const char* Config::retiredReason(const std::string& keyOrEnv) {
+  for (const auto& r : retiredKeys())
+    if ((r.key && keyOrEnv == r.key) || (r.envName && keyOrEnv == r.envName))
+      return r.reason;
+  return nullptr;
 }
 
 bool Config::stateSettable(const std::string& key) {
@@ -484,8 +520,6 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(recompress);
   if (key == "recompress_keep_originals")
     return onoff(recompressKeepOriginals);
-  if (key == "recompress_drain_jobs")
-    return std::to_string(recompressDrainJobs);
   if (key == "recompress_codecs")
     return join(recompressCodecs);
   if (key == "recompress_reclaim")

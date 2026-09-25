@@ -809,18 +809,24 @@ converts it again), and `ucache stats` counts it as not kept.
 file that has one keeps being served from it, and what a job reads of it for
 the first time is still converted.
 
-A file the first pass cannot lay out (an unusual structure; the log says why)
-is still recompressed by a detached, nice'd background worker after your job
-closes it (log: `<cache-dir>/recompress.log`; totals: `ucache status`).
+A file the first pass cannot recompress is served from the byte cache;
+`ucache status` counts such files on its `declined` line and `ucache doctor`
+names why. The commonest reason is the codec: a file stored in a codec that is
+not in `recompress_codecs` is left as it is, and changing the list makes the
+next read decide again. For other reasons (an unusual structure;
+`UCACHE_LOG=info` names it), an explicit `ucache recompress` may still build a
+replica.
 
 `ucache recompress` runs one foreground sweep, with live progress, over what is
 already in the byte cache: you need it only for data cached before
-recompression was switched on and never read since. Check where you stand with
-`ucache status` (the `recompressed:` line) or per file with `ucache ls` (the
-`RECOMP` column). The sweep's own summary gives each outcome its own words —
+recompression was switched on and never read since, and for files the first
+pass declined. Check where you stand with `ucache status` (the `recompressed:`
+line) or per file with `ucache ls` (the `RECOMP` column). The sweep's own
+summary gives each outcome its own words —
 `recompressed`, `declined` (with the codec it found and the one-line fix),
-`already recompressed`, `incomplete`, `failed` — and background passes add
-`deferred` when they decline for want of disk space.
+`already recompressed`, `incomplete`, `failed`, and `deferred (no space)` for
+files that would not fit above the free-space floor (run it again once there
+is room).
 `ucache doctor` will tell you why nothing is being built if that is what you are
 seeing (see Troubleshooting).
 
