@@ -1,0 +1,38 @@
+# uCache configuration -- the one file uCache needs.
+#
+# It belongs in YOUR account: ~/.xrootd/client.plugins.d/ucache.conf. uCache is
+# a per-user cache and is never switched on for a whole machine. Set `dir`
+# below, then check with `ucache doctor`. `ucache setup --dir <path>` writes
+# this same file for you, with the plugin's path filled in for your install.
+# Every setting, and the UCACHE_* environment variable that overrides it for
+# one job, is in the user guide (USER_GUIDE.md, "Configuration").
+
+# Which servers' files go through the cache ("*" = all), and the plugin. The
+# copy the package ships names the RPM's plugin (/usr/lib64); from any other
+# install `lib` must name yours -- `ucache setup` writes it for you.
+url = {{URL}}
+lib = {{LIB}}
+enable = true
+
+# REQUIRED: the cache directory, on a LOCAL disk (not AFS, NFS or EOS). There
+# is deliberately no default.
+dir = {{DIR}}
+
+# Recompression is OFF by default: the cache keeps the bytes the origin sent.
+# With it on, a ROOT file read for the first time is converted, as it is read,
+# into a form that is faster to decode -- no separate step.
+#
+# MEMORY: with it on, a job holds more memory while it reads. On the analyses
+# measured, warm passes needed about 1.9x (TTree) and 2.3x (RNTuple) the memory
+# the same job needs from a replica made by `ucache recompress`. If your jobs
+# run short of memory, leave it off and build replicas with `ucache recompress`
+# instead. Turning it off later does not change files already recompressed
+# this way: remove those first (`ucache untranspose <url>`, or `ucache clear`).
+# recompress = on
+#
+# TTree files only: each basket gets room for this many times its stored size
+# (fractions allowed, 1 to 10). ROOT sizes its read buffers from that room, so
+# less needs less memory, and leaves more baskets in their original codec.
+# Applies to files that get their replica after a change; a file that has one
+# keeps its own.
+# recompress_slot_factor = 3

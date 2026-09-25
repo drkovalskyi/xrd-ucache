@@ -131,6 +131,33 @@ TEST(Config, MaxReadFraction) {
   }
 }
 
+// recompress_slot_factor: any number from 1 to 10, kept in hundredths, and
+// reported the way it was written.
+TEST(Config, RecompressSlotFactor) {
+  EnvGuard g;
+  {
+    Config c = Config::fromEnv();
+    EXPECT_EQ(c.recompressSlotFactor100, 300u);
+    EXPECT_EQ(c.valueOf("recompress_slot_factor"), "3");
+  }
+  const std::pair<const char*, std::pair<uint32_t, const char*>> good[] = {
+      {"2.5", {250, "2.5"}}, {"2.75", {275, "2.75"}}, {"1", {100, "1"}}, {"10", {1000, "10"}},
+      {"4.0", {400, "4"}},   {"2.333", {233, "2.33"}}};
+  for (const auto& [in, want] : good) {
+    ::setenv("UCACHE_RECOMPRESS_SLOT_FACTOR", in, 1);
+    Config c = Config::fromEnv();
+    EXPECT_EQ(c.recompressSlotFactor100, want.first) << in;
+    EXPECT_EQ(c.valueOf("recompress_slot_factor"), want.second) << in;
+    EXPECT_EQ(c.sources.at("recompress_slot_factor"), "env");
+  }
+  for (const char* bad : {"0.99", "10.5", "0", "-3", "abc", "2.5x", ""}) {
+    ::setenv("UCACHE_RECOMPRESS_SLOT_FACTOR", bad, 1);
+    Config c = Config::fromEnv();
+    EXPECT_EQ(c.recompressSlotFactor100, 300u) << "'" << bad << "' is refused";
+    EXPECT_EQ(c.sources.count("recompress_slot_factor"), 0u) << "a refused value is no source";
+  }
+}
+
 // ucache settings live in the XrdCl plugin conf. Layering:
 // defaults < plugin conf < <cacheDir>/state < UCACHE_* env.
 TEST(Config, PluginConfMapLayer) {

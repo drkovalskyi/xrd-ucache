@@ -73,6 +73,15 @@ say "3. ucache setup (unprivileged; ONE conf file, nothing else touched)"
 "$PREFIX/bin/ucache" setup --host "localhost:$PORT" --dir "$CACHE" || fail "setup failed"
 test -f "$CONF_FILE" || fail "setup did not write $CONF_FILE"
 grep -q "^dir = $CACHE" "$CONF_FILE" || fail "conf lacks the explicit cache dir"
+# The recommended configuration ships beside the binaries, activates nothing,
+# and says what setup writes: the same text, bar the three lines setup fills in.
+REC="$PREFIX/share/xrd-ucache/ucache.conf"
+test -f "$REC" || fail "the recommended configuration was not installed ($REC)"
+diff <(grep -v '^url = \|^lib = \|^dir = ' "$REC") <(grep -v '^url = \|^lib = \|^dir = ' "$CONF_FILE") \
+  || fail "setup's conf and the installed recommended one differ beyond url/lib/dir"
+grep -q "^# recompress = on" "$CONF_FILE" && grep -q "MEMORY" "$CONF_FILE" \
+  || fail "the conf does not carry the recompression block and its memory note"
+grep -q "^lib = $PREFIX/lib" "$CONF_FILE" || fail "setup did not name this install's plugin"
 
 say "4. start a self-contained local xrootd origin"
 head -c 4194304 /dev/urandom > "$ORIGINDIR/probe.bin"       # 4 MiB test object

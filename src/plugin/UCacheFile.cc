@@ -1570,7 +1570,8 @@ void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<
     if (c) {
       const uint64_t mine = coldLayoutHash(*c);
       uint64_t won = 0;
-      if (noteShownLayout(key.key, ShownLayout::kSlot, mine, &won) == ShownLayout::kSlot &&
+      if (noteShownLayout(key.key, ShownLayout::kSlot, mine, &won, c.get()) ==
+              ShownLayout::kSlot &&
           won == mine) {
         cold = std::move(c);
         return;

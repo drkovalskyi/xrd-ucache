@@ -163,8 +163,9 @@ Fx fixture(int64_t fend = 70000, bool largeHeader = false, bool wideEntry = true
   return fx;
 }
 
-FillLayout layout(const Fx& fx, std::vector<std::string> codecs = {"lzma", "zlib"}, uint32_t k = 4) {
-  return layoutForFill(fx.fm, fx.fileSize, fx.header, fx.treeKeyHeader, fx.keysList, codecs, k);
+FillLayout layout(const Fx& fx, std::vector<std::string> codecs = {"lzma", "zlib"},
+                  uint32_t k100 = 400) {
+  return layoutForFill(fx.fm, fx.fileSize, fx.header, fx.treeKeyHeader, fx.keysList, codecs, k100);
 }
 
 std::vector<uint8_t> metaBlob(const FillLayout& L, const Fx& fx) {
@@ -255,6 +256,35 @@ TEST(FillLayout, SlotsAreContiguousAndSized) {
   EXPECT_EQ(L.virtualSize, at);
   EXPECT_GE(L.metaSeek + L.metaRecord.size(), L.metaSeek);
   EXPECT_LE(L.metaSeek + L.metaRecord.size(), L.slotsBegin);
+}
+
+// The factor is in hundredths: 2.5x, and a factor whose slots must be rounded
+// down to a byte. fZipBytes grows by exactly the padding, whatever the factor.
+TEST(FillLayout, FractionalSlotFactors) {
+  Fx fx = fixture();
+  const uint32_t orig[] = {1500, 2500, 900};
+  for (uint32_t k100 : {250u, 233u}) {
+    FillLayout L = layout(fx, {"lzma", "zlib"}, k100);
+    ASSERT_TRUE(L.error.empty()) << L.error;
+    ASSERT_EQ(L.slots.size(), 3u);
+    uint64_t at = L.slotsBegin;
+    int64_t b0 = 0, b2 = 0;
+    for (size_t i = 0; i < 3; ++i) {
+      const uint32_t want = orig[i] * k100 / 100; // 3750 6250 2250; 3495 5825 2097
+      EXPECT_EQ(L.slots[i].vLen, want) << k100;
+      EXPECT_EQ(L.slots[i].vSeek, at);
+      at += L.slots[i].vLen;
+      (i < 2 ? b0 : b2) += static_cast<int64_t>(want) - orig[i];
+    }
+    EXPECT_EQ(L.virtualSize, at);
+    auto blob = metaBlob(L, fx);
+    EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kB0Zip])), 4000 + b0);
+    EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kB2Zip])), 900 + b2);
+    EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kTreeZipOff])), 10000 + b0 + b2);
+  }
+  EXPECT_EQ(layout(fx, {"lzma", "zlib"}, 100).slots[0].vLen, 1500u) << "1x: the original fits";
+  EXPECT_NE(layout(fx, {"lzma", "zlib"}, 99).error.find("at least 1"), std::string::npos)
+      << "below 1x the original would not fit its own slot";
 }
 
 TEST(FillLayout, MetadataPointsAtSlotsAndScalesSizes) {
@@ -381,7 +411,7 @@ TEST(FillLayout, SlotLengthIsCappedAtInt32Max) {
   fx.fm.branches[0].basketBytes = {1500, 600000000};
   fx.fm.fend = fx.fileSize = 700000000;
   bePut32(&fx.header[12], 700000000);
-  FillLayout L = layout(fx, {"lzma"}, 4);
+  FillLayout L = layout(fx, {"lzma"}, 400);
   ASSERT_TRUE(L.error.empty()) << L.error;
   EXPECT_EQ(L.slots[1].vLen, static_cast<uint32_t>(INT32_MAX));
 }

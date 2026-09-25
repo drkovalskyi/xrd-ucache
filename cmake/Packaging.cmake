@@ -26,6 +26,21 @@ install(FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/xrd-ucache)
 
+# The recommended configuration, to COPY into a user's own
+# ~/.xrootd/client.plugins.d/ (uCache is per user: nothing the package installs
+# switches it on for anyone). Filled in with the plugin's path as the RPM
+# installs it -- CPack's RPM prefix is /usr -- and a placeholder cache
+# directory; `ucache setup` writes the same text with this install's own path.
+# scripts/package-el9.sh checks, on a staged install laid out as the RPM, that
+# the library this file names is there.
+file(READ "${PROJECT_SOURCE_DIR}/share/ucache.conf.in" _ucache_conf)
+string(REPLACE "{{URL}}" "*" _ucache_conf "${_ucache_conf}")
+string(REPLACE "{{LIB}}" "/usr/${CMAKE_INSTALL_LIBDIR}/libXrdClUCache.so" _ucache_conf "${_ucache_conf}")
+string(REPLACE "{{DIR}}" "/path/on/a/local/disk/ucache" _ucache_conf "${_ucache_conf}")
+file(WRITE "${CMAKE_BINARY_DIR}/share/ucache.conf" "${_ucache_conf}")
+install(FILES "${CMAKE_BINARY_DIR}/share/ucache.conf"
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/xrd-ucache)
+
 set(CPACK_PACKAGE_NAME "xrd-ucache")
 set(CPACK_PACKAGE_VENDOR "xrd-ucache")
 set(CPACK_PACKAGE_CONTACT "Dmytro Kovalskyi <dmytro@cern.ch>")

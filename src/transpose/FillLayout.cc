@@ -169,7 +169,7 @@ std::string codecOfSetting(int32_t compress, int32_t fileCompress) {
 FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vector<uint8_t>& header,
                          const std::vector<uint8_t>& treeKeyHeader,
                          const std::vector<uint8_t>& keysList,
-                         const std::vector<std::string>& codecs, uint32_t k) {
+                         const std::vector<std::string>& codecs, uint32_t slotFactor100) {
   FillLayout L;
   auto decline = [&](std::string why) {
     L.error = std::move(why);
@@ -181,7 +181,7 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
   };
   if (!fm.error.empty())
     return decline("parse: " + fm.error);
-  if (k < 1)
+  if (slotFactor100 < 100) // the original must fit its slot: it is what a basket falls back to
     return decline("slot factor must be at least 1");
   Header H;
   if (!parseHeader(header, H))
@@ -237,7 +237,7 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
       s.basket = static_cast<uint32_t>(i);
       s.origSeek = static_cast<uint64_t>(br.basketSeek[i]);
       s.origLen = static_cast<uint32_t>(br.basketBytes[i]);
-      const uint64_t want = static_cast<uint64_t>(s.origLen) * k;
+      const uint64_t want = static_cast<uint64_t>(s.origLen) * slotFactor100 / 100;
       s.vLen = static_cast<uint32_t>(std::min<uint64_t>(want, INT32_MAX));
       s.vSeek = at;
       at += s.vLen;

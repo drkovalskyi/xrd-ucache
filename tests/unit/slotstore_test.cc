@@ -7,10 +7,12 @@
 
 #include "IOBackend.h"
 #include "TestUtil.h"
+#include "vendor/crc32c.h"
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <map>
 #include <sys/file.h>
@@ -32,7 +34,7 @@ SlotStoreHeader hdr(uint32_t nSlots = 100) {
   SlotStoreHeader h;
   h.layoutVersion = 1;
   h.container = 0;
-  h.slotFactor = 3;
+  h.slotFactor100 = 300;
   h.codecs = "lzma,zlib";
   h.originSize = 123456;
   h.originMtime = 1700000000;
@@ -92,12 +94,28 @@ TEST(SlotStore, HeaderRoundTripsAndRejectsCorruption) {
   auto b = encodeSlotHeader(in);
   SlotStoreHeader h;
   ASSERT_TRUE(decodeSlotHeader(b.data(), b.size(), h));
-  EXPECT_EQ(h.slotFactor, 3);
+  EXPECT_EQ(h.slotFactor100, 300);
   EXPECT_EQ(h.codecs, "lzma,zlib");
   EXPECT_EQ(h.layoutHash, 0x1234567890abcdefull);
   EXPECT_EQ(h.storeId, 42u);
   EXPECT_TRUE(h.declined);
   b[70] ^= 1;
+  EXPECT_FALSE(decodeSlotHeader(b.data(), b.size(), h));
+}
+
+// A fractional factor round-trips; a header of another format version (the
+// first one kept the factor as a whole number in one byte) is not read, so a
+// new store replaces it rather than serving slots of the wrong size.
+TEST(SlotStore, TheFactorIsKeptInHundredthsAndOtherFormatsAreNotRead) {
+  SlotStoreHeader in = hdr();
+  in.slotFactor100 = 250;
+  auto b = encodeSlotHeader(in);
+  SlotStoreHeader h;
+  ASSERT_TRUE(decodeSlotHeader(b.data(), b.size(), h));
+  EXPECT_EQ(h.slotFactor100, 250);
+  b[8] = 1; // format_version 1
+  const uint32_t crc = crc32c(b.data(), SlotStore::kHeaderBytes - 4);
+  std::memcpy(b.data() + SlotStore::kHeaderBytes - 4, &crc, 4);
   EXPECT_FALSE(decodeSlotHeader(b.data(), b.size(), h));
 }
 
@@ -111,11 +129,11 @@ TEST(SlotStore, TheFirstCreatorFixesHeaderAndLayout) {
   EXPECT_NE(a->header().storeId, 0u);
   EXPECT_EQ(a->layoutBlob(), blob());
   SlotStoreHeader other = hdr();
-  other.slotFactor = 4;
+  other.slotFactor100 = 400;
   auto b = make(io, t.path(), &created, other, blob(50));
   ASSERT_TRUE(b);
   EXPECT_FALSE(created);
-  EXPECT_EQ(b->header().slotFactor, 3); // what was created, not what was asked for
+  EXPECT_EQ(b->header().slotFactor100, 300); // what was created, not what was asked for
   EXPECT_EQ(b->header().storeId, a->header().storeId);
   EXPECT_EQ(b->layoutBlob(), blob()); // the layout everyone serves
   EXPECT_FALSE(SlotStore::open(io, t.path(), "nosuchhash"));

@@ -181,6 +181,17 @@ struct Config {
   // cache would otherwise hold the same data twice). `on` keeps them too, for
   // comparing the two tiers on one cache.
   bool recompressKeepOriginals = false;          // UCACHE_RECOMPRESS_KEEP_ORIGINALS
+  // `recompress_slot_factor`, in HUNDREDTHS (300 = 3). With recompress = on, a
+  // TTree basket is shown to the reader in a slot of this many times its stored
+  // length (rounded down to a byte), and its ZSTD-1 form is written into it
+  // when first read; a basket whose ZSTD-1 form does not fit is served as it
+  // was stored. At 3 the ZSTD-1 form of all but ~2% of NanoAOD's LZMA baskets
+  // fits (0.1% of the bytes). ROOT sizes its read buffers from the slots, so a
+  // smaller factor needs less memory and keeps more baskets in their original
+  // codec. 1 to 10. Each store keeps the factor it was made with: a change
+  // applies to files that get their store after it. RNTuple pages are shown at
+  // their decoded size whatever this says.
+  uint32_t recompressSlotFactor100 = 300;        // UCACHE_RECOMPRESS_SLOT_FACTOR
   std::vector<std::string> recompressCodecs{"lzma", "zlib"}; // UCACHE_RECOMPRESS_CODECS
   // `recompress_reclaim`: what to punch from the v1 byte cache once
   // a valid replica exists. kSuperseded (default) frees only the ranges the

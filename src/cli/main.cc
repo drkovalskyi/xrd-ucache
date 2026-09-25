@@ -8,6 +8,7 @@
 #include "MetaFile.h"
 #include "SlotStore.h"
 #include "ReplicaStore.h"
+#include "ConfTemplate.h"
 #include "RunLog.h"
 #include "DiskBench.h"
 #include "Publish.h"
@@ -47,6 +48,7 @@ namespace tp = ucache::transpose;
 #include <pwd.h>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -3881,14 +3883,15 @@ int cmdSetup(int argc, char** argv) {
   const std::string pdir = xrdHome() + "/.xrootd/client.plugins.d";
   mkdirs(pdir);
   const std::string conf = pdir + "/ucache.conf";
-  if (!writeFileStr(conf, "# written by `ucache setup` — the only file uCache needs (USER_GUIDE §2)\n"
-                          "url = " + host + "\n"
-                          "lib = " + so + "\n"
-                          "enable = true\n"
-                          "\n"
-                          "# ucache settings (UCACHE_* environment variables override; see\n"
-                          "# USER_GUIDE §Configuration for all keys)\n"
-                          "dir = " + dir + "\n")) {
+  // The recommended configuration, exactly as the package ships it, with this
+  // install's plugin, the host binding and the cache directory filled in.
+  std::string text = kConfTemplate;
+  for (const auto& [from, to] : {std::pair<std::string, std::string>{"{{URL}}", host},
+                                 {"{{LIB}}", so},
+                                 {"{{DIR}}", dir}})
+    for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size()))
+      text.replace(at, from.size(), to);
+  if (!writeFileStr(conf, text)) {
     std::fprintf(stderr, "setup: cannot write %s\n", conf.c_str());
     return 1;
   }
@@ -4132,6 +4135,16 @@ int cmdDoctor(const Config& cfg) {
   // predates the switch has no replica yet and nothing wrong with it, so no
   // identified cause means no finding. `deep` — doctor may parse a cached file
   // to compare its codec against the policy; status may not.
+  // Not a problem, a cost the user chose: said here because a job killed for
+  // memory cannot say it, and ROOT does not shrink its buffers to fit.
+  if (cfg.recompress)
+    std::printf("  [NOTE] recompress = on: jobs hold more memory while they read (warm passes\n"
+                "         needed about 1.9x on TTree and 2.3x on RNTuple what a replica made by\n"
+                "         `ucache recompress` needs). If they run short, set recompress off; files\n"
+                "         already recompressed this way keep their layout until removed\n"
+                "         (`ucache untranspose <url>`, or `ucache clear`) and read again; then\n"
+                "         `ucache recompress` builds replicas that need about what a job needs\n"
+                "         without the cache\n");
   if (!cfg.cacheDir.empty() && cfg.recompress) {
     RealIO dio;
     const size_t replicas = anyReplicaExists(cfg.cacheDir) ? 1 : 0;

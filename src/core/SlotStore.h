@@ -44,10 +44,10 @@
 namespace ucache {
 
 struct SlotStoreHeader {
-  static constexpr uint32_t kFormatVersion = 1;
+  static constexpr uint32_t kFormatVersion = 2;
   uint32_t layoutVersion = 0; // bumped when the layout algorithm changes
   uint8_t container = 0;      // 0 = TTree, 1 = RNTuple
-  uint8_t slotFactor = 0;
+  uint16_t slotFactor100 = 0; // TTree slot = this / 100 x the stored basket length
   bool declined = false;      // not served in a slot layout: nothing else below matters
   std::string codecs;         // which baskets are converted (the rest are kept as stored)
   uint64_t originSize = 0;

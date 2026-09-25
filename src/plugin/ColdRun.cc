@@ -27,6 +27,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -47,11 +48,9 @@ using XrdCl::XRootDStatus;
 
 namespace {
 
-// Slots are this many times a basket's stored length. At 3 the ZSTD-1 record
-// of all but ~2% of NanoAOD's LZMA baskets fits (0.1% of the bytes); the rest
-// is served as it was stored. A warm pass reads 3x as fast as it does 4x and
-// the file seen through the cache is smaller.
-constexpr uint32_t kSlotFactor = 3;
+// The slot factor (how many times a basket's stored length its slot is) is
+// the setting `recompress_slot_factor` for a new store, and the store's own
+// for an existing one: see Config.h.
 
 // Bumped whenever the layout a store was made for could be computed
 // differently: a store of another version is replaced, never served.
@@ -132,7 +131,7 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   // record; or the page list and footer), for the read footprint.
   std::vector<std::pair<uint64_t, uint64_t>> metaOrigin;
   std::vector<std::string> codecs; // the store's: which baskets are converted
-  uint32_t slotFactor = 0;         // the store's
+  uint32_t slotFactor100 = 0;      // the store's, in hundredths
   bool keepOriginals = false;
   // max_read_fraction: null when no rule applies. Once it says direct, what
   // this process converts is served and never kept, and nothing it fetches
@@ -330,6 +329,35 @@ std::unordered_map<std::string, std::shared_ptr<ColdFill>>& registry() {
   return *r;
 }
 
+// Which layout this process has shown each file in, for the process's whole
+// life: a reader may hold offsets from any open it made, and must never be
+// shown a different address space later. For a slot layout, also what it was
+// computed with: a store removed meanwhile (evicted, `ucache rm`) is rebuilt
+// with the SAME slot factor and codecs, whatever the settings say now, or the
+// rebuilt layout could not be the one the reader holds offsets into. Leaked.
+struct Shown {
+  ShownLayout layout = ShownLayout::kNone;
+  uint64_t hash = 0;
+  uint32_t slotFactor100 = 0; // a slot layout's
+  std::string codecs;         // a slot layout's, joined
+};
+std::mutex g_shownMu;
+std::unordered_map<std::string, Shown>& shownMap() {
+  static auto* m = new std::unordered_map<std::string, Shown>();
+  return *m;
+}
+// The parameters of the slot layout this process showed `key` in, if any.
+bool shownSlotParams(const std::string& key, uint32_t& slotFactor100, std::string& codecs) {
+  std::lock_guard<std::mutex> g(g_shownMu);
+  auto it = shownMap().find(key);
+  if (it == shownMap().end() || it->second.layout != ShownLayout::kSlot ||
+      it->second.slotFactor100 == 0)
+    return false;
+  slotFactor100 = it->second.slotFactor100;
+  codecs = it->second.codecs;
+  return true;
+}
+
 // The parser's byte source at setup (shared with the read rule).
 using SetupSource = OriginSource;
 
@@ -452,9 +480,9 @@ struct Reader {
   }
 };
 
-// A TTree slot's length when nothing capped it: k times the stored basket.
-uint32_t plainSlotLen(uint32_t origLen, uint32_t k) {
-  const uint64_t v = static_cast<uint64_t>(origLen) * k;
+// A TTree slot's length when nothing capped it: k (in hundredths) times the stored basket.
+uint32_t plainSlotLen(uint32_t origLen, uint32_t k100) {
+  const uint64_t v = static_cast<uint64_t>(origLen) * k100 / 100; // as layoutForFill sizes it
   return v > INT32_MAX ? static_cast<uint32_t>(INT32_MAX) : static_cast<uint32_t>(v);
 }
 
@@ -492,7 +520,7 @@ std::vector<uint8_t> encodeLayout(const ColdFill& cf) {
     w.svarint(static_cast<int64_t>(s.basket) - static_cast<int64_t>(prevBasket) - 1);
     w.svarint(static_cast<int64_t>(s.origSeek - prevOrig));
     w.varint(s.origLen);
-    w.varint(!cf.rnt && s.vLen == plainSlotLen(s.origLen, cf.slotFactor) ? 0 : uint64_t(s.vLen) + 1);
+    w.varint(!cf.rnt && s.vLen == plainSlotLen(s.origLen, cf.slotFactor100) ? 0 : uint64_t(s.vLen) + 1);
     w.svarint(static_cast<int64_t>(s.vSeek - nextV)); // 0 when contiguous
     prevBranch = s.branch;
     prevBasket = s.basket;
@@ -567,7 +595,7 @@ bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf) {
     s.origSeek = prevOrig + static_cast<uint64_t>(r.svarint());
     s.origLen = static_cast<uint32_t>(r.varint());
     const uint64_t vl = r.varint();
-    s.vLen = vl ? static_cast<uint32_t>(vl - 1) : plainSlotLen(s.origLen, cf.slotFactor);
+    s.vLen = vl ? static_cast<uint32_t>(vl - 1) : plainSlotLen(s.origLen, cf.slotFactor100);
     s.vSeek = nextV + static_cast<uint64_t>(r.svarint());
     prevBranch = s.branch;
     prevBasket = s.basket;
@@ -602,7 +630,7 @@ bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf) {
 // Parse the file and compute its layout with the given parameters into cf.
 // False when the file is not served this way; `declined` then says whether
 // that is the file's nature (worth remembering) or a failed read (not).
-bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k, bool& declined) {
+bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k100, bool& declined) {
   declined = false;
   std::vector<uint8_t> header(100);
   cf.rnt = false;
@@ -651,7 +679,7 @@ bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k, bo
     keysList.resize(static_cast<size_t>(kn));
     if (!src.read(keysList.data(), keysList.size(), static_cast<uint64_t>(fm.keyslistSeek)))
       return false;
-    cf.L = tp::layoutForFill(fm, size, header, treeKeyHeader, keysList, cf.codecs, k);
+    cf.L = tp::layoutForFill(fm, size, header, treeKeyHeader, keysList, cf.codecs, k100);
     cf.metaOrigin = {{static_cast<uint64_t>(fm.treeKey.seekkey),
                       static_cast<uint64_t>(fm.treeKey.nbytes)}};
   }
@@ -737,12 +765,17 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     src.st = st;
     src.entry = entry;
     cf->codecs = cfg.recompressCodecs;
-    cf->slotFactor = kSlotFactor;
+    cf->slotFactor100 = cfg.recompressSlotFactor100;
+    // Rebuilding the layout this process already showed (its store is gone):
+    // with what it was computed with, not with today's settings.
+    if (std::string shownCodecs; mode == AttachMode::kMatch &&
+                                 shownSlotParams(key.key, cf->slotFactor100, shownCodecs))
+      cf->codecs = splitCodecs(shownCodecs);
     bool declined = false;
-    const bool ok = computeLayout(*cf, src, size, kSlotFactor, declined);
+    const bool ok = computeLayout(*cf, src, size, cf->slotFactor100, declined);
     SlotStoreHeader want;
     want.layoutVersion = kLayoutVersion;
-    want.slotFactor = static_cast<uint8_t>(kSlotFactor);
+    want.slotFactor100 = static_cast<uint16_t>(cf->slotFactor100);
     want.codecs = joinCodecs(cf->codecs);
     want.originSize = size;
     want.originMtime = originMtime;
@@ -763,7 +796,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
       blob = encodeLayout(*cf);
       // Everyone after us serves what this blob decodes to: make sure it does.
       ColdFill check;
-      check.slotFactor = cf->slotFactor;
+      check.slotFactor100 = cf->slotFactor100;
       if (!decodeLayout(blob, check) || layoutHash(check.L, check.rnt) != want.layoutHash) {
         UCACHE_WARN("slot run declined for %s: its layout does not survive storing",
                     key.key.c_str());
@@ -796,7 +829,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   }
   if (!created) {
     cf->L = tp::FillLayout(); // the stored layout, in place of anything computed above
-    cf->slotFactor = store->header().slotFactor;
+    cf->slotFactor100 = store->header().slotFactor100;
     cf->metaOrigin.clear();
     cf->pages.clear();
     if (!decodeLayout(store->layoutBlob(), *cf) ||
@@ -816,11 +849,15 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->sync();
   if (created && st->store)
     st->store->stats().coldReplicaFiles.fetch_add(1, std::memory_order_relaxed);
-  UCACHE_INFO("slot run for %s: %zu %s of %zu %s in slots (%s), virtual %llu bytes, "
+  char factor[32] = "";
+  if (!cf->rnt)
+    std::snprintf(factor, sizeof factor, ", slot factor %u.%02u", cf->slotFactor100 / 100,
+                  cf->slotFactor100 % 100);
+  UCACHE_INFO("slot run for %s: %zu %s of %zu %s in slots (%s%s), virtual %llu bytes, "
               "set up in %.1f ms",
               key.key.c_str(), cf->L.slots.size(), cf->rnt ? "pages" : "baskets",
               cf->L.relocated.size(), cf->rnt ? "column ranges" : "branches",
-              created ? "new store" : "existing store",
+              created ? "new store" : "existing store", factor,
               static_cast<unsigned long long>(cf->L.virtualSize), (nowUs() - tSetup) / 1e3);
   return cf;
 }
@@ -2031,15 +2068,6 @@ void ColdFill::commit() try {
 
 namespace {
 
-// Which layout this process has shown each file in, for the process's whole
-// life: a reader may hold offsets from any open it made, and must never be
-// shown a different address space later. Leaked.
-std::mutex g_shownMu;
-std::unordered_map<std::string, std::pair<ShownLayout, uint64_t>>& shownMap() {
-  static auto* m = new std::unordered_map<std::string, std::pair<ShownLayout, uint64_t>>();
-  return *m;
-}
-
 // At exit: every record still in memory is committed, with a bounded wait. A
 // hard _exit() skips this, and loses at most what the periodic checkpoint had
 // not yet committed.
@@ -2057,24 +2085,31 @@ ShownLayout shownLayout(const std::string& key, uint64_t& hash) {
   auto it = shownMap().find(key);
   if (it == shownMap().end())
     return ShownLayout::kNone;
-  hash = it->second.second;
-  return it->second.first;
+  hash = it->second.hash;
+  return it->second.layout;
 }
 
 ShownLayout noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash,
-                            uint64_t* winnerHash) {
+                            uint64_t* winnerHash, const ColdFill* run) {
   std::lock_guard<std::mutex> g(g_shownMu);
   auto& v = shownMap()[key];
   // Original may later become compact or slot (the original region reads the
   // same in both); nothing else changes once shown -- not even to another
   // compact replica or slot layout of the same file. The caller learns which
   // layout won, and must serve that one.
-  if (v.first == ShownLayout::kNone || v.first == ShownLayout::kOriginal ||
-      (v.first == s && v.second == hash))
-    v = {s, hash};
+  if (v.layout == ShownLayout::kNone || v.layout == ShownLayout::kOriginal ||
+      (v.layout == s && v.hash == hash)) {
+    const bool first = v.layout != s || v.hash != hash;
+    v.layout = s;
+    v.hash = hash;
+    if (first && s == ShownLayout::kSlot && run) {
+      v.slotFactor100 = run->slotFactor100;
+      v.codecs = joinCodecs(run->codecs);
+    }
+  }
   if (winnerHash)
-    *winnerHash = v.second;
-  return v.first;
+    *winnerHash = v.hash;
+  return v.layout;
 }
 
 // -------------------------------------------------------------------- API

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -117,7 +118,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "usage: %s IN.root OUT.root [slot-factor] [codecs] [tree]\n", argv[0]);
     return 2;
   }
-  const uint32_t k = argc > 3 ? (uint32_t)std::atoi(argv[3]) : 4;
+  // The slot factor as a number (4, 2.5), handed to the layout in hundredths.
+  const uint32_t k =
+      argc > 3 ? static_cast<uint32_t>(std::llround(std::strtod(argv[3], nullptr) * 100.0)) : 400;
   std::vector<std::string> codecs;
   {
     std::string s = argc > 4 ? argv[4] : "lzma,zlib", cur;

@@ -70,12 +70,12 @@ std::vector<uint8_t> encodeSlotHeader(const SlotStoreHeader& h) {
   put<uint32_t>(b.data(), 8, SlotStoreHeader::kFormatVersion);
   put<uint32_t>(b.data(), 12, h.layoutVersion);
   b[16] = h.container;
-  b[17] = h.slotFactor;
   b[18] = h.declined ? 1 : 0;
   put<uint32_t>(b.data(), 20, h.nSlots);
   put<uint64_t>(b.data(), 24, h.originSize);
   put<uint64_t>(b.data(), 32, h.originMtime);
   b[40] = h.cksumKind;
+  put<uint16_t>(b.data(), 42, h.slotFactor100);
   put<uint32_t>(b.data(), 44, h.originCksum);
   put<uint64_t>(b.data(), 48, h.virtualSize);
   put<uint64_t>(b.data(), 56, h.layoutHash);
@@ -98,12 +98,12 @@ bool decodeSlotHeader(const uint8_t* p, size_t n, SlotStoreHeader& h) {
     return false;
   h.layoutVersion = get<uint32_t>(p, 12);
   h.container = p[16];
-  h.slotFactor = p[17];
   h.declined = p[18] != 0;
   h.nSlots = get<uint32_t>(p, 20);
   h.originSize = get<uint64_t>(p, 24);
   h.originMtime = get<uint64_t>(p, 32);
   h.cksumKind = p[40];
+  h.slotFactor100 = get<uint16_t>(p, 42);
   h.originCksum = get<uint32_t>(p, 44);
   h.virtualSize = get<uint64_t>(p, 48);
   h.layoutHash = get<uint64_t>(p, 56);

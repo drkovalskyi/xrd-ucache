@@ -86,6 +86,14 @@ if [ -n "$MISSINGDOC" ]; then
   exit 1
 fi
 echo "installed docs are closed under their own pointers ($(ls "$DOCDIR"/*.md | wc -l) docs)"
+# Hard gate: the recommended configuration the package ships names the plugin
+# where the RPM puts it. The staged install above is laid out as the RPM (its
+# prefix is /usr), so the path must exist under it.
+REC="$DOCSTAGE/usr/share/xrd-ucache/ucache.conf"
+RECLIB=$(sed -n 's/^lib = //p' "$REC" 2>/dev/null)
+[ -n "$RECLIB" ] && [ -e "$DOCSTAGE$RECLIB" ] \
+  || { echo "FATAL: the shipped ucache.conf names lib = '${RECLIB:-?}', which the package does not install"; exit 1; }
+echo "the shipped ucache.conf names the packaged plugin ($RECLIB)"
 rm -rf "$DOCSTAGE"
 
 # Host quirk guard: rpm's brp-ldconfig hardcodes /sbin/ldconfig, which some

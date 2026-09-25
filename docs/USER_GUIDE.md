@@ -214,19 +214,46 @@ write the same file; nothing else is touched either way.
 
 XrdCl scans `~/.xrootd/client.plugins.d/` automatically in every `root://`
 process — no environment variable, no shell startup file to edit, no shell
-to reload, and batch jobs pick it up too:
+to reload, and batch jobs pick it up too. The package ships the recommended
+file, which activates nothing until you copy it into your own account (uCache
+is a per-user cache; nothing it installs switches it on for anyone else):
 
 ```sh
 mkdir -p ~/.xrootd/client.plugins.d
-cat > ~/.xrootd/client.plugins.d/ucache.conf <<EOF
+cp /usr/share/xrd-ucache/ucache.conf ~/.xrootd/client.plugins.d/   # the RPM
+# a tarball or source install: <prefix>/share/xrd-ucache/ucache.conf
+# then edit it: set `dir` (required); unless you installed the RPM, also `lib`
+ucache doctor      # verify install, filesystem, activation; exits 0 when good
+```
+
+The file, without its longer comments:
+
+```ini
 url = *
-lib = $HOME/.local/lib64/libXrdClUCache.so
+lib = /usr/lib64/libXrdClUCache.so
 enable = true
 
-# ucache settings (UCACHE_* env vars override — see §Configuration)
-dir = /data/$USER/ucache-cache
-EOF
-ucache doctor      # verify install, filesystem, activation; exits 0 when good
+# REQUIRED: the cache directory, on a LOCAL disk (not AFS, NFS or EOS).
+dir = /path/on/a/local/disk/ucache
+
+# Recompression is OFF by default: the cache keeps the bytes the origin sent.
+# With it on, a ROOT file read for the first time is converted, as it is read,
+# into a form that is faster to decode -- no separate step.
+#
+# MEMORY: with it on, a job holds more memory while it reads. On the analyses
+# measured, warm passes needed about 1.9x (TTree) and 2.3x (RNTuple) the memory
+# the same job needs from a replica made by `ucache recompress`. If your jobs
+# run short of memory, leave it off and build replicas with `ucache recompress`
+# instead. Turning it off later does not change files already recompressed
+# this way: remove those first (`ucache untranspose <url>`, or `ucache clear`).
+# recompress = on
+#
+# TTree files only: each basket gets room for this many times its stored size
+# (fractions allowed, 1 to 10). ROOT sizes its read buffers from that room, so
+# less needs less memory, and leaves more baskets in their original codec.
+# Applies to files that get their replica after a change; a file that has one
+# keeps its own.
+# recompress_slot_factor = 3
 ```
 
 - `dir` — where the cached data lives. **Required, on purpose**: there is no
@@ -235,11 +262,11 @@ ucache doctor      # verify install, filesystem, activation; exits 0 when good
   filesystem defeats the purpose). Use a **local** disk. Until it is set,
   `doctor` FAILs and the plugin runs uncached (fail-open).
 - `lib` — the absolute path to wherever §1 put the plugin:
-  `$HOME/.local/lib64/…` for the no-root tarball/source install (as shown;
-  the unquoted heredoc expands `$HOME` when writing — the conf itself needs
-  a literal absolute path, no `~`), or `/usr/lib64/libXrdClUCache.so` if an
-  admin installed the RPM. If unsure, `ucache doctor` prints the resolved
-  path on its `plugin loads` line.
+  `/usr/lib64/libXrdClUCache.so` from the RPM (as shipped), or
+  `$HOME/.local/lib64/libXrdClUCache.so` for the no-root tarball/source
+  install — written out in full: the conf needs a literal absolute path, no
+  `~` and no `$HOME`. If unsure, `ucache doctor` prints the resolved path on
+  its `plugin loads` line, and `ucache setup` (below) fills it in for you.
 - `url = *` intercepts every `root://` URL. If a system config in
   `/etc/xrootd/client.plugins.d/` already claims the `*` slot (`doctor`
   warns), list your data hosts explicitly instead:
@@ -269,8 +296,9 @@ ucache setup --host eospublic.cern.ch:1094 --dir /data/$USER/ucache-cache
 ucache doctor
 ```
 
-`setup` writes exactly the file above — plugin path resolved, cache dir
-explicit — to `~/.xrootd/client.plugins.d/ucache.conf`, and touches nothing
+`setup` writes exactly the file above — the same text, with this install's
+plugin path, your `--host` and your `--dir` filled in — to
+`~/.xrootd/client.plugins.d/ucache.conf`, and touches nothing
 else: no shell startup files, no environment variables, no second config.
 `--dir` is required unless `UCACHE_DIR` or an existing conf already provides
 a location (there is deliberately no default). Activation is immediate for
@@ -654,6 +682,7 @@ overriding your defaults. Common keys:
 | `revalidate_seconds = 604800` | `UCACHE_REVALIDATE_S` | freshness window (TTL): an entry validated against the origin within this many seconds is served with **no remote contact at all**. Default 7 days — right for write-once physics data. `0` = re-check on every open; `ucache rm <url>` forces a re-check anytime |
 | `open_retries = 0`  | `UCACHE_OPEN_RETRIES`   | retry a transient open failure this many times (0 = off); backoff via `open_retry_base_ms`/`open_retry_max_ms` |
 | `recompress = off`  | `UCACHE_RECOMPRESS`     | `on` = the files your jobs read get fast-to-decode replicas **automatically**, created on their first pass (default off — opt-in CPU/disk). Flip it with `ucache set recompress on` |
+| `recompress_slot_factor = 3` | `UCACHE_RECOMPRESS_SLOT_FACTOR` | TTree files, with `recompress = on`: each basket's room, as a multiple of its stored size (1 to 10, fractions allowed). ROOT sizes its read buffers from it: a smaller factor needs less memory and leaves more baskets in their original codec. Applies to files that get their replica after a change; a file that has one keeps its own |
 | `recompress_keep_originals = off` | `UCACHE_RECOMPRESS_KEEP_ORIGINALS` | `on` = when baskets are converted into a replica, keep their original bytes in the byte cache too (by default they are not kept, and a copy held from before is released: the cache would hold the same data twice) |
 | `recompress_codecs = lzma,zlib` | `UCACHE_RECOMPRESS_CODECS` | which **source** codecs are worth recompressing (comma list); branches in other codecs are served as-is |
 | `recompress_reclaim = superseded` | `UCACHE_RECOMPRESS_RECLAIM` | what to free from the byte cache once a file's replica exists: `superseded` (default) punches only the ranges the replica replaced; `full` drops the **entire** byte copy — replicas become the primary copy, uncovered reads refetch from origin (space-tight disks) |
@@ -835,6 +864,23 @@ the converted records in the file's replica as it goes; the next run reads
 them. Nothing extra is fetched and no command is needed. That first pass costs
 CPU — everything it reads is converted — so on a machine short of cores it can
 be slower than a pass with recompression off.
+
+**It also costs memory, on every pass that reads such a file.** ROOT sizes its
+read buffers from the layout described below and does not shrink them to fit
+the memory there is, and uCache keeps a table for each such file while it is
+open (about 20 MB for a large NanoAOD file). On the analyses measured (32
+threads), warm passes needed about 1.9x the memory on TTree and 2.3x on RNTuple
+of the same job reading a replica made by `ucache recompress` — which in turn
+needs about what the job needs with no cache at all. A job that runs short of
+memory is killed by the system, not warned: if yours are near their memory
+limit, leave recompression off and build replicas with `ucache recompress`
+instead. Turning it off later does not change files already recompressed this
+way; `docs/TROUBLESHOOTING.md` ("Jobs are killed for memory") says how to get
+them back. For TTree files, `recompress_slot_factor` (default 3, fractions
+allowed) sets how much room each basket gets: a smaller factor shrinks ROOT's
+share and leaves more baskets in their original codec. It applies to files that
+get their replica after the change; a file keeps the room it was given.
+`ucache doctor` repeats this note whenever recompression is on.
 
 While a file is recompressed this way your jobs see it in a layout of its own,
 in which every basket has room to be converted: the same data and the same

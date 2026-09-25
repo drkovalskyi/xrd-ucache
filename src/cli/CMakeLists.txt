@@ -75,4 +75,11 @@ if (TARGET ucache-transpose)
   target_compile_definitions(ucache PRIVATE UCACHE_HAVE_TRANSPOSE=1)
   target_link_libraries(ucache PRIVATE ucache-transpose)
 endif()
+# The recommended configuration: one text for the file the package ships
+# (cmake/Packaging.cmake) and the file `ucache setup` writes.
+file(READ "${PROJECT_SOURCE_DIR}/share/ucache.conf.in" UCACHE_CONF_TEMPLATE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${PROJECT_SOURCE_DIR}/share/ucache.conf.in")
+configure_file(ConfTemplate.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/ConfTemplate.h" @ONLY)
+target_include_directories(ucache PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 install(TARGETS ucache RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

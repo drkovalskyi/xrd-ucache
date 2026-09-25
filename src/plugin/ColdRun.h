@@ -76,9 +76,11 @@ ShownLayout shownLayout(const std::string& key, uint64_t& hash);
 // hash; a compact replica's id; 0 for the original); returns the layout that
 // holds for the file in this process from now on (and its identity). When that
 // is not `s` and `hash`, another handle got there first, and the caller must
-// serve the winner instead.
+// serve the winner instead. For a slot layout, `run` is the run being shown:
+// its slot factor and codecs are kept, so a store removed later is rebuilt
+// with them (AttachMode::kMatch) rather than with the settings of the day.
 ShownLayout noteShownLayout(const std::string& key, ShownLayout s, uint64_t hash = 0,
-                            uint64_t* winnerHash = nullptr);
+                            uint64_t* winnerHash = nullptr, const ColdFill* run = nullptr);
 
 // The handle is done with the run. The process's last handle on the file
 // commits what it converted.

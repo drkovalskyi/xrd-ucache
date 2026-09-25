@@ -1169,7 +1169,7 @@ void cachedEntry(CacheStore& store, const UrlKey& key) {
 SlotStoreHeader slotHeader(bool declined) {
   SlotStoreHeader h;
   h.layoutVersion = 1;
-  h.slotFactor = 3;
+  h.slotFactor100 = 300;
   h.codecs = "lzma,zlib";
   h.originSize = 100000;
   h.declined = declined;

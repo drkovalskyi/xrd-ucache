@@ -1,0 +1,11 @@
+// Generated at configure time from share/ucache.conf.in: the recommended
+// configuration. The package installs it filled in (cmake/Packaging.cmake);
+// `ucache setup` fills in {{URL}}, {{LIB}} and {{DIR}} and writes it. One text
+// for both, so the two can never say different things.
+#pragma once
+
+namespace ucache {
+
+inline constexpr const char* kConfTemplate = R"UCACHECONF(@UCACHE_CONF_TEMPLATE@)UCACHECONF";
+
+} // namespace ucache

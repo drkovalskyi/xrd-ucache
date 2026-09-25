@@ -169,7 +169,7 @@ Rules:
   Stale/torn/absent markers just re-run the scan; the per-read page CRC is
   never skipped, so served bytes are always verified regardless.
 
-## Slot store: `<hash>.slots`, format_version 1
+## Slot store: `<hash>.slots`, format_version 2
 
 The replica of a file recompressed as it is read (`recompress = on`). The file
 is served to readers in its SLOT layout: every convertible basket (TTree) or
@@ -189,15 +189,15 @@ Header:
 | offset | size | field | notes |
 |---|---|---|---|
 | 0 | 8 | magic | `"UCSLOTS1"` |
-| 8 | 4 | format_version u32 | = 1; other → store not used |
+| 8 | 4 | format_version u32 | = 2; other → store not used (and replaced when a new one is made) |
 | 12 | 4 | layout_version u32 | the layout algorithm; other → store replaced |
 | 16 | 1 | container u8 | 0 = TTree, 1 = RNTuple |
-| 17 | 1 | slot_factor u8 | TTree slot = factor × stored basket length |
 | 18 | 1 | declined u8 | 1 = the file is not served this way (nothing else follows) |
 | 20 | 4 | n_slots u32 | |
 | 24 | 8 | origin_size u64 | validators, compared like a replica's (`validate`) |
 | 32 | 8 | origin_mtime u64 | |
 | 40 | 1 | cksum_kind u8 | |
+| 42 | 2 | slot_factor u16 | in hundredths: a TTree slot is ⌊stored basket length × slot_factor / 100⌋ bytes (`recompress_slot_factor` when the store was made) |
 | 44 | 4 | origin_cksum u32 | |
 | 48 | 8 | virtual_size u64 | the file size readers are shown |
 | 56 | 8 | layout_hash u64 | XXH3-64 of the layout |

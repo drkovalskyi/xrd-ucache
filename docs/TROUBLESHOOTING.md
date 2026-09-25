@@ -191,6 +191,32 @@ By default uCache uses the disk and evicts LRU to keep a free-space floor
 Note the byte cap is best-effort under extreme concurrent write rates; the
 free-disk floor is the hard guard against actually filling the volume.
 
+## Jobs are killed for memory with `recompress = on`
+
+With recompression on, a job holds more memory while it reads a recompressed
+file: ROOT sizes its read buffers from the layout the file is shown in and does
+not shrink them to fit, and uCache keeps a table for each such file while it is
+open (about 20 MB for a large NanoAOD file). On the analyses measured, warm
+passes needed about 1.9x (TTree) and 2.3x (RNTuple) the memory of the same job
+reading a replica made by `ucache recompress`, which needs about what the job
+needs without the cache. A batch system or the kernel then stops the job
+without a word from uCache (`ucache doctor` says so while recompression is
+on).
+
+- Turn recompression off for these jobs (`UCACHE_RECOMPRESS=off`, or
+  `ucache set recompress off`) and build replicas with `ucache recompress`
+  instead. The files the killed jobs already read keep their recompressed
+  layout whatever the setting, and `ucache recompress` counts them as done:
+  remove those first — `ucache untranspose <url>` for one file, `ucache clear`
+  for all — read them again (what was converted is fetched again), then run
+  `ucache recompress`. Until then `UCACHE_TRANSPOSE=0` serves every file as
+  stored, fetching again what was converted.
+- For TTree files, a smaller `recompress_slot_factor` (default 3; 2 or 2.5,
+  say) shrinks ROOT's share, not uCache's table, and leaves more baskets in
+  their original codec; near 1 almost nothing is converted. It applies to files
+  that get their replica after the change: a file that has one keeps its own
+  until it is removed.
+
 ## `recompress = on` but no replicas ever appear
 
 With `recompress = on`, a file your job reads gets its replica while it is read

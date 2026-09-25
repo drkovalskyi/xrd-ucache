@@ -8,8 +8,9 @@
 // headers, so a region longer than the basket is legal: the reader decodes
 // fNbytes and ignores the rest. That is what lets this layout be fixed before
 // any basket exists: every basket of a relocatable branch gets a SLOT of
-// k x fBasketBytes[i] in an extension past fEND, and the basket's recompressed
-// record is written into it when the reader first asks for it.
+// k x fBasketBytes[i] (k given in hundredths, the slot rounded down to a byte)
+// in an extension past fEND, and the basket's recompressed record is written
+// into it when the reader first asks for it.
 //
 // What the reader is shown, and what never changes for the life of a handle:
 //   * the file header with fEND = the virtual end (promoted in place from the
@@ -97,7 +98,7 @@ std::string codecOfSetting(int32_t compress, int32_t fileCompress);
 FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vector<uint8_t>& header,
                          const std::vector<uint8_t>& treeKeyHeader,
                          const std::vector<uint8_t>& keysList,
-                         const std::vector<std::string>& codecs, uint32_t k = 4);
+                         const std::vector<std::string>& codecs, uint32_t slotFactor100 = 300);
 
 // A basket prepared for its slot, from its ORIGINAL record.
 struct ConvertedBasket {
