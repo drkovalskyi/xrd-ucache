@@ -91,6 +91,31 @@ TEST(CopyDetect, ExecutableNames) {
   EXPECT_EQ(copierSignal(), CopySignal::kNone);
 }
 
+// hadd and ROOT's command-line tools read the origin's file: they merge, copy
+// or report on it. Most of the tools are Python scripts, recognised by the
+// script the interpreter runs.
+TEST(CopyDetect, RootToolPrograms) {
+  for (const char* n : {"hadd", "rootcp", "rootmv", "rooteventselector", "rootslimtree",
+                        "rootls", "rootprint", "rootdrawtree", "rootbrowse", "rootrm",
+                        "rootmkdir"})
+    EXPECT_TRUE(isRootToolProgram(n)) << n;
+  for (const char* n : {"root", "root.exe", "python3", "haddx", "rootcling", "", "HADD"})
+    EXPECT_FALSE(isRootToolProgram(n)) << n;
+  using V = std::vector<std::string>;
+  EXPECT_EQ(scriptOfCommandLine(V{"python3", "/cvmfs/x/bin/rootcp", "a.root", "b.root"}), "rootcp");
+  EXPECT_EQ(scriptOfCommandLine(V{"/usr/bin/python3.12", "-u", "-W", "ignore", "/x/rootls", "-t"}),
+            "rootls");
+  EXPECT_EQ(scriptOfCommandLine(V{"python3", "-c", "import rootcp"}), "");
+  EXPECT_EQ(scriptOfCommandLine(V{"python3", "-m", "rootls"}), "");
+  EXPECT_EQ(scriptOfCommandLine(V{"python3"}), "");
+  EXPECT_EQ(scriptOfCommandLine(V{"hadd", "out.root", "rootcp"}), ""); // not an interpreter
+  EXPECT_EQ(scriptOfCommandLine(V{}), "");
+#if defined(__linux__) || defined(__APPLE__)
+  EXPECT_EQ(hostScript(), ""); // the test binary is not an interpreter
+#endif
+  EXPECT_EQ(copyProgramSignal(), CopySignal::kNone);
+}
+
 // A typo in any of these switches detection off without a sound.
 TEST(CopyDetect, SymbolListPinned) {
   const std::vector<std::string> engine(std::begin(kCopyEngineSymbols),
@@ -102,6 +127,9 @@ TEST(CopyDetect, SymbolListPinned) {
                         "_ZN5XrdCl6XCpSrc3RunEPv",
                     }));
   EXPECT_STREQ(kRootCpSymbol, "_ZN5TFile2CpEPKcS1_bj");
+  const std::vector<std::string> merge(std::begin(kRootMergeSymbols), std::end(kRootMergeSymbols));
+  EXPECT_EQ(merge, (std::vector<std::string>{"_ZN11TFileMerger7AddFileEPKcb",
+                                             "_ZN11TFileMerger15OpenExcessFilesEv"}));
   EXPECT_STREQ(kGfalXrootdPrefix, "libgfal_plugin_xrootd");
   EXPECT_EQ(kCopyStackDepth, 32);
 }
@@ -155,6 +183,7 @@ TEST(CopyDetect, LateLoadedLibrary) {
   void* r = openFake(UCACHE_COPYFAKE_RIO);
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(seenFrom(entry(r, "ucache_fake_root_cp")), CopySignal::kRootCp);
+  EXPECT_EQ(seenFrom(entry(r, "ucache_fake_merger_add")), CopySignal::kMerge);
   // ... and what was found before is still found.
   EXPECT_EQ(seenFrom(entry(x, "ucache_fake_copy_job")), CopySignal::kCopyEngine);
 }

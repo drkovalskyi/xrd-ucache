@@ -459,7 +459,7 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
         s.origSeek = pg.offset;
         s.origLen = pg.nbytes + (pg.hasChecksum ? 8u : 0u);
         s.vSeek = at;
-        s.vLen = static_cast<uint32_t>(pg.uncompressedBytes);
+        s.vLen = static_cast<uint32_t>(pg.uncompressedBytes + kSlotChecksumBytes);
         s.branch = ri;
         s.basket = pi;
         L.slots.push_back(s);
@@ -467,7 +467,8 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
         seen.emplace(pg.offset, at);
         at += s.vLen;
       }
-      putLE(pl.data() + pg.recordOffset, pg.nElements, 4); // positive: no checksum
+      // Negative: the page carries a checksum (the decoded page's, served after it).
+      putLE(pl.data() + pg.recordOffset, static_cast<uint32_t>(-static_cast<int64_t>(pg.nElements)), 4);
       putLE(pl.data() + pg.recordOffset + 4, pg.uncompressedBytes, 4);
       putLE(pl.data() + pg.recordOffset + 8, v, 8);
     }
@@ -499,6 +500,11 @@ FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
   if (L.windows[0].off + L.windows[0].bytes.size() > L.windows[1].off)
     return decline("anchor overlaps the file header");
   return L;
+}
+
+void sealDecodedPage(const uint8_t* page, size_t n, uint8_t out[kSlotChecksumBytes]) {
+  const uint64_t h = xxh3_64(page, n);
+  for (uint32_t i = 0; i < kSlotChecksumBytes; ++i) out[i] = static_cast<uint8_t>(h >> (8 * i));
 }
 
 ConvertedPage convertPage(const uint8_t* onDisk, size_t n, uint32_t nbytes, bool hasChecksum,

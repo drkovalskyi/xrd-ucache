@@ -4142,9 +4142,10 @@ int cmdDoctor(const Config& cfg) {
                 "         needed about 1.9x on TTree and 2.3x on RNTuple what a replica made by\n"
                 "         `ucache recompress` needs). If they run short, set recompress off; files\n"
                 "         already recompressed this way keep their layout until removed\n"
-                "         (`ucache untranspose <url>`, or `ucache clear`) and read again; then\n"
-                "         `ucache recompress` builds replicas that need about what a job needs\n"
-                "         without the cache\n");
+                "         while no job is reading them (`ucache untranspose <url>`, or\n"
+                "         `ucache clear`; a job still reading one would fail) and read again;\n"
+                "         then `ucache recompress` builds replicas that need about what a job\n"
+                "         needs without the cache\n");
   if (!cfg.cacheDir.empty() && cfg.recompress) {
     RealIO dio;
     const size_t replicas = anyReplicaExists(cfg.cacheDir) ? 1 : 0;

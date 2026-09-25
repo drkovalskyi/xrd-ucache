@@ -32,7 +32,8 @@ second. If not:
    `ucache disable` was run. Re-enable with `ucache enable`.
 6. **You tested with `xrdcp`.** A copy never uses the cache, by design: `xrdcp`,
    `xrdfs`, `xrdadler32`, XRootD's copy engine from any program (Python's
-   `CopyProcess`, `gfal-copy`, `rucio download`) and ROOT's `TFile::Cp` are
+   `CopyProcess`, `gfal-copy`, `rucio download`), ROOT's `TFile::Cp`, `hadd`
+   and ROOT's command-line tools (`rootcp`, `rootls`, ...) are
    recognised and read straight from the origin, because a copy must be the
    origin's bytes and uCache may show readers a file in a layout of its own.
    `stats` then shows `copier_handles` and direct (relayed) bytes, not hits —
@@ -140,16 +141,20 @@ trusts the cache. When you know a file changed:
 A copy that uCache recognises is read straight from the origin and is the
 origin's bytes: `xrdcp`, `xrdfs`, `xrdadler32`, `edmCopyUtil`, XRootD's copy
 engine from any program (Python's `CopyProcess`, `gfal-copy`, `rucio
-download`) and ROOT's `TFile::Cp`. `ucache stats` counts each such handle in
-`copier_handles`.
+download`), ROOT's `TFile::Cp`, `hadd`, ROOT's command-line tools (`rootcp`,
+`rootmv`, `rooteventselector`, `rootslimtree`, `rootls`, `rootprint`, ...) and
+ROOT's file merger (`TFileMerger`, given the file's name). `ucache stats`
+counts each such handle in `copier_handles`.
 
 A copy made any other way reads through the cache like an analysis job, and a
 file with a replica is then shown in the replica's layout — the same data to
 ROOT, but a larger file with different bytes. That is the case for reading a
 file handle in a loop (fsspec's `get` or `open().read()`, a hand-written
-loop), ROOT's fast cloning (`rootcp`, `hadd`), and copies through an XRootD
-proxy or a FUSE mount with uCache inside it. Make those copies with the cache
-switched off:
+loop), fast cloning inside a program of your own (`CloneTree(-1, "fast")` on a
+tree it opened), and copies through an XRootD proxy or a FUSE mount with uCache
+inside it. Make those copies with the cache switched off, and inspect a file's
+real sizes and codecs the same way (`TTree::Print`, `TFile::Map`, the
+`RNTupleInspector` report what they are shown):
 
 ```sh
 UCACHE_DISABLE=1 python3 my_copy.py
@@ -207,8 +212,9 @@ on).
   `ucache set recompress off`) and build replicas with `ucache recompress`
   instead. The files the killed jobs already read keep their recompressed
   layout whatever the setting, and `ucache recompress` counts them as done:
-  remove those first — `ucache untranspose <url>` for one file, `ucache clear`
-  for all — read them again (what was converted is fetched again), then run
+  remove those first, while no job is reading them (a job still reading one
+  would fail) — `ucache untranspose <url>` for one file, `ucache clear` for
+  all — read them again (what was converted is fetched again), then run
   `ucache recompress`. Until then `UCACHE_TRANSPOSE=0` serves every file as
   stored, fetching again what was converted.
 - For TTree files, a smaller `recompress_slot_factor` (default 3; 2 or 2.5,

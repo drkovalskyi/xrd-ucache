@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #if defined(__APPLE__)
+#include <crt_externs.h>
 #include <mach-o/dyld.h>
 #else
 #include <link.h>
@@ -177,10 +178,13 @@ std::shared_ptr<const Table> buildTable(Generation gen, const Table* prev) {
       for (const RootIo& p : prev->rootIo)
         if (p.path == l.path && p.base == l.base)
           same = &p;
-    if (same)
+    if (same) {
       r.ranges = same->ranges;
-    else
+    } else {
       addFromLibrary(r.ranges, l.path.c_str(), &kRootCpSymbol, 1, CopySignal::kRootCp);
+      addFromLibrary(r.ranges, l.path.c_str(), kRootMergeSymbols,
+                     sizeof kRootMergeSymbols / sizeof kRootMergeSymbols[0], CopySignal::kMerge);
+    }
     t->rootIo.push_back(std::move(r));
   }
   t->all = t->copyEngine;
@@ -227,6 +231,30 @@ std::string computeExecutable() {
 #endif
 }
 
+std::vector<std::string> commandLine() {
+  std::vector<std::string> argv;
+#if defined(__APPLE__)
+  if (char*** av = _NSGetArgv(); av && *av)
+    for (char** a = *av; *a; ++a)
+      argv.emplace_back(*a);
+#elif defined(__linux__)
+  FILE* f = std::fopen("/proc/self/cmdline", "rb");
+  if (!f)
+    return argv;
+  std::string cur;
+  for (int c; (c = std::fgetc(f)) != EOF;) {
+    if (c == '\0') {
+      argv.push_back(cur);
+      cur.clear();
+    } else {
+      cur.push_back(static_cast<char>(c));
+    }
+  }
+  std::fclose(f);
+#endif
+  return argv;
+}
+
 } // namespace
 
 const char* copySignalName(CopySignal s) {
@@ -236,6 +264,8 @@ const char* copySignalName(CopySignal s) {
     case CopySignal::kCopyEngine: return "XRootD's copy engine";
     case CopySignal::kRootCp: return "ROOT's TFile::Cp";
     case CopySignal::kGfal: return "gfal2's xrootd plugin";
+    case CopySignal::kRootTool: return "a ROOT command-line tool";
+    case CopySignal::kMerge: return "ROOT's TFileMerger";
   }
   return "?";
 }
@@ -257,9 +287,46 @@ bool isCopyToolExecutable(const std::string& base) {
   return false;
 }
 
+bool isRootToolProgram(const std::string& base) {
+  for (const char* name : kRootToolPrograms)
+    if (base == name)
+      return true;
+  return false;
+}
+
 const std::string& hostExecutable() {
   static const std::string* exe = new std::string(computeExecutable());
   return *exe;
+}
+
+std::string scriptOfCommandLine(const std::vector<std::string>& argv) {
+  if (argv.empty() || executableBaseName(argv[0]).rfind("python", 0) != 0)
+    return "";
+  for (size_t i = 1; i < argv.size(); ++i) {
+    const std::string& a = argv[i];
+    if (a == "-c" || a == "-m" || a == "-")
+      return ""; // code or a module, not a script file
+    if (a.empty() || a[0] != '-')
+      return executableBaseName(a);
+    if (a == "-W" || a == "-X") // options that take the next argument
+      ++i;
+  }
+  return "";
+}
+
+const std::string& hostScript() {
+  static const std::string* s = new std::string(
+      executableBaseName(hostExecutable()).rfind("python", 0) == 0 ? scriptOfCommandLine(commandLine())
+                                                                    : std::string());
+  return *s;
+}
+
+CopySignal copyProgramSignal() {
+  if (isCopyToolExecutable(hostExecutable()))
+    return CopySignal::kExecutable;
+  if (isRootToolProgram(hostExecutable()) || isRootToolProgram(hostScript()))
+    return CopySignal::kRootTool;
+  return CopySignal::kNone;
 }
 
 bool isGfalXrootdObject(const std::string& path) {
@@ -274,6 +341,7 @@ bool isRootIoObject(const std::string& path) {
 void copyDetectInit(const void* xrdclAnchor) {
   gAnchor.store(xrdclAnchor, std::memory_order_release);
   (void)hostExecutable();
+  (void)hostScript();
 #ifdef UCACHE_HAVE_BACKTRACE
   void* one[1];
   (void)::backtrace(one, 1); // the first call may load the unwinder: not inside an open
@@ -283,8 +351,8 @@ void copyDetectInit(const void* xrdclAnchor) {
 }
 
 CopySignal copierSignal() {
-  if (isCopyToolExecutable(hostExecutable()))
-    return CopySignal::kExecutable;
+  if (const CopySignal p = copyProgramSignal(); p != CopySignal::kNone)
+    return p;
   return copierStackSignal(kCopyStackDepth);
 }
 

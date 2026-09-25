@@ -54,7 +54,8 @@ namespace {
 
 // Bumped whenever the layout a store was made for could be computed
 // differently: a store of another version is replaced, never served.
-constexpr uint32_t kLayoutVersion = 1;
+// 2: RNTuple slot pages carry their checksum.
+constexpr uint32_t kLayoutVersion = 2;
 
 // Converted records wait in memory until this many bytes, the periodic
 // checkpoint, or the process's last close of the file, then go to the store in
@@ -614,8 +615,8 @@ bool decodeLayout(const std::vector<uint8_t>& blob, ColdFill& cf) {
     return false;
   uint64_t prev = L.slotsBegin;
   for (const auto& s : L.slots) {
-    // (An RNTuple slot is the page's DECODED size, which may be shorter than
-    // the page as stored with its checksum; a TTree slot holds the record.)
+    // (An RNTuple slot is the page's DECODED size plus its checksum, which may
+    // be shorter than the page as stored; a TTree slot holds the record.)
     if (s.vSeek < prev || s.vSeek + s.vLen > L.virtualSize ||
         (!cf.rnt && s.vLen < s.origLen) || s.origSeek + s.origLen > L.originSize)
       return false;
@@ -736,6 +737,10 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->rule = ReadRule::forFile(key.key, size);
 
   auto store = SlotStore::open(io, dir, key.hashHex);
+  // Several releases may share a cache: a newer uCache's store is left alone
+  // and the file served as stored, never replaced (it would replace ours back).
+  if (store && store->header().layoutVersion > kLayoutVersion)
+    return nullptr;
   if (store && !adoptable(store->header(), size, originMtime, cksumKind, originCksum)) {
     UCACHE_INFO("slot store for %s was made for another version of the file; replaced",
                 key.key.c_str());
@@ -754,7 +759,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     return nullptr; // not the layout this process has shown: never mix two
   bool created = false;
   if (!store) {
-    if (mode == AttachMode::kExisting)
+    if (mode == AttachMode::kExisting || SlotStore::newer(io, dir, key.hashHex))
       return nullptr;
     // A compact replica is served in its own layout, to readers who may hold
     // its offsets: a store is never made beside one.
@@ -985,19 +990,28 @@ bool copySlot(ColdFill& cf, uint32_t i, uint64_t from, uint64_t len, char* dest,
     rec = buf;
   }
   if (cf.rnt) {
-    // The store keeps the block; the reader is served the page decoded, which
-    // is exactly the slot's length.
-    if (rec->size() == fs.vLen) {
-      std::memcpy(dest, rec->data() + from, len);
-      recBytes = len;
-      return true;
+    // The store keeps the block; the reader is served the page decoded, then
+    // the decoded page's checksum: the slot's length.
+    const uint32_t pageLen = fs.vLen - tp::kSlotChecksumBytes;
+    std::vector<uint8_t> raw;
+    const uint8_t* page = rec->data();
+    if (rec->size() != pageLen) {
+      raw = tp::decompressFrames(rec->data(), rec->size(), pageLen);
+      if (raw.size() != pageLen) {
+        cf.forget(i);
+        return false;
+      }
+      page = raw.data();
     }
-    std::vector<uint8_t> raw = tp::decompressFrames(rec->data(), rec->size(), fs.vLen);
-    if (raw.size() != fs.vLen) {
-      cf.forget(i);
-      return false;
+    uint8_t sum[tp::kSlotChecksumBytes];
+    if (from + len > pageLen)
+      tp::sealDecodedPage(page, pageLen, sum);
+    if (from < pageLen) {
+      const uint64_t n = std::min<uint64_t>(len, pageLen - from);
+      std::memcpy(dest, page + from, n);
     }
-    std::memcpy(dest, raw.data() + from, len);
+    for (uint64_t p = std::max<uint64_t>(from, pageLen); p < from + len; ++p)
+      dest[p - from] = static_cast<char>(sum[p - pageLen]);
     recBytes = len;
     return true;
   }
@@ -1134,7 +1148,8 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   const uint64_t t0 = nowUs();
   if (cf.rnt) {
     const ColdFill::Page& pg = cf.pages[i];
-    tp::ConvertedPage p = tp::convertPage(rec, recLen, pg.nbytes, pg.hasChecksum, slot.vLen);
+    tp::ConvertedPage p =
+        tp::convertPage(rec, recLen, pg.nbytes, pg.hasChecksum, slot.vLen - tp::kSlotChecksumBytes);
     const uint64_t us = nowUs() - t0;
     if (!p.error.empty()) {
       // A page whose checksum or decode fails must not be served decoded: the

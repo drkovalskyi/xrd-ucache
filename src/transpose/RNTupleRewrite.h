@@ -97,14 +97,21 @@ RNTupleRewrite buildRNTupleRewriteFromPages(
 // the first read, computed from metadata alone (see FillLayout.h for the TTree
 // counterpart and the shape of the result). A page's uncompressed size IS in
 // the metadata, so every page of a convertible column range gets a slot of
-// exactly that size and is served DECODED: its record's locator points at the
-// slot with size = uncompressed size (ROOT copies a page whose stored and
-// uncompressed sizes agree), its checksum flag is cleared, and the range's
-// compression setting becomes 0. The rebuilt page list and footer come first in
+// that size plus its checksum and is served DECODED: its record's locator
+// points at the slot with size = uncompressed size (ROOT copies a page whose
+// stored and uncompressed sizes agree), its checksum flag is SET, and the
+// range's compression setting becomes 0. The 8 bytes after the page are the
+// checksum of the decoded bytes (sealDecodedPage), so a reader verifies every
+// page it is served exactly as it would the original's. The rebuilt page list and footer come first in
 // the extension, the anchor is patched in place, and the header says the new
 // end. `header` = the file's first fBEGIN bytes. `slots[i].branch` is the
 // range index and `.basket` the page index; a page several records share gets
 // one slot. Declines (error set) rather than guess.
+// The checksum a slot serves after a decoded page: XXH3-64 of the page's
+// bytes, little-endian, as the format stores a page checksum.
+inline constexpr uint32_t kSlotChecksumBytes = 8;
+void sealDecodedPage(const uint8_t* page, size_t n, uint8_t out[kSlotChecksumBytes]);
+
 FillLayout layoutForRNTupleFill(const RNTupleMeta& m, uint64_t fileSize,
                                 const std::vector<uint8_t>& header,
                                 const std::vector<std::string>& codecs);

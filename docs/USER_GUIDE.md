@@ -245,7 +245,8 @@ dir = /path/on/a/local/disk/ucache
 # the same job needs from a replica made by `ucache recompress`. If your jobs
 # run short of memory, leave it off and build replicas with `ucache recompress`
 # instead. Turning it off later does not change files already recompressed
-# this way: remove those first (`ucache untranspose <url>`, or `ucache clear`).
+# this way: remove those first, while no job is reading them (`ucache
+# untranspose <url>`, or `ucache clear`; a job still reading one would fail).
 # recompress = on
 #
 # TTree files only: each basket gets room for this many times its stored size
@@ -766,8 +767,11 @@ A copy is meant to be the file, so a copy never goes through the cache. These
 are recognised and read straight from the origin, and never enter or use the
 cache: `xrdcp` (and `xrdcopy`), `xrdfs cat`/`tail`, `xrdadler32`,
 `edmCopyUtil`, XRootD's copy engine from any program or language (Python's
-`XRootD.client.CopyProcess`, `gfal-copy`, `rucio download`), and ROOT's
-`TFile::Cp`. Only the copy's own file handle is affected: a program that reads
+`XRootD.client.CopyProcess`, `gfal-copy`, `rucio download`), ROOT's
+`TFile::Cp`, and ROOT's own tools that merge, copy or report on files: `hadd`,
+the command-line tools (`rootcp`, `rootmv`, `rooteventselector`,
+`rootslimtree`, `rootls`, `rootprint`, ...) and `TFileMerger` given a file's
+name. Only the copy's own file handle is affected: a program that reads
 a file and also copies one keeps its reads cached. A checksum asked for at the
 end of a copy (`xrdcp --cksum`, `gfal-copy -K`) is the origin's. Because a copy
 reads the origin, it needs the origin to be reachable, even for a file that is
@@ -775,10 +779,13 @@ cached.
 
 A copy made any other way reads through the cache like any reader, and for a
 file with a replica it copies the replica's layout: reading a file handle in a
-loop (fsspec's `get` or `open().read()`, a hand-written loop), ROOT's fast
-cloning (`rootcp`, `hadd`), and copies through an XRootD proxy or a FUSE mount
-with uCache inside it. Make those copies with the cache switched off:
-`UCACHE_DISABLE=1 …`. Each handle recognised as a copy is counted in
+loop (fsspec's `get` or `open().read()`, a hand-written loop), fast cloning
+inside a program of your own (`CloneTree(-1, "fast")` on a tree it opened), and
+copies through an XRootD proxy or a FUSE mount with uCache inside it. Make those
+copies with the cache switched off: `UCACHE_DISABLE=1 …`. The same holds for
+inspecting a file's real form from your own session: `TTree::Print`,
+`TFile::Map` or the `RNTupleInspector` report the sizes and codecs of the layout
+they are shown. Each handle recognised as a copy is counted in
 `copier_handles` (`ucache stats`); `copy_detect = off` turns the recognition
 off.
 
@@ -893,10 +900,11 @@ it reads them. Two consequences:
 
 - A copy is still the origin's file: `xrdcp`, `xrdfs`, `xrdadler32`, XRootD's
   copy engine from any language (`gfal-copy`, `rucio download`, Python's
-  `CopyProcess`) and ROOT's `TFile::Cp` are recognised and read straight from
-  the origin (see "Copies are the origin's bytes" above). A copy made any other
-  way — a read loop, fsspec's `get`, `rootcp`/`hadd` — gets the larger layout:
-  make it with `UCACHE_DISABLE=1`.
+  `CopyProcess`), ROOT's `TFile::Cp`, `hadd` and ROOT's command-line tools are
+  recognised and read straight from the origin (see "Copies are the origin's
+  bytes" above). A copy made any other way — a read loop, fsspec's `get`, fast
+  cloning in your own program — gets the larger layout: make it with
+  `UCACHE_DISABLE=1`.
 - Do not share a cache directory with uCache 1.2.0 or older. It does not know
   these replicas: it serves such files from the byte cache and the origin
   (correctly, but slowly) and can leave the replicas behind when it evicts.

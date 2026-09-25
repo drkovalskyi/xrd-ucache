@@ -1396,8 +1396,9 @@ namespace {
 void noteCopier(CopySignal sig, const std::string& url) {
   static std::atomic<bool> said{false};
   const std::string where = url.substr(0, url.find('?'));
-  const std::string what = sig == CopySignal::kExecutable
-                               ? std::string(copySignalName(sig)) + " (" + hostExecutable() + ")"
+  const std::string program = hostScript().empty() ? hostExecutable() : hostScript();
+  const std::string what = sig == CopySignal::kExecutable || sig == CopySignal::kRootTool
+                               ? std::string(copySignalName(sig)) + " (" + program + ")"
                                : std::string(copySignalName(sig));
   if (!said.exchange(true, std::memory_order_relaxed))
     UCACHE_INFO("%s is opened by %s: copies are read straight from the origin, not through the "

@@ -135,8 +135,9 @@ not to cache, and says the cache is under pressure rather than broken.
   (failed page writes, failed sidecar persists). `disabled_handles` —
   handles that tripped `UCACHE_MAX_ERRORS` (plugin layer).
 - `copier_handles` (plugin layer) — file handles opened for a copy: by a copy
-  tool (`xrdcp`, `xrdfs`, `xrdadler32`, `edmCopyUtil`), from inside XRootD's
-  copy engine, from ROOT's `TFile::Cp` or from gfal2's xrootd plugin. They are
+  tool (`xrdcp`, `xrdfs`, `xrdadler32`, `edmCopyUtil`), by `hadd` or one of
+  ROOT's command-line tools, from inside XRootD's copy engine, from ROOT's
+  `TFile::Cp` or `TFileMerger`, or from gfal2's xrootd plugin. They are
   served as pure pass-through, so a copy is the origin's bytes: their reads
   are in `relay_bytes`, and they add nothing to the cache. Zero with
   `copy_detect = off`.

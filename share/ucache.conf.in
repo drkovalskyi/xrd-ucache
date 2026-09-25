@@ -27,7 +27,8 @@ dir = {{DIR}}
 # the same job needs from a replica made by `ucache recompress`. If your jobs
 # run short of memory, leave it off and build replicas with `ucache recompress`
 # instead. Turning it off later does not change files already recompressed
-# this way: remove those first (`ucache untranspose <url>`, or `ucache clear`).
+# this way: remove those first, while no job is reading them (`ucache
+# untranspose <url>`, or `ucache clear`; a job still reading one would fail).
 # recompress = on
 #
 # TTree files only: each basket gets room for this many times its stored size

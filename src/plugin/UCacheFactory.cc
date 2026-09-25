@@ -82,10 +82,10 @@ void announceIdentity(const Config& cfg) {
                  cfg.disable ? "disabled" : "no cache dir");
     return;
   }
-  if (cfg.copyDetect && isCopyToolExecutable(hostExecutable())) {
-    UCACHE_DEBUG("not announcing: %s only copies, and copies are read straight from the "
-                 "origin, so the reads a server sees are the program's own",
-                 hostExecutable().c_str());
+  if (cfg.copyDetect && copyProgramSignal() != CopySignal::kNone) {
+    UCACHE_DEBUG("not announcing: %s only copies, merges or inspects, and those read straight "
+                 "from the origin, so the reads a server sees are the program's own",
+                 hostScript().empty() ? hostExecutable().c_str() : hostScript().c_str());
     return;
   }
   XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv();

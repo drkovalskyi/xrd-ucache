@@ -15,9 +15,16 @@
 //
 //   - the program: xrdcp (and its xrdcopy alias), xrdfs, xrdadler32 and
 //     edmCopyUtil only ever copy, so every read handle they open is a copy;
+//     and hadd and ROOT's command-line tools (rootcp, rootls, ...) only merge,
+//     copy or inspect files, so they are treated the same way: a merge that
+//     copies baskets as it reads them, or a tool reporting a file's sizes and
+//     codecs, must see the origin's file, not the cache's layout. Most of
+//     ROOT's tools are Python scripts, recognised by the script the
+//     interpreter runs;
 //   - the call stack: a handle opened from inside XRootD's copy engine (the
 //     one xrdcp, Python's XRootD.client.CopyProcess, gfal2 and rucio use), from
-//     ROOT's static TFile::Cp, or from gfal2's xrootd plugin.
+//     ROOT's static TFile::Cp or its file merger (TFileMerger, which hadd
+//     uses, opening an input by name), or from gfal2's xrootd plugin.
 //
 // The stack check compares return addresses against address ranges that are
 // resolved once per set of loaded libraries: the copy-engine functions are
@@ -35,9 +42,12 @@
 // layout a file was shown in.
 //
 // Not recognised, by construction: a copy made by reading a file handle in a
-// loop (fsspec's get and open().read(), a hand-written loop), ROOT's fast
-// cloning (rootcp, hadd), and a copy through an XRootD proxy or a FUSE mount
-// that has uCache inside it. Those copy with the cache switched off.
+// loop (fsspec's get and open().read(), a hand-written loop), fast cloning or
+// inspection inside a program of the user's own (TTree::CloneTree(-1, "fast"),
+// TTree::Print on a file it opened to analyse), a merge of files the program
+// opened itself before handing them to TFileMerger, and a copy through an
+// XRootD proxy or a FUSE mount that has uCache inside it. Those copy with the
+// cache switched off.
 //
 // This file has no XRootD dependency, so it is unit-tested on its own.
 //
@@ -50,6 +60,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ucache {
 
@@ -59,6 +70,8 @@ enum class CopySignal : uint8_t {
   kCopyEngine, // opened from inside XRootD's copy engine
   kRootCp,     // opened from inside ROOT's TFile::Cp
   kGfal,       // opened from inside gfal2's xrootd plugin
+  kRootTool,   // the program is hadd or one of ROOT's command-line tools
+  kMerge,      // opened from inside ROOT's TFileMerger
 };
 
 // What the signal was, in words, for a log line ("XRootD's copy engine").
@@ -79,8 +92,19 @@ inline constexpr const char* kCopyEngineSymbols[] = {
     "_ZN5XrdCl11CopyProcess3RunEPNS_19CopyProgressHandlerE",       // CopyProcess::Run
     "_ZN5XrdCl6XCpSrc3RunEPv", // XCpSrc::Run: a multi-source copy's reader thread
 };
+// hadd and ROOT's command-line tools: matched against the executable's file
+// name, and, when the program is a Python interpreter, the file name of the
+// script it runs.
+inline constexpr const char* kRootToolPrograms[] = {
+    "hadd",   "rootcp",       "rootmv",     "rooteventselector", "rootslimtree", "rootls",
+    "rootprint", "rootdrawtree", "rootbrowse", "rootrm",            "rootmkdir"};
+
 // static Bool_t TFile::Cp(const char*, const char*, Bool_t, UInt_t), in libRIO.
 inline constexpr const char* kRootCpSymbol = "_ZN5TFile2CpEPKcS1_bj";
+// TFileMerger, in libRIO: AddFile(const char*, Bool_t) opens an input by name;
+// OpenExcessFiles() reopens inputs a merge of many files had to close.
+inline constexpr const char* kRootMergeSymbols[] = {"_ZN11TFileMerger7AddFileEPKcb",
+                                                    "_ZN11TFileMerger15OpenExcessFilesEv"};
 // gfal2's xrootd plugin has no SONAME and is loaded by path; its file name is
 // libgfal_plugin_xrootd.so.
 inline constexpr const char* kGfalXrootdPrefix = "libgfal_plugin_xrootd";
@@ -95,8 +119,18 @@ inline constexpr int kCopyStackDepth = 32;
 // appends to the link of an executable replaced while it runs).
 std::string executableBaseName(const std::string& path);
 bool isCopyToolExecutable(const std::string& base);
+bool isRootToolProgram(const std::string& base);
 // The running program's file name ("" if it cannot be found). Computed once.
 const std::string& hostExecutable();
+// For a program that is a Python interpreter, the file name of the script it
+// runs: the first argument that is not an option ("" for none, for -c and -m,
+// and for any other program). `argv` is the whole command line.
+std::string scriptOfCommandLine(const std::vector<std::string>& argv);
+// scriptOfCommandLine of this process's command line. Computed once.
+const std::string& hostScript();
+// kExecutable or kRootTool when the program alone makes every read a copy,
+// else kNone. Free: both names are computed once.
+CopySignal copyProgramSignal();
 // Whether a loaded object is gfal2's xrootd plugin / ROOT's I/O library, by
 // its path.
 bool isGfalXrootdObject(const std::string& path);

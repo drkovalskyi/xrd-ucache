@@ -6,7 +6,8 @@
 //                      return type, so this one is identical), an anchor that
 //                      names the library, and a function that is NOT a copy;
 //   UCACHE_FAKE_GFAL   is named libgfal_plugin_xrootd: any frame in it counts;
-//   UCACHE_FAKE_RIO    is named libRIO and exports the static TFile::Cp.
+//   UCACHE_FAKE_RIO    is named libRIO and exports the static TFile::Cp and
+//                      TFileMerger::AddFile(const char*, bool).
 //
 // Each calls back into the test from inside the function that matters, so the
 // test can ask the detector what it sees from there. Built with sibling calls
@@ -78,6 +79,33 @@ __attribute__((noinline)) bool TFile::Cp(const char* src, const char*, bool, uns
 
 extern "C" FAKE_EXPORT int ucache_fake_root_cp(FakeCall* c) {
   const bool ok = TFile::Cp(reinterpret_cast<const char*>(c), "", false, 0);
+  asm volatile("" ::: "memory");
+  return ok ? 0 : 1;
+}
+
+class FAKE_EXPORT TFileMerger {
+ public:
+  bool AddFile(const char* url, bool cpProgress);
+  bool OpenExcessFiles();
+  bool Merge(bool); // not where an input is opened: must not count
+};
+__attribute__((noinline)) bool TFileMerger::AddFile(const char* url, bool) {
+  callBack(reinterpret_cast<FakeCall*>(const_cast<char*>(url)));
+  asm volatile("" ::: "memory");
+  return true;
+}
+__attribute__((noinline)) bool TFileMerger::OpenExcessFiles() {
+  asm volatile("" ::: "memory");
+  return true;
+}
+__attribute__((noinline)) bool TFileMerger::Merge(bool) {
+  asm volatile("" ::: "memory");
+  return true;
+}
+
+extern "C" FAKE_EXPORT int ucache_fake_merger_add(FakeCall* c) {
+  TFileMerger m;
+  const bool ok = m.AddFile(reinterpret_cast<const char*>(c), false);
   asm volatile("" ::: "memory");
   return ok ? 0 : 1;
 }

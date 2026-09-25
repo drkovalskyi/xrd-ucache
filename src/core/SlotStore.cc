@@ -142,13 +142,22 @@ SlotStore::~SlotStore() {
 
 namespace {
 
-enum class Read { kOk, kAbsent, kUnusable };
+enum class Read { kOk, kAbsent, kUnusable, kNewer };
+
+// A header in a format newer than this build's: the magic, and a version above
+// ours at offset 8 (every format keeps both where they are).
+bool newerFormat(const uint8_t* p, size_t n) {
+  return n >= 12 && std::memcmp(p, kMagic, 8) == 0 &&
+         get<uint32_t>(p, 8) > SlotStoreHeader::kFormatVersion;
+}
 
 // Header and layout blob of an open store.
 Read readHeadAndBlob(IOBackend& io, int fd, SlotStoreHeader& h, std::vector<uint8_t>& blob) {
   std::vector<uint8_t> b(SlotStore::kHeaderBytes);
-  if (io.preadFull(fd, b.data(), b.size(), 0) != static_cast<int64_t>(b.size()) ||
-      !decodeSlotHeader(b.data(), b.size(), h))
+  const int64_t got = io.preadFull(fd, b.data(), b.size(), 0);
+  if (got >= 12 && newerFormat(b.data(), static_cast<size_t>(got)))
+    return Read::kNewer;
+  if (got != static_cast<int64_t>(b.size()) || !decodeSlotHeader(b.data(), b.size(), h))
     return Read::kUnusable;
   blob.resize(h.blobLen);
   if (h.blobLen &&
@@ -201,15 +210,21 @@ std::shared_ptr<SlotStore> SlotStore::openOrCreate(IOBackend& io, const std::str
     if (fd >= 0) {
       SlotStoreHeader h;
       std::vector<uint8_t> b;
-      if (readHeadAndBlob(io, fd, h, b) == Read::kOk)
+      const Read r = readHeadAndBlob(io, fd, h, b);
+      if (r == Read::kOk)
         return std::shared_ptr<SlotStore>(new SlotStore(io, fd, p, std::move(h), std::move(b)));
+      if (r == Read::kNewer) {
+        io.close(fd);
+        err = "a newer uCache made its store; left in place";
+        return nullptr;
+      }
       const bool debris = isDebris(io, fd);
       io.close(fd);
       if (!debris) {
         err = "store being written by another process";
         return nullptr;
       }
-      io.unlink(p); // a creation that died, or a format this build cannot read
+      io.unlink(p); // a creation that died, or an older format this build replaces
       continue;
     }
     if (fd != -ENOENT) {
@@ -264,10 +279,23 @@ bool SlotStore::serving(IOBackend& io, const std::string& objectDir, const std::
     return false;
   std::vector<uint8_t> b(kHeaderBytes);
   SlotStoreHeader h;
-  const bool ok = io.preadFull(fd, b.data(), b.size(), 0) == static_cast<int64_t>(b.size()) &&
-                  decodeSlotHeader(b.data(), b.size(), h) && !h.declined;
+  const int64_t got = io.preadFull(fd, b.data(), b.size(), 0);
+  const bool ok = (got >= 12 && newerFormat(b.data(), static_cast<size_t>(got))) ||
+                  (got == static_cast<int64_t>(b.size()) &&
+                   decodeSlotHeader(b.data(), b.size(), h) && !h.declined);
   io.close(fd);
   return ok;
+}
+
+bool SlotStore::newer(IOBackend& io, const std::string& objectDir, const std::string& hashHex) {
+  int fd = io.open(path(objectDir, hashHex), O_RDONLY | O_CLOEXEC, 0);
+  if (fd < 0)
+    return false;
+  uint8_t b[12];
+  const bool n = io.preadFull(fd, b, sizeof b, 0) == static_cast<int64_t>(sizeof b) &&
+                 newerFormat(b, sizeof b);
+  io.close(fd);
+  return n;
 }
 
 bool SlotStore::holdsRecords(IOBackend& io, const std::string& objectDir,

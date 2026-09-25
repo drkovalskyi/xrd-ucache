@@ -373,6 +373,55 @@ TEST(SlotStore, AStoreBeingCreatedIsNotUsedAndOldDebrisIsReplaced) {
   EXPECT_TRUE(created);
 }
 
+// Several releases may share one cache. A store in a format newer than this
+// build's is never unlinked or replaced (the newer build would replace ours
+// back, and readers holding either layout's offsets would lose them), never
+// served, and still counts as the file's store, so no compact replica is built
+// beside it. An older format is replaced, as before.
+TEST(SlotStore, ANewerUCachesStoreIsLeftInPlaceAndOlderOnesAreReplaced) {
+  TempDir t;
+  RealIO io;
+  const std::string p = SlotStore::path(t.path(), kHash);
+  auto writeFormat = [&](uint32_t version) {
+    auto b = encodeSlotHeader(hdr());
+    std::memcpy(b.data() + 8, &version, 4);
+    const uint32_t crc = crc32c(b.data(), SlotStore::kHeaderBytes - 4);
+    std::memcpy(b.data() + SlotStore::kHeaderBytes - 4, &crc, 4);
+    b.resize(b.size() + 8192, 0x5a);
+    int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT_EQ(::write(fd, b.data(), b.size()), static_cast<ssize_t>(b.size()));
+    ::close(fd);
+    struct utimbuf old{::time(nullptr) - 3600, ::time(nullptr) - 3600};
+    ASSERT_EQ(::utime(p.c_str(), &old), 0); // well past the age debris is taken for
+  };
+
+  writeFormat(SlotStoreHeader::kFormatVersion + 1);
+  struct ::stat before;
+  ASSERT_EQ(::stat(p.c_str(), &before), 0);
+  EXPECT_FALSE(SlotStore::open(io, t.path(), kHash));
+  EXPECT_TRUE(SlotStore::newer(io, t.path(), kHash));
+  EXPECT_TRUE(SlotStore::serving(io, t.path(), kHash));
+  EXPECT_FALSE(SlotStore::holdsRecords(io, t.path(), kHash));
+  bool created = true;
+  std::string err;
+  EXPECT_FALSE(SlotStore::openOrCreate(io, t.path(), kHash, hdr(), blob(), created, err));
+  EXPECT_FALSE(created);
+  EXPECT_NE(err.find("newer"), std::string::npos) << err;
+  struct ::stat after;
+  ASSERT_EQ(::stat(p.c_str(), &after), 0); // still there, the same file, untouched
+  EXPECT_EQ(after.st_ino, before.st_ino);
+  EXPECT_EQ(after.st_size, before.st_size);
+
+  writeFormat(1); // an older format
+  EXPECT_FALSE(SlotStore::newer(io, t.path(), kHash));
+  EXPECT_FALSE(SlotStore::serving(io, t.path(), kHash));
+  auto s = SlotStore::openOrCreate(io, t.path(), kHash, hdr(), blob(), created, err);
+  ASSERT_TRUE(s) << err;
+  EXPECT_TRUE(created);
+  EXPECT_FALSE(SlotStore::newer(io, t.path(), kHash));
+  EXPECT_TRUE(SlotStore::serving(io, t.path(), kHash));
+}
+
 TEST(SlotStore, ADroppedOrReplacedStoreTakesNoMoreRecords) {
   TempDir t;
   RealIO io;

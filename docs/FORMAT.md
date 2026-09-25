@@ -174,7 +174,10 @@ Rules:
 The replica of a file recompressed as it is read (`recompress = on`). The file
 is served to readers in its SLOT layout: every convertible basket (TTree) or
 page (RNTuple) of the original sits in a slot past the original end, sized so
-its converted record fits, followed by zeros. That layout is fixed when the
+its converted record fits, followed by zeros. An RNTuple slot is the page
+DECODED, followed by 8 bytes: the XXH3-64 of the decoded page, little-endian,
+the page's checksum in the format's own convention (the page list flags every
+such page as checksummed), so a reader verifies each page it is served. That layout is fixed when the
 store is created and never changes, so a reader may reopen the file at any
 time and find its offsets unchanged. All integers little-endian.
 
@@ -189,8 +192,8 @@ Header:
 | offset | size | field | notes |
 |---|---|---|---|
 | 0 | 8 | magic | `"UCSLOTS1"` |
-| 8 | 4 | format_version u32 | = 2; other → store not used (and replaced when a new one is made) |
-| 12 | 4 | layout_version u32 | the layout algorithm; other → store replaced |
+| 8 | 4 | format_version u32 | = 2. Below 2: not used, and replaced when a new store is made. Above 2 (a newer uCache's store): left in place — never replaced, unlinked or served; the file is served as stored |
+| 12 | 4 | layout_version u32 | the layout algorithm. Lower than this build's: store replaced; higher: left in place, as a newer format is |
 | 16 | 1 | container u8 | 0 = TTree, 1 = RNTuple |
 | 18 | 1 | declined u8 | 1 = the file is not served this way (nothing else follows) |
 | 20 | 4 | n_slots u32 | |
@@ -254,6 +257,10 @@ to. A kept-as-stored entry has no record: the slot is served from the byte
 cache's copy of the original basket, with its `fSeekKey` pointing at the slot.
 The last valid entry for a slot wins.
 
+- **Releases sharing a cache:** every format keeps the magic at offset 0 and
+  format_version at offset 8, so any build can tell a newer store from debris.
+  A newer store still counts as the file's store: no compact replica is made
+  beside it.
 - **Creation:** header and blob are written to `.slots.tmp.<pid>.<n>`, then
   `link()`ed into place. That fails if the store already exists, so a store is
   never visible without its layout.

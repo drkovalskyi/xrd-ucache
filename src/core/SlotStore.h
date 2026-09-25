@@ -86,22 +86,32 @@ class SlotStore {
 
   // The entry's store, or null if there is none, or it is not usable: a header
   // being written right now, a layout blob failing its CRC, a format this
-  // build does not know. Nothing is compared against the file here.
+  // build does not know (newer() tells that one apart). Nothing is compared
+  // against the file here.
   static std::shared_ptr<SlotStore> open(IOBackend& io, const std::string& objectDir,
                                          const std::string& hashHex);
 
   // The store, created from `want` and `blob` if there is none. When one
   // exists (made by someone else, perhaps a moment ago) it is returned as it
   // is and `created` is false: its header and layout are the ones to serve.
-  // Null on I/O failure (err set). `want.storeId` is ignored and generated.
+  // Null on I/O failure (err set), and when a newer uCache's store is there
+  // (newer()): that one is left in place, neither replaced nor served.
+  // `want.storeId` is ignored and generated.
   static std::shared_ptr<SlotStore> openOrCreate(IOBackend& io, const std::string& objectDir,
                                                  const std::string& hashHex, SlotStoreHeader want,
                                                  const std::vector<uint8_t>& blob, bool& created,
                                                  std::string& err);
 
-  // Is there a store here that files are served from (a valid header, not
-  // DECLINED)? Reads only the header.
+  // Is there a store here that the file's layout belongs to: one this build
+  // serves (a valid header, not DECLINED), or a newer uCache's (newer())? No
+  // compact replica is made beside either. Reads only the header.
   static bool serving(IOBackend& io, const std::string& objectDir, const std::string& hashHex);
+
+  // Is there a store here made by a newer uCache, in a format this build does
+  // not know? Several releases may share a cache: this build never unlinks,
+  // replaces or serves such a store, and serves the file as stored. Every
+  // format keeps the magic at offset 0 and its version at offset 8.
+  static bool newer(IOBackend& io, const std::string& objectDir, const std::string& hashHex);
 
   // Is there a serving store that has recompressed something: one that runs
   // past its layout (only commit blocks lie there)? A store with its layout and

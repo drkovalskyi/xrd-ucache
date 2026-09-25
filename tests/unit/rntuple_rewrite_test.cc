@@ -323,8 +323,9 @@ TEST(RNTupleFill, LayoutParsesBackAndServesTheSamePages) {
     ConvertedPage c = convertPage(orig.data() + s.origSeek, s.origLen, pg.nbytes, pg.hasChecksum,
                                   pg.uncompressedBytes);
     ASSERT_TRUE(c.error.empty()) << c.error;
-    ASSERT_EQ(c.raw.size(), s.vLen);
+    ASSERT_EQ(c.raw.size() + kSlotChecksumBytes, s.vLen);
     std::memcpy(v.b.data() + s.vSeek, c.raw.data(), c.raw.size());
+    sealDecodedPage(c.raw.data(), c.raw.size(), v.b.data() + s.vSeek + c.raw.size());
   }
 
   RNTupleMeta t = parseRNTuple(v, static_cast<int64_t>(v.b.size()), "");
@@ -334,9 +335,12 @@ TEST(RNTupleFill, LayoutParsesBackAndServesTheSamePages) {
   for (uint32_t ri : L.relocated)
     for (const auto& pg : t.ranges[ri].pages) {
       EXPECT_EQ(pg.nbytes, pg.uncompressedBytes);
-      EXPECT_FALSE(pg.hasChecksum);
+      EXPECT_TRUE(pg.hasChecksum); // every page a reader is served can be verified
       EXPECT_GE(pg.offset, L.slotsBegin);
-      EXPECT_LE(pg.offset + pg.nbytes, L.virtualSize);
+      EXPECT_LE(pg.offset + pg.nbytes + kSlotChecksumBytes, L.virtualSize);
+      // The checksum after the page is the decoded page's, as a reader checks it.
+      EXPECT_EQ(convertPage(v.b.data() + pg.offset, pg.nbytes + kSlotChecksumBytes, pg.nbytes, true,
+                            pg.uncompressedBytes).error, "");
       ++relocatedPages;
     }
   EXPECT_GT(relocatedPages, L.slots.size() - 1); // shared pages: records >= slots

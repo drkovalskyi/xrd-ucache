@@ -88,11 +88,13 @@ int rntupleMain(const char* inPath, const char* outPath, const std::vector<std::
       return 1;
     const auto& pg = m.ranges[s.branch].pages[s.basket];
     ConvertedPage c = convertPage(rec.data(), rec.size(), pg.nbytes, pg.hasChecksum, pg.uncompressedBytes);
-    if (!c.error.empty() || c.raw.size() != s.vLen) {
+    if (!c.error.empty() || c.raw.size() + kSlotChecksumBytes != s.vLen) {
       std::fprintf(stderr, "page at %llu: %s\n", (unsigned long long)s.origSeek, c.error.c_str());
       return 1;
     }
-    if (!writeAll(out, c.raw.data(), c.raw.size()))
+    uint8_t sum[kSlotChecksumBytes];
+    sealDecodedPage(c.raw.data(), c.raw.size(), sum);
+    if (!writeAll(out, c.raw.data(), c.raw.size()) || !writeAll(out, sum, sizeof sum))
       return 1;
     rawBytes += c.raw.size();
     encBytes += c.enc.size();
