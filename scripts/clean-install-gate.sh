@@ -9,9 +9,11 @@
 #      + settings, cache dir explicit) in XrdCl's default user plugin dir
 #      (passwd home); no dotfiles, no env vars,
 #   4. starts a self-contained local xrootd origin over a temp file,
-#   5. with a COMPLETELY clean environment (no XRD_/UCACHE_ vars at all —
+#   5. with a clean environment (no XRD_/UCACHE_ vars that affect activation —
 #      activation only via the default-dir conf), reads the file TWICE via the
-#      plugin and asserts the warm pass fetches ZERO bytes from the origin,
+#      plugin and asserts the warm pass fetches ZERO bytes from the origin; then
+#      copies a second file with a plain xrdcp and asserts the copy is the
+#      origin's bytes and never entered the cache,
 #   6. breaks the install and asserts the read still succeeds (fail-open),
 #      with `ucache doctor` reporting not-engaged.
 #
@@ -74,6 +76,7 @@ grep -q "^dir = $CACHE" "$CONF_FILE" || fail "conf lacks the explicit cache dir"
 
 say "4. start a self-contained local xrootd origin"
 head -c 4194304 /dev/urandom > "$ORIGINDIR/probe.bin"       # 4 MiB test object
+head -c 1048576 /dev/urandom > "$ORIGINDIR/copy.bin"        # 1 MiB, copied in step 5b
 # xrootd refuses to run as uid 0; in a root container (CI) hand the origin to
 # a scratch user. Everywhere else run it as the invoking (unprivileged) user.
 XRD=(env -u LD_LIBRARY_PATH xrootd)
@@ -90,15 +93,31 @@ sleep 2
 # carries the ABSOLUTE path of the probe file.
 URL="root://localhost:$PORT/$ORIGINDIR/probe.bin"
 
-# Zero-env activation: no XRD_* or UCACHE_* variables at all —
-# XrdCl finds the conf in the default user plugin dir, and the cache dir
-# comes from the conf's explicit `dir =` line.
+# Zero-env activation: no XRD_PLUGINCONFDIR or UCACHE_DIR — XrdCl finds the
+# conf in the default user plugin dir, and the cache dir comes from the conf's
+# explicit `dir =` line.
 read_via_plugin() { # -> exit code of xrdcp
-  # xrdcp >= 5.8 transfers via PgRead, which the plugin deliberately relays
-  # uncached (analysis clients use Read/ReadV, which cache). Disable xrdcp's
-  # pgread path so this smoke-test exercises the cached path.
-  env -u XRD_PLUGINCONFDIR -u UCACHE_DIR XRD_CPUSEPGWRTRD=0 \
+  # xrdcp is a copy tool, and uCache reads a copy straight from the origin (a
+  # copy is the origin's bytes) unless copy detection is off. And xrdcp >= 5.8
+  # transfers via PgRead, which the plugin deliberately relays uncached
+  # (analysis clients use Read/ReadV, which cache). Neither setting touches
+  # activation: with both, this smoke-test exercises the cached path.
+  env -u XRD_PLUGINCONFDIR -u UCACHE_DIR UCACHE_COPY_DETECT=off XRD_CPUSEPGWRTRD=0 \
     xrdcp -f "$URL" /tmp/ucache-gate/out.bin >/dev/null 2>&1
+}
+metas() { ls "$CACHE"/objects/*/*.meta 2>/dev/null | wc -l; }
+stat_sum() { # $1 = counter: summed over the last line of every stats file
+  python3 - "$CACHE/stats" "$1" <<'PY'
+import sys,glob,re
+tot=0
+for f in glob.glob(sys.argv[1]+"/*.jsonl"):
+    last=""
+    for l in open(f):
+        if l.strip().endswith("}"): last=l
+    m=re.search(r'"%s":(\d+)' % sys.argv[2],last) if last else None
+    if m: tot+=int(m.group(1))
+print(tot)
+PY
 }
 origin_bytes() { # sum origin_bytes across stats files
   python3 - "$CACHE/stats" <<'PY'
@@ -122,6 +141,16 @@ rm -f "$CACHE"/stats/*.jsonl
 read_via_plugin || fail "warm read failed"
 WARM=$(origin_bytes); echo "warm origin_bytes=$WARM"
 [ "$WARM" -eq 0 ] || fail "warm read fetched $WARM bytes (expected 0 — cache not serving)"
+
+say "5b. a plain xrdcp is a copy: the origin's bytes, nothing cached"
+N0=$(metas)
+env -u XRD_PLUGINCONFDIR -u UCACHE_DIR xrdcp -f "root://localhost:$PORT/$ORIGINDIR/copy.bin" \
+    /tmp/ucache-gate/copy.bin >/dev/null 2>&1 || fail "plain xrdcp failed"
+[ "$(sha256sum < "$ORIGINDIR/copy.bin")" = "$(sha256sum < /tmp/ucache-gate/copy.bin)" ] ||
+  fail "the copy differs from the origin's file"
+[ "$(metas)" = "$N0" ] || fail "a plain xrdcp created a cache entry (copies must bypass the cache)"
+COPIES=$(stat_sum copier_handles); echo "copier_handles=$COPIES"
+[ "$COPIES" -gt 0 ] || fail "the copy was not counted as one (plugin not engaged, or copy detection off?)"
 
 say "6. fail-open: break the plugin, read must still succeed"
 mv "$PREFIX"/lib*/libXrdClUCache.so /tmp/ucache-gate/broken.so

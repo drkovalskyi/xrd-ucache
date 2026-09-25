@@ -20,8 +20,13 @@
 // listed, and baskets whose conversion does not fit their slot.
 //
 // A file with a store is always served in its layout, whatever `recompress`
-// says; with recompression off, a slot not yet converted is served its
-// original record, and nothing is added to the store.
+// says, and a slot read for the first time is converted as usual:
+// `recompress = off` only stops a file with no store from getting one.
+//
+// A file this process reads directly (max_read_fraction, ReadRule.h) is still
+// served in its layout -- the reader may hold its offsets -- but what the
+// process converts is served and never committed, and nothing it fetches
+// enters the byte cache except the file's own records.
 //
 // Thread-safety: every entry point is thread-safe. The per-file state is shared
 // by every handle of the file in the process and guards itself; requests run

@@ -15,7 +15,7 @@ find_path(UCACHE_LZ4_INC lz4.h)
 
 if (UCACHE_LZMA AND UCACHE_ZLIB AND UCACHE_ZSTD AND UCACHE_LZMA_INC AND UCACHE_ZSTD_INC)
   add_library(ucache-transpose STATIC TreeMeta.cc RNTupleMeta.cc RNTupleRewrite.cc Transposer.cc
-              FillLayout.cc)
+              FillLayout.cc ReadMap.cc)
   set_target_properties(ucache-transpose PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(ucache-transpose
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}

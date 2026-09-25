@@ -365,6 +365,9 @@ void printStats(const StatsTotals& t) {
   rowB("evicted_bytes", t.evictedBytes);
   row("failopen_events", t.failopenEvents);
   row("admissions_bypassed", t.admissionsBypassed);
+  row("copier_handles", t.copierHandles);
+  row("direct_read_files", t.directReadFiles);
+  rowB("direct_read_bytes", t.directReadBytes);
   row("open_retries", t.openRetries);
   row("open_retries_exhausted", t.openRetriesExhausted);
   row("validations_failed", t.validationsFailed);
@@ -380,6 +383,15 @@ void printStats(const StatsTotals& t) {
               human(t.relayBytes).c_str(), human(t.missBytes).c_str(),
               human(t.ramHitBytes).c_str(), human(diskB).c_str(),
               human(t.replicaBytesServed).c_str());
+  if (t.copierHandles) // explains direct bytes that no reader asked for
+    std::printf("  copies             %llu file handle%s opened for a copy, read straight from "
+                "the origin (counted in direct)\n",
+                (unsigned long long)t.copierHandles, t.copierHandles == 1 ? "" : "s");
+  if (t.directReadFiles) // the other source of direct bytes: max_read_fraction
+    std::printf("  read directly      %llu file%s whose first read asked for more than "
+                "max_read_fraction of the data: %s fetched and not kept (counted in direct)\n",
+                (unsigned long long)t.directReadFiles, t.directReadFiles == 1 ? "" : "s",
+                human(t.directReadBytes).c_str());
   if (t.coldReplicaFiles || t.coldReplicaBaskets || t.coldReplicaBasketsKept)
     std::printf("  converted on read  %llu new store%s, %s converted to %s (%llu baskets, %llu kept "
                 "as stored), %.1f s converting, %llu not kept\n",
@@ -4139,12 +4151,16 @@ int cmdDoctor(const Config& cfg) {
 // user's data and is kept (the test then verifies warm serving only).
 
 // Run one pass through a real XrdCl client. The child gets
-// XRD_CPUSEPGWRTRD=0 because plain xrdcp transfers with PgRead, which the
-// cache deliberately passes through, and UCACHE_TRANSPOSE=0 plus
-// UCACHE_RECOMPRESS=off because a whole-file copy is a byte-cache test: a
-// copy shown the file in its recompressed layout reads the original baskets
-// too, which that layout never keeps. (With transpose off the first pass never
-// runs, so the second setting only states the intent.)
+// UCACHE_COPY_DETECT=off because xrdcp is a copy tool, and a copy is otherwise
+// read straight from the origin and never touches the cache -- the test would
+// see no cache traffic at all; XRD_CPUSEPGWRTRD=0 because plain xrdcp
+// transfers with PgRead, which the cache deliberately passes through; and
+// UCACHE_TRANSPOSE=0 plus UCACHE_RECOMPRESS=off because a whole-file copy is
+// a byte-cache test: a copy shown the file in its recompressed layout reads
+// the original baskets too, which that layout never keeps. (With transpose off
+// the first pass never runs, so the last setting only states the intent.)
+// UCACHE_MAX_READ_FRACTION=100 because a copy reads all of a file, and a ROOT
+// file read that widely is otherwise read straight from the origin.
 // Everything else is inherited untouched: the point is to exercise the
 // user's setup as-is.
 uint64_t nowUs() {
@@ -4158,6 +4174,8 @@ int runTestPass(const std::string& url, std::vector<pid_t>& pids) {
   if (pid < 0)
     return -1;
   if (pid == 0) {
+    ::setenv("UCACHE_COPY_DETECT", "off", 1);
+    ::setenv("UCACHE_MAX_READ_FRACTION", "100", 1);
     ::setenv("XRD_CPUSEPGWRTRD", "0", 1);
     ::setenv("UCACHE_TRANSPOSE", "0", 1);
     ::setenv("UCACHE_RECOMPRESS", "off", 1);

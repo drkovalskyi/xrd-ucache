@@ -23,6 +23,10 @@
 // return stale/missing bytes: there it is served from the stitched view
 // with locally computed crc32c page checksums.
 //
+// A handle opened for a copy -- by a copy tool, XRootD's copy engine, ROOT's
+// TFile::Cp or gfal2's xrootd plugin -- is pure pass-through: it reads the
+// origin's bytes and never enters the cache (CopyDetect.h).
+//
 // Thread-safety: fully thread-safe; see HandleState.
 #pragma once
 
@@ -45,6 +49,7 @@
 namespace ucache {
 
 class ColdFill; // ColdRun.h
+class ReadRule; // ReadRule.h
 
 // State shared between the plugin object, executor tasks, and wire handlers.
 struct HandleState {
@@ -87,6 +92,9 @@ struct HandleState {
   // Cold replica run (ColdRun.h): the transient layout this handle was shown
   // at setup, likewise HANDLE-STABLE. Never set together with `view`.
   std::shared_ptr<ColdFill> cold;
+  // max_read_fraction (ReadRule.h), set with the entry: null when no rule
+  // applies. Shared by every handle of the file in the process.
+  std::shared_ptr<ReadRule> rule;
   std::unique_ptr<XrdCl::StatInfo> statInfo;   // clone source for Stat(false)
   std::mutex setupMu;                          // serializes lazy entry setup
   bool setupDone = false;                      // entry setup attempted (ok or not)
@@ -208,7 +216,7 @@ class UCacheFile : public XrdCl::FilePlugIn {
   uint64_t shownSize() const;
 
   std::shared_ptr<HandleState> st_;
-  bool passthroughOnly_ = false; // write-open / UCACHE_DISABLE / denied host
+  bool passthroughOnly_ = false; // write-open / UCACHE_DISABLE / no store / a copy
   bool cacheOpen_ = false;       // trusted-cache Open succeeded without the remote
 };
 

@@ -10,6 +10,7 @@
 // plugin for filesystem objects (verified in XrdClFileSystem.cc) — all FS
 // ops are naturally pass-through, and a broken cache can never break a job.
 #include "Announce.h"
+#include "CopyDetect.h"
 #include "Executor.h"
 #include "Log.h"
 #include "UCacheFile.h"
@@ -68,7 +69,8 @@ void pinSelfInMemory() {
 // Silent when uCache is not actually in the data path. A disabled cache, or
 // one with nowhere to store anything, relays the program's own reads
 // untouched, and claiming those would misreport them -- a baseline run must
-// look like what it is.
+// look like what it is. So does a copy tool: every read it makes is a copy,
+// and copies go straight to the origin (CopyDetect.h).
 void announceIdentity(const Config& cfg) {
   if (!cfg.announce) {
     UCACHE_DEBUG("announce = off: leaving the application name as the host program's");
@@ -78,6 +80,12 @@ void announceIdentity(const Config& cfg) {
     UCACHE_DEBUG("not announcing: uCache is passing through (%s), so the reads a server "
                  "sees are the program's own",
                  cfg.disable ? "disabled" : "no cache dir");
+    return;
+  }
+  if (cfg.copyDetect && isCopyToolExecutable(hostExecutable())) {
+    UCACHE_DEBUG("not announcing: %s only copies, and copies are read straight from the "
+                 "origin, so the reads a server sees are the program's own",
+                 hostExecutable().c_str());
     return;
   }
   XrdCl::Env* env = XrdCl::DefaultEnv::GetEnv();
@@ -130,6 +138,10 @@ void initGlobals() {
   if (gConfig->cacheDir.empty() && !gConfig->disable)
     UCACHE_WARN("no cache dir configured — set `dir =` in ucache.conf (USER_GUIDE §2) "
                 "or UCACHE_DIR; running uncached (pass-through)");
+  // Copy detection needs the libXrdCl this plugin is bound to -- only that
+  // library can route an open here -- and any function in it names it.
+  if (gConfig->copyDetect)
+    copyDetectInit(reinterpret_cast<const void*>(&XrdCl::DefaultEnv::GetEnv));
   announceIdentity(*gConfig);
   gStore = new std::shared_ptr<CacheStore>(
       gConfig->cacheDir.empty()

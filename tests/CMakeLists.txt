@@ -16,6 +16,7 @@ add_executable(ucache-unit-tests
   unit/sha256_test.cc
   unit/config_test.cc
   unit/announce_test.cc
+  unit/copydetect_test.cc
   unit/log_test.cc
   unit/iobackend_test.cc
   unit/urlkey_test.cc
@@ -37,18 +38,41 @@ add_executable(ucache-unit-tests
   unit/origin_inflight_test.cc
   unit/publish_test.cc
   ${CMAKE_SOURCE_DIR}/src/plugin/Announce.cc  # pure identity strings (no XrdCl)
+  ${CMAKE_SOURCE_DIR}/src/plugin/CopyDetect.cc # copy tools and copy engines (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/Executor.cc   # thread pool (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/cli/RunLog.cc        # run reader (pure file parsing)
   ${CMAKE_SOURCE_DIR}/src/cli/Publish.cc       # redaction + hashes (pure; no network in tests)
 )
-target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing gtest gtest_main)
+target_link_libraries(ucache-unit-tests PRIVATE ucache-core ucache-core-testing gtest gtest_main
+                                                ${CMAKE_DL_LIBS})
+# Stand-in shared libraries for the copy detector's stack check: one exports
+# XrdCl's copy-engine entry point under its real name, one carries the file
+# name of gfal2's xrootd plugin, one is named like ROOT's I/O library. The test
+# loads them by path, so it decides when each one appears.
+foreach(fake xrdcl gfal rio)
+  string(TOUPPER ${fake} FAKE)
+  add_library(ucache-copyfake-${fake} SHARED unit/copydetect_fake.cc)
+  target_compile_definitions(ucache-copyfake-${fake} PRIVATE UCACHE_FAKE_${FAKE}=1)
+  # The frame the test looks for must really be on the stack.
+  target_compile_options(ucache-copyfake-${fake} PRIVATE -fno-optimize-sibling-calls)
+  set_target_properties(ucache-copyfake-${fake} PROPERTIES
+                        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/copyfake)
+  add_dependencies(ucache-unit-tests ucache-copyfake-${fake})
+endforeach()
+set_target_properties(ucache-copyfake-xrdcl PROPERTIES OUTPUT_NAME ucache_copyfake_xrdcl)
+set_target_properties(ucache-copyfake-gfal PROPERTIES OUTPUT_NAME gfal_plugin_xrootd)
+set_target_properties(ucache-copyfake-rio PROPERTIES OUTPUT_NAME RIO)
+target_compile_definitions(ucache-unit-tests PRIVATE
+  UCACHE_COPYFAKE_XRDCL="$<TARGET_FILE:ucache-copyfake-xrdcl>"
+  UCACHE_COPYFAKE_GFAL="$<TARGET_FILE:ucache-copyfake-gfal>"
+  UCACHE_COPYFAKE_RIO="$<TARGET_FILE:ucache-copyfake-rio>")
 target_include_directories(ucache-unit-tests PRIVATE ${CMAKE_SOURCE_DIR}/src/plugin
                                                     ${CMAKE_SOURCE_DIR}/src/cli)
 if (TARGET ucache-transpose) # learner + seek-width + hole-verification contracts
   target_sources(ucache-unit-tests PRIVATE unit/learner_test.cc unit/transpose_width_test.cc
                  unit/transpose_hole_test.cc unit/rntuple_meta_test.cc
-                 unit/rntuple_rewrite_test.cc unit/fill_layout_test.cc)
+                 unit/rntuple_rewrite_test.cc unit/fill_layout_test.cc unit/readmap_test.cc)
   target_compile_definitions(ucache-unit-tests PRIVATE
                              UCACHE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   target_link_libraries(ucache-unit-tests PRIVATE ucache-transpose)
@@ -77,6 +101,11 @@ set_tests_properties(soak-suite PROPERTIES TIMEOUT 2400 LABELS soak)
 
 # Plugin-level fuzz (needs a running origin; driven by tests/integration/).
 if(UCACHE_BUILD_PLUGIN)
+  # Copies through the plugin come out as the origin's bytes, and a reader in the
+  # same process still caches (needs a running origin).
+  add_executable(ucache-copy-probe integration/copy_probe.cc)
+  target_include_directories(ucache-copy-probe SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
+  target_link_libraries(ucache-copy-probe PRIVATE ${XRDCL_LIBRARY})
   add_executable(ucache-plugin-fuzz integration/plugin_fuzz.cc)
   target_include_directories(ucache-plugin-fuzz SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
   target_link_libraries(ucache-plugin-fuzz PRIVATE ${XRDCL_LIBRARY})

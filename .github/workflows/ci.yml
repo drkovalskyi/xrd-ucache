@@ -51,6 +51,11 @@ jobs:
           printf 'url = 127.0.0.1:10940\nlib = %s\nenable = true\n' "$PWD/build/src/plugin/libXrdClUCache.so" > /tmp/conf/u.conf
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 1 1
           XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache ./build/tests/ucache-plugin-fuzz root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin 100000 8 2
+      - name: copies through the plugin are the origin's bytes (copy engine vs a reader, one process)
+        run: |
+          # A cache of its own: the probe needs one that does not hold the file yet.
+          mkdir -p /tmp/cache-copy
+          XRD_PLUGINCONFDIR=/tmp/conf UCACHE_DIR=/tmp/cache-copy ./build/tests/ucache-copy-probe root://127.0.0.1:10940//bench/data/f.bin /bench/data/f.bin
 
   # macOS: keep the tree compiling under AppleClang and run the hermetic tests.
   # Build-and-test only, deliberately: reading root:// through the plugin needs a

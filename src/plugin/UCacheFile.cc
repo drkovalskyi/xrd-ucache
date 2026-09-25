@@ -6,9 +6,14 @@
 #include "ColdRun.h"
 #endif
 
+#include "CopyDetect.h"
 #include "Executor.h"
 #include "Log.h"
 #include "OpenRetry.h"
+#ifdef UCACHE_HAVE_COLDRUN
+#include "OriginSource.h"
+#include "ReadRule.h"
+#endif
 #include "OriginInFlight.h"
 #include "PluginSupport.h"
 #include "ReadRounding.h"
@@ -403,6 +408,60 @@ static void noteRelayBytes(const std::shared_ptr<HandleState>& st, uint64_t n,
 // byte tier reads exactly the request, and a replica addresses a rewritten
 // container. Those are three different byte sets for one analysis, and hashing
 // them would say the same work was different work.
+// Bytes a file read directly (max_read_fraction) fetched and did not keep:
+// relayed, as pass-through bytes are, and counted as read directly.
+static void noteDirectBytes(const std::shared_ptr<HandleState>& st,
+                            const std::shared_ptr<FileEntry>& entry, uint64_t n) {
+  if (!n)
+    return;
+  noteRelayBytes(st, n);
+  if (st->store)
+    st->store->stats().directReadBytes.fetch_add(n, std::memory_order_relaxed);
+  if (entry)
+    entry->obs().directBytes.fetch_add(n, std::memory_order_relaxed);
+}
+
+// max_read_fraction, on the plain path: a request that needs the origin asks
+// the file's rule, which decides once, at the first such request that reads
+// two or more branches (ReadRule.h). The rule of a file read directly, else
+// null.
+// (A build without the tree parser has no rule.)
+#ifdef UCACHE_HAVE_COLDRUN
+static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>& st,
+                                            const std::shared_ptr<FileEntry>& entry,
+                                            const XrdCl::ChunkList& chunks) {
+  std::shared_ptr<ReadRule> rule;
+  {
+    std::lock_guard<std::mutex> g(st->mu);
+    rule = st->rule;
+  }
+  if (!rule)
+    return nullptr;
+  if (rule->state() == ReadRule::kUndecided) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    ranges.reserve(chunks.size());
+    for (const auto& c : chunks)
+      ranges.emplace_back(c.offset, c.length);
+    OriginSource src;
+    src.st = st;
+    src.entry = entry;
+    rule->observe(ranges, src);
+  }
+  return rule->direct() ? rule : nullptr;
+}
+// Does [off, off + len) read the data of a file read directly?
+static bool ruleReadsData(const std::shared_ptr<ReadRule>& r, uint64_t off, uint64_t len) {
+  return r && r->readsData(off, len);
+}
+#else
+static std::shared_ptr<ReadRule> directRule(const std::shared_ptr<HandleState>&,
+                                            const std::shared_ptr<FileEntry>&,
+                                            const XrdCl::ChunkList&) {
+  return nullptr;
+}
+static bool ruleReadsData(const std::shared_ptr<ReadRule>&, uint64_t, uint64_t) { return false; }
+#endif
+
 static void noteAppRead(const std::shared_ptr<HandleState>& st,
                         const std::shared_ptr<FileEntry>& entry,
                         const std::shared_ptr<ReplicaView>& view, uint64_t off,
@@ -865,12 +924,15 @@ struct WireElem {
 // Vector-read miss stage: one wire VectorRead of rounded+coalesced ranges.
 class MissVReadHandler : public ResponseHandler {
  public:
+  // `direct`: the file's rule when it is read directly -- its data is served
+  // and not kept, only pages holding none of it are.
   MissVReadHandler(std::shared_ptr<HandleState> st, std::shared_ptr<FileEntry> entry,
                    ChunkList userChunks, std::vector<size_t> missIdx,
-                   std::vector<WireElem> wire, ResponseHandler* user, uint64_t t0)
+                   std::vector<WireElem> wire, ResponseHandler* user, uint64_t t0,
+                   std::shared_ptr<ReadRule> direct = nullptr)
       : st_(std::move(st)), entry_(std::move(entry)), userChunks_(std::move(userChunks)),
         missIdx_(std::move(missIdx)), wire_(std::move(wire)), user_(user), t0_(t0),
-        inflight_(st_->store ? &st_->store->stats() : nullptr) {}
+        direct_(std::move(direct)), inflight_(st_->store ? &st_->store->stats() : nullptr) {}
 
   void HandleResponseWithHosts(XRootDStatus* status, AnyObject* response,
                                HostList* hostList) override {
@@ -909,7 +971,7 @@ class MissVReadHandler : public ResponseHandler {
     // Scatter wire bytes into the user's miss chunks (memcpy only). A chunk can
     // span several elements: an oversized run is cut into protocol-legal pieces,
     // and the pieces of one run are adjacent and in offset order.
-    uint64_t missBytes = 0;
+    uint64_t missBytes = 0, directBytes = 0;
     const WireElem* const wend = wire_.data() + wire_.size();
     for (size_t idx : missIdx_) {
       auto& c = userChunks_[idx];
@@ -931,7 +993,10 @@ class MissVReadHandler : public ResponseHandler {
         delete this;
         return;
       }
-      missBytes += c.length;
+      if (ruleReadsData(direct_, c.offset, c.length))
+        directBytes += c.length;
+      else
+        missBytes += c.length;
     }
     if (st_->store) {
       auto& stats = st_->store->stats();
@@ -939,18 +1004,26 @@ class MissVReadHandler : public ResponseHandler {
       for (const auto& w : wire_)
         wireBytes += w.len;
       stats.missBytes.fetch_add(missBytes, std::memory_order_relaxed);
-      stats.originBytes.fetch_add(wireBytes, std::memory_order_relaxed);
+      // What a file read directly fetched for its data is relayed, not a fill.
+      stats.originBytes.fetch_add(wireBytes - std::min(wireBytes, directBytes),
+                                  std::memory_order_relaxed);
       stats.originReadvs.fetch_add(1, std::memory_order_relaxed);
       uint64_t total = 0;
       for (const auto& c : userChunks_)
         total += c.length;
-      stats.servedBytes.fetch_add(total, std::memory_order_relaxed);
+      stats.servedBytes.fetch_add(total - directBytes, std::memory_order_relaxed);
       stats.originRtUs.add(nowUs() - t0_);
       if (stats.tracer)
         stats.tracer->rec("wire", entry_->key().key, wire_.front().off, wireBytes,
                           nowUs() - t0_);
     }
     st_->noteCacheOk();
+    if (direct_) {
+      noteDirectBytes(st_, entry_, directBytes);
+      persistWithoutData();
+      delete this;
+      return;
+    }
     // Reserve all persist slots before completing the user (see MissRead).
     for (size_t i = 0; i < wire_.size(); ++i)
       st_->beginPersist();
@@ -963,6 +1036,43 @@ class MissVReadHandler : public ResponseHandler {
   }
 
  private:
+  // A file read directly: complete the user, then keep only the whole pages of
+  // each element that hold none of the file's data (its own records).
+  void persistWithoutData() {
+    const uint64_t ps = entry_->pageSize(), fs = entry_->fileSize();
+    struct Run {
+      uint64_t a, b;
+      std::shared_ptr<std::vector<char>> buf;
+      uint64_t base;
+    };
+    std::vector<Run> keep;
+    for (auto& w : wire_) {
+      const uint64_t we = w.off + w.len;
+      uint64_t p = (w.off + ps - 1) / ps * ps; // whole pages only
+      for (; p < we; p += ps) {
+        const uint64_t pe = std::min(p + ps, fs);
+        if (pe > we || ruleReadsData(direct_, p, pe - p))
+          continue;
+        if (!keep.empty() && keep.back().buf == w.buf && keep.back().b == p)
+          keep.back().b = pe;
+        else
+          keep.push_back({p, pe, w.buf, w.off});
+      }
+    }
+    for (size_t i = 0; i < keep.size(); ++i)
+      st_->beginPersist();
+    complete(user_, okStatus(), vreadResponse(userChunks_));
+    for (auto& r : keep) {
+      auto st = st_;
+      auto entry = entry_;
+      Executor::instance().post([st, entry, r] {
+        entry->writePages(r.a, r.b - r.a, r.buf->data() + (r.a - r.base));
+        entry->flushMeta(false);
+        st->endPersist();
+      });
+    }
+  }
+
   const WireElem* findWire(uint64_t off) const {
     // wire_ is sorted by offset and covers every miss chunk's rounded range.
     const WireElem* best = &wire_.front();
@@ -981,6 +1091,7 @@ class MissVReadHandler : public ResponseHandler {
   std::vector<WireElem> wire_;
   ResponseHandler* user_;
   uint64_t t0_;
+  std::shared_ptr<ReadRule> direct_;
   OriginInFlight inflight_; // the origin read this handler waits for
 };
 
@@ -994,14 +1105,19 @@ std::pair<uint64_t, uint64_t> roundChunk(const FileEntry& e, uint64_t off, uint6
 // or an executor thread; touches inner only via acquire/release.
 void issueMissVRead(const std::shared_ptr<HandleState>& st,
                     const std::shared_ptr<FileEntry>& entry, ChunkList userChunks,
-                    std::vector<size_t> missIdx, ResponseHandler* user) {
+                    std::vector<size_t> missIdx, ResponseHandler* user,
+                    std::shared_ptr<ReadRule> direct = nullptr) {
   // Build rounded intervals in offset order, coalescing overlaps so the
-  // origin never sees overlapping reads (§5.2 step 3).
+  // origin never sees overlapping reads (§5.2 step 3). A file read directly
+  // fetches its data exactly as asked: rounding is for pages to keep.
   std::vector<std::pair<uint64_t, uint64_t>> ivals;
   ivals.reserve(missIdx.size());
   for (size_t idx : missIdx) {
     const auto& c = userChunks[idx];
-    ivals.push_back(roundChunk(*entry, c.offset, c.length));
+    if (ruleReadsData(direct, c.offset, c.length))
+      ivals.emplace_back(c.offset, c.offset + c.length);
+    else
+      ivals.push_back(roundChunk(*entry, c.offset, c.length));
   }
   std::sort(ivals.begin(), ivals.end());
   std::vector<std::pair<uint64_t, uint64_t>> runs;
@@ -1036,7 +1152,7 @@ void issueMissVRead(const std::shared_ptr<HandleState>& st,
     return;
   }
   auto* mh = new MissVReadHandler(st, entry, std::move(userChunks), std::move(missIdx),
-                                  std::move(wire), user, nowUs());
+                                  std::move(wire), user, nowUs(), std::move(direct));
   XRootDStatus s;
   if (readFaultFire()) // test hook: wire vector read dies mid-stream
     Executor::instance().post([mh] {
@@ -1273,6 +1389,25 @@ void writeCostSidecar(const std::string& url, const Config& cfg, uint64_t cpuUs,
     ::unlink(tmp.c_str());
 }
 
+namespace {
+// Once per process at INFO (silent at the default level), then at DEBUG: which
+// signal made a handle a copy. The URL is logged without its query, which can
+// carry a token.
+void noteCopier(CopySignal sig, const std::string& url) {
+  static std::atomic<bool> said{false};
+  const std::string where = url.substr(0, url.find('?'));
+  const std::string what = sig == CopySignal::kExecutable
+                               ? std::string(copySignalName(sig)) + " (" + hostExecutable() + ")"
+                               : std::string(copySignalName(sig));
+  if (!said.exchange(true, std::memory_order_relaxed))
+    UCACHE_INFO("%s is opened by %s: copies are read straight from the origin, not through the "
+                "cache, so a copy is the origin's bytes (copy_detect = off to cache them)",
+                where.c_str(), what.c_str());
+  else
+    UCACHE_DEBUG("%s opened by %s: read straight from the origin", where.c_str(), what.c_str());
+}
+} // namespace
+
 XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::Flags flags,
                                      XrdCl::Access::Mode mode, ResponseHandler* handler,
                                      ucache::XrdTimeout timeout) {
@@ -1300,6 +1435,18 @@ XrdCl::XRootDStatus UCacheFile::Open(const std::string& url, XrdCl::OpenFlags::F
   using OF = XrdCl::OpenFlags;
   bool writey = flags & (OF::Update | OF::Write | OF::New | OF::Delete);
   passthroughOnly_ = writey || cfg.disable || !st_->store;
+  // A handle opened for a copy reads straight from the origin, for this handle
+  // only: a copy is the origin's bytes, never the layout the cache would show
+  // a reader (CopyDetect.h). Asked only of a read open that could be cached,
+  // so a copy's destination never pays for the stack walk.
+  if (!passthroughOnly_ && cfg.copyDetect) {
+    const CopySignal sig = copierSignal();
+    if (sig != CopySignal::kNone) {
+      passthroughOnly_ = true;
+      st_->store->stats().copierHandles.fetch_add(1, std::memory_order_relaxed);
+      noteCopier(sig, url);
+    }
+  }
   if (passthroughOnly_ && st_->store) {
     // Start a relayed handle's span at open for the same reason: its cost
     // includes reaching the origin, and a one-read file must still have a span.
@@ -1361,6 +1508,9 @@ namespace {
 // any of its opens -- except that the original may become a replica, whose
 // original region reads the same. Otherwise: a slot store first, then a
 // compact replica, then a new store when recompression is on.
+// A handle opened for a copy never gets here: Open makes it pass-through, so it
+// is neither recorded nor constrained by this. That is safe because a copy's
+// file handle is its own and holds no offset any reader uses.
 // Which compact replica a view is: a rebuild from a different cache state can
 // relocate a different set of branches, to other offsets. Within one process.
 uint64_t compactId(const ReplicaView& v) {
@@ -1412,7 +1562,9 @@ void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<
         }
         continue;
       }
-      if (cfg.recompress)
+      // Not for a file this process already reads directly: nothing it
+      // converted would be kept.
+      if (cfg.recompress && !readRuleDirect(key.key))
         c = coldAttach(st, entry, key, mtime, cksumKind, cksum, AttachMode::kCreate);
     }
     if (c) {
@@ -1434,6 +1586,9 @@ void chooseLayout(const std::shared_ptr<HandleState>& st, const std::shared_ptr<
 #endif
 
 std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
+  // Pass-through handles -- write opens, UCACHE_DISABLE, no store, and copies
+  // (CopyDetect.h) -- never get an entry: nothing is created, stored or
+  // shown in another layout for them.
   if (passthroughOnly_ || !st_->store)
     return nullptr;
   {
@@ -1580,6 +1735,11 @@ std::shared_ptr<FileEntry> UCacheFile::ensureEntry() {
     st_->statInfo = std::move(statClone);
     if (!st_->closed && !st_->tripped) {
       st_->entry = entry;
+#ifdef UCACHE_HAVE_COLDRUN
+      // A slot run keeps its own rule (ColdRun); a compact replica has none.
+      if (entry && !view && !cold)
+        st_->rule = ReadRule::forFile(entry->key().key, entry->fileSize());
+#endif
       st_->view = view;
       st_->cold = cold;
       attached = true;
@@ -1844,6 +2004,19 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
     return XRootDStatus();
   }
 
+  // A file read directly (max_read_fraction): its data is relayed as asked,
+  // not kept; its own records are fetched and kept below, as for any file.
+  {
+    ChunkList one;
+    one.emplace_back(offset, size, buffer);
+    if (auto rule = directRule(st_, entry, one); ruleReadsData(rule, offset, size)) {
+      noteDirectBytes(st_, entry, size);
+      return relayToInner(st_, handler, [=](XrdCl::File* f, ResponseHandler* rh) {
+        return f->Read(offset, size, buffer, rh, timeout);
+      });
+    }
+  }
+
   // MISS from the caller's thread: rounded wire read. Dedup: an identical
   // rounded miss already in flight (another handle/thread — RDF-IMT re-reads
   // the same baskets constantly) parks this read instead of duplicating the
@@ -1886,7 +2059,8 @@ XrdCl::XRootDStatus UCacheFile::Read(uint64_t offset, uint32_t size, void* buffe
 
 // §4.7: PgRead is pure pass-through, never cached, never served from cache —
 // ROOT's remote-read path is Read/VectorRead (F5); xrdcp's pgread traffic is
-// deliberately uncached in v1. On a trusted-cache handle (UCACHE_REVALIDATE_S,
+// deliberately uncached in v1, and a copy's handle is pass-through anyway
+// (CopyDetect.h). On a trusted-cache handle (UCACHE_REVALIDATE_S,
 // default-on) the relay lazy-opens the origin first
 // (relayToInner). EXCEPTION: a transposed handle
 // must never pass PgRead through — the origin lacks the extension bytes and
@@ -2004,12 +2178,15 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   // number of parked reads (6.5M -> 9.1M on a full pass).
   if (mayPark)
     noteVectorRequest(st, chunks);
+  // max_read_fraction: a file read directly is neither read ahead nor waited
+  // for; what it misses is fetched for this request only.
+  std::shared_ptr<ReadRule> direct = missIdx.empty() ? nullptr : directRule(st, entry, chunks);
 #ifdef UCACHE_HAVE_PREFETCH
   // Read-ahead learns from every fill and, once confirmed, fetches the next
   // one while the reader computes; posted to its own thread, never blocking.
   // Only on the first pass: a re-dispatched request is the same fill, and
   // counting it twice would move the frontier past baskets nobody asked for.
-  if (mayPark && globalConfig().prefetch)
+  if (mayPark && globalConfig().prefetch && !direct)
     Prefetcher::instance().onFill(st, entry, chunks, !missIdx.empty());
 #endif
 
@@ -2018,7 +2195,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   // copies then cross the network. Wait for the one in flight instead. Only
   // ever parks once per request, and only when EVERY absent page is covered,
   // so a read can never wait on a fetch that is not happening.
-  if (mayPark && !missIdx.empty() && globalConfig().prefetchJoin) {
+  if (mayPark && !missIdx.empty() && globalConfig().prefetchJoin && !direct) {
     std::vector<std::pair<uint64_t, uint64_t>> want;
     want.reserve(missIdx.size());
     for (size_t i : missIdx)
@@ -2059,7 +2236,7 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
 
   if (missIdx.size() == chunks.size()) {
     // All-miss: no disk stage; issue the wire read from this thread.
-    issueMissVRead(st, entry, chunks, std::move(missIdx), handler);
+    issueMissVRead(st, entry, chunks, std::move(missIdx), handler, std::move(direct));
     return;
   }
 
@@ -2067,8 +2244,8 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
   // wire vector read.
   ChunkList userChunks = chunks;
   Executor::instance().post(
-      [st, entry, userChunks = std::move(userChunks), missIdx = std::move(missIdx),
-       handler]() mutable {
+      [st, entry, userChunks = std::move(userChunks), missIdx = std::move(missIdx), handler,
+       direct = std::move(direct)]() mutable {
         uint64_t t0 = nowUs();
         uint64_t hitBytes = 0;
         std::vector<size_t> misses = std::move(missIdx);
@@ -2099,7 +2276,8 @@ static void servePlainVectorRead(const std::shared_ptr<HandleState>& st,
           return;
         }
         std::sort(misses.begin(), misses.end());
-        issueMissVRead(st, entry, std::move(userChunks), std::move(misses), handler);
+        issueMissVRead(st, entry, std::move(userChunks), std::move(misses), handler,
+                       std::move(direct));
       });
   return;
 }
@@ -2277,6 +2455,10 @@ bool UCacheFile::GetProperty(const std::string& name, std::string& value) const 
   // and in Python an unset property arrives as None: it takes its no-server
   // defaults on "" and died in client.URL(None) on the second open of every
   // cached file. Fail-open means answering what each client can act on.
+  //
+  // A copy's handle never takes this path: it is never trusted cache-only, so
+  // the lines above return the origin's own values, and a checksum asked for at
+  // the end of a copy (xrdcp --cksum, gfal-copy -K) is asked of the origin.
   if (name == "LastURL") {
     std::lock_guard<std::mutex> g(st_->mu);
     if (!st_->url.empty()) {

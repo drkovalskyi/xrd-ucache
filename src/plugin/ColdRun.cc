@@ -6,11 +6,13 @@
 #include "RNTupleRewrite.h"
 #include "Log.h"
 #include "OriginInFlight.h"
+#include "OriginSource.h"
 #ifdef UCACHE_HAVE_PREFETCH
 #include "Prefetch.h"
 #endif
 #include "PluginSupport.h"
 #include "ReadRounding.h"
+#include "ReadRule.h"
 #include "ReplicaStore.h"
 #include "SlotStore.h"
 #include "Transposer.h"
@@ -132,6 +134,11 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   std::vector<std::string> codecs; // the store's: which baskets are converted
   uint32_t slotFactor = 0;         // the store's
   bool keepOriginals = false;
+  // max_read_fraction: null when no rule applies. Once it says direct, what
+  // this process converts is served and never kept, and nothing it fetches
+  // goes to the byte cache but the file's own records.
+  std::shared_ptr<ReadRule> rule;
+  bool direct() const { return rule && rule->direct(); }
   std::shared_ptr<SlotStore> store;
   std::atomic<bool> storeGone{false}; // dropped or replaced: nothing more is committed
   std::shared_ptr<FileEntry> entry;
@@ -244,7 +251,8 @@ class ColdFill : public std::enable_shared_from_this<ColdFill> {
   }
 
   // A converted record for slot i: served from memory until it is committed.
-  void stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache);
+  // `keepIt` false (a file this process reads directly): served to whoever asked, never kept.
+  void stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt = true);
 
   // A fetch that claimed slot i failed: give the claim back and tell whoever
   // waited on it, so they can fetch it themselves.
@@ -322,78 +330,8 @@ std::unordered_map<std::string, std::shared_ptr<ColdFill>>& registry() {
   return *r;
 }
 
-// The parser's byte source at setup: the byte cache when it has the range,
-// otherwise ONE synchronous page-rounded read from the origin, kept in the byte
-// cache (these are the file's own records -- header, directory, keys list, tree
-// record -- which is exactly what the byte cache holds).
-struct SetupSource : tp::Source {
-  std::shared_ptr<HandleState> st;
-  std::shared_ptr<FileEntry> entry;
-  bool has(uint64_t off, uint64_t n) override {
-    return off + n >= off && off + n <= entry->fileSize();
-  }
-  bool read(void* dst, uint64_t n, uint64_t off) override {
-    if (n == 0)
-      return true;
-    if (entry->hasRange(off, n) && entry->readCached(off, n, dst, /*account=*/false))
-      return true;
-    auto [ws, we] = roundSpan(entry->pageSize(), entry->fileSize(), off, n);
-    return fetch(ws, we, dst, off, n);
-  }
-  // The file head as ONE block of the size ROOT's RNTuple reader asks for it
-  // in (128 KiB at offset 0): setup's piecemeal reads would otherwise leave
-  // that read partly missing, and cost one more request. A TTree reader reads
-  // only the first few hundred bytes, so this is for RNTuple files only.
-  bool fetchHead() {
-    const uint64_t n = std::min<uint64_t>(kHeadBlock, entry->fileSize());
-    if (entry->hasRange(0, n))
-      return true;
-    std::vector<char> tmp(1);
-    return fetch(0, n, tmp.data(), 0, 0);
-  }
-
- private:
-  bool fetch(uint64_t ws, uint64_t we, void* dst, uint64_t off, uint64_t n) {
-    if (we - ws > UINT32_MAX)
-      return false;
-    std::vector<char> buf(we - ws);
-    XrdCl::File* f = st->acquireInner();
-    if (!f)
-      return false;
-    uint32_t got = 0;
-    const uint64_t t0 = nowUs();
-    XRootDStatus s = f->Read(ws, static_cast<uint32_t>(we - ws), buf.data(), got,
-                             static_cast<ucache::XrdTimeout>(0));
-    st->releaseInner();
-    if (!s.IsOK() || got < off + n - ws)
-      return false;
-    if (st->store) {
-      auto& stats = st->store->stats();
-      stats.originBytes.fetch_add(got, std::memory_order_relaxed);
-      stats.originReads.fetch_add(1, std::memory_order_relaxed);
-      stats.originRtUs.add(nowUs() - t0);
-    }
-    entry->writePages(ws, got, buf.data());
-    if (n)
-      std::memcpy(dst, buf.data() + (off - ws), n);
-    return true;
-  }
-};
-
-// The tree a reader of this file would be reading: NanoAOD's by name, else the
-// first TTree the keys list names.
-tp::FileMeta parseTree(tp::Source& src, int64_t size) {
-  tp::FileMeta fm = tp::parseFile(src, size, "Events");
-  if (!fm.error.empty() && fm.error.find("not found") != std::string::npos) {
-    tp::ContainerMeta cm = tp::parseContainer(src, size);
-    for (const auto& k : cm.keys)
-      if (k.cls == "TTree") {
-        fm = tp::parseFile(src, size, k.name);
-        break;
-      }
-  }
-  return fm;
-}
+// The parser's byte source at setup (shared with the read rule).
+using SetupSource = OriginSource;
 
 // Everything a reader could learn from the layout, hashed: two layouts that
 // agree on it serve the same bytes at the same offsets.
@@ -668,7 +606,7 @@ bool computeLayout(ColdFill& cf, SetupSource& src, uint64_t size, uint32_t k, bo
   declined = false;
   std::vector<uint8_t> header(100);
   cf.rnt = false;
-  tp::FileMeta fm = parseTree(src, static_cast<int64_t>(size));
+  tp::FileMeta fm = tp::parseReaderTree(src, static_cast<int64_t>(size));
   if (!fm.error.empty() && fm.error.find("not found") != std::string::npos) {
     // No TTree: perhaps an RNTuple.
     if (!src.fetchHead())
@@ -767,6 +705,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
   cf->cacheDir = cfg.cacheDir;
   cf->entry = entry;
   cf->keepOriginals = cfg.recompressKeepOriginals;
+  cf->rule = ReadRule::forFile(key.key, size);
 
   auto store = SlotStore::open(io, dir, key.hashHex);
   if (store && !adoptable(store->header(), size, originMtime, cksumKind, originCksum)) {
@@ -1116,10 +1055,26 @@ void ColdRequest::finish() {
     // are the replica tier's; records converted from what the origin just
     // sent, and original bytes fetched, are the fill. A slot's padding is
     // neither: zeros made here, which no tier holds.
-    stats.servedBytes.fetch_add(total, std::memory_order_relaxed);
-    stats.missBytes.fetch_add(fillRec + origFetched, std::memory_order_relaxed);
+    //
+    // A file read directly (max_read_fraction) keeps none of what it fetched:
+    // those bytes are relayed, as pass-through is, not a fill -- except the
+    // file's own records, which are cached whatever the reader.
+    uint64_t directBytes = 0;
+    if (cf->direct()) {
+      directBytes = fillRec;
+      for (const auto& p : origPieces)
+        if (cf->rule->readsData(p.off, p.len))
+          directBytes += p.len;
+    }
+    stats.servedBytes.fetch_add(total - directBytes, std::memory_order_relaxed);
+    stats.missBytes.fetch_add(fillRec + origFetched - directBytes, std::memory_order_relaxed);
     stats.replicaBytesServed.fetch_add(replicaRec, std::memory_order_relaxed);
     entry->obs().replicaBytes.fetch_add(replicaRec, std::memory_order_relaxed);
+    if (directBytes) {
+      stats.relayBytes.fetch_add(directBytes, std::memory_order_relaxed);
+      stats.directReadBytes.fetch_add(directBytes, std::memory_order_relaxed);
+      entry->obs().directBytes.fetch_add(directBytes, std::memory_order_relaxed);
+    }
   }
   entry->noteActivity();
   st->noteCacheOk();
@@ -1166,17 +1121,18 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
       stats.coldReplicaInBytes.fetch_add(recLen, std::memory_order_relaxed);
       stats.coldReplicaOutBytes.fetch_add(p.enc.size(), std::memory_order_relaxed);
     }
-    if (cf.keepOriginals) {
+    const bool direct = cf.direct();
+    if (cf.keepOriginals && !direct) {
       req->entry->writePages(rStart, rounded->size(), rounded->data());
       req->entry->flushMeta(false);
-    } else if (!fromCache) {
+    } else if (!fromCache && !direct) {
       // Fetched for this file, kept only as its record: the file's origin tier
       // (staging counts what goes to the byte cache).
       req->entry->obs().wireBytes.fetch_add(recLen, std::memory_order_relaxed);
     }
     auto rec = std::make_shared<const std::vector<uint8_t>>(std::move(p.enc));
     req->hold(i, rec);
-    cf.stage(i, kind, std::move(rec), fromCache);
+    cf.stage(i, kind, std::move(rec), fromCache, /*keepIt=*/!direct);
     { // staged: the claim is no longer this request's to give back
       std::lock_guard<std::mutex> g(req->emu);
       req->converted.push_back(i);
@@ -1216,12 +1172,14 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   // A kept basket is served from the byte cache, so it is written there even
   // when it came from it: taken from read-ahead's stage, its pages left the
   // stage when used, or are still only speculative.
-  if (c.kind == tp::ConvertedBasket::kOriginal || cf.keepOriginals) {
+  // A file read directly keeps neither: the request holds the record it serves.
+  const bool direct = cf.direct();
+  if ((c.kind == tp::ConvertedBasket::kOriginal || cf.keepOriginals) && !direct) {
     // Cannot be converted: the one kind of basket the byte cache keeps --
     // unless keeping every original was asked for, to compare the tiers.
     req->entry->writePages(rStart, rounded->size(), rounded->data());
     req->entry->flushMeta(false);
-  } else if (!fromCache) {
+  } else if (!fromCache && !direct) {
     // Fetched for this file, kept only as its record: the file's origin tier
     // (staging counts what goes to the byte cache).
     req->entry->obs().wireBytes.fetch_add(recLen, std::memory_order_relaxed);
@@ -1230,7 +1188,7 @@ void convertOne(const std::shared_ptr<ColdRequest>& req, uint32_t i,
   req->hold(i, held);
   // A kept original is not punched from the byte cache: it is the only copy.
   cf.stage(i, static_cast<uint8_t>(c.kind), std::move(held),
-           fromCache && c.kind != tp::ConvertedBasket::kOriginal);
+           fromCache && c.kind != tp::ConvertedBasket::kOriginal, /*keepIt=*/!direct);
   { // staged: the claim is no longer this request's to give back
     std::lock_guard<std::mutex> g(req->emu);
     req->converted.push_back(i);
@@ -1254,6 +1212,25 @@ struct WireElem {
   uint64_t off, len;
   std::shared_ptr<std::vector<char>> buf;
 };
+
+// Of page runs a file read directly would keep, the pages that hold none of its
+// data: the file's own records are cached whatever the reader.
+std::vector<std::pair<uint64_t, uint64_t>>
+withoutData(const std::vector<std::pair<uint64_t, uint64_t>>& runs, const ReadRule& rule,
+            uint64_t ps) {
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  for (const auto& [a, b] : runs)
+    for (uint64_t p = a; p < b; p += ps) {
+      const uint64_t pe = std::min(b, p + ps);
+      if (rule.readsData(p, pe - p))
+        continue;
+      if (!out.empty() && out.back().second == p)
+        out.back().second = pe;
+      else
+        out.emplace_back(p, pe);
+    }
+  return out;
+}
 
 class PartHandler : public ResponseHandler {
  public:
@@ -1311,6 +1288,8 @@ class PartHandler : public ResponseHandler {
         // this layout never needs (a copy tool reading everything would
         // otherwise store every basket a second time).
         auto runs = req_->cf->storableRuns(it.rs, it.re, req_->entry->pageSize());
+        if (req_->cf->direct())
+          runs = withoutData(runs, *req_->cf->rule, req_->entry->pageSize());
         if (!runs.empty()) {
           st->beginPersist();
           auto entry = req_->entry;
@@ -1477,10 +1456,24 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
                               }),
                need.end());
   }
+  // max_read_fraction is decided at the first request that needs the origin,
+  // from the ORIGINAL ranges the request carries (a slot is its basket).
+  if (cf.rule && cf.rule->state() == ReadRule::kUndecided &&
+      (!need.empty() || !req->origPieces.empty())) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    for (const auto& c : req->chunks)
+      coldOriginRanges(cf, c.offset, c.length, ranges);
+    OriginSource src;
+    src.st = req->st;
+    src.entry = req->entry;
+    cf.rule->observe(ranges, src);
+  }
 
 #ifdef UCACHE_HAVE_PREFETCH
   const Config& cfg = globalConfig();
-  if (cfg.prefetch && req->mayPark && !need.empty()) {
+  // A file read directly is not read ahead: nothing it fetches is kept.
+  const bool direct = cf.direct();
+  if (cfg.prefetch && req->mayPark && !need.empty() && !direct) {
     // Read-ahead learns from this fill in the ORIGINAL file's coordinates --
     // a slot is its basket -- and predicts and fetches the next baskets into
     // the byte cache's speculative stage, from where the conversion below
@@ -1491,7 +1484,7 @@ void serveRequest(const std::shared_ptr<ColdRequest>& req) {
       orig.emplace_back(cf.L.slots[i].origSeek, cf.L.slots[i].origLen, nullptr);
     Prefetcher::instance().onFill(req->st, req->entry, orig, true);
   }
-  if (cfg.prefetch && cfg.prefetchJoin && req->mayPark && !need.empty()) {
+  if (cfg.prefetch && cfg.prefetchJoin && req->mayPark && !need.empty() && !direct) {
     // A basket read ahead may be on the wire right now: wait for that copy
     // (once) instead of fetching it a second time.
     std::vector<std::pair<uint64_t, uint64_t>> want;
@@ -1657,7 +1650,7 @@ void ColdFill::releaseMemLocked(Info& s) {
   s.mem.reset();
 }
 
-void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache) {
+void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache, bool keepIt) {
   std::vector<Waiter> wake;
   bool kick = false;
   uint64_t lost = 0; // records no longer held anywhere: converted again if read
@@ -1665,7 +1658,10 @@ void ColdFill::stage(uint32_t i, uint8_t kind, Rec rec, bool fromCache) {
     std::lock_guard<std::mutex> g(mu);
     Info& s = info[i];
     bool keep = true;
-    if (!s.inStore) { // someone committed it meanwhile: theirs serves
+    if (!keepIt && !s.inStore) {
+      releaseMemLocked(s); // a file read directly: nothing of it is kept
+      keep = false;
+    } else if (!s.inStore) { // someone committed it meanwhile: theirs serves
       releaseMemLocked(s); // staged twice: the newer record replaces the older
       s.kind = kind;
       // A basket kept as stored is served from the byte cache's copy of its

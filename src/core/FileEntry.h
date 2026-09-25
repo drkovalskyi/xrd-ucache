@@ -222,6 +222,7 @@ class FileEntry {
     std::atomic<uint64_t> diskBytes{0};
     std::atomic<uint64_t> firstTouchBytes{0}; // bytes served for the first time
     std::atomic<uint64_t> wireBytes{0};       // bytes staged/persisted (fills)
+    std::atomic<uint64_t> directBytes{0};     // fetched and not kept (max_read_fraction)
     // Prefetch, per file: bytes the prefetcher asked the origin for, bytes of
     // speculative pages the reader then demanded, bytes dropped never used.
     std::atomic<uint64_t> prefetchIssued{0};

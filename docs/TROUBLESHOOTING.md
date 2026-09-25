@@ -30,11 +30,18 @@ second. If not:
    (or vice versa), they are different keys. Read via a consistent URL.
 5. **Caching disabled.** `UCACHE_DISABLE=1`, `disable = true` in the conf, or
    `ucache disable` was run. Re-enable with `ucache enable`.
-6. **You tested with `xrdcp`.** Recent `xrdcp` (5.8+) transfers with PgRead by
-   default, which the plugin relays to the origin without caching — `stats`
-   stays at zero even though the plugin is loaded (opens count). Analysis reads
-   (ROOT, RDataFrame, uproot) use Read/ReadV and cache normally. To smoke-test
-   with `xrdcp`, disable its PgRead path: `XRD_CPUSEPGWRTRD=0 xrdcp …`.
+6. **You tested with `xrdcp`.** A copy never uses the cache, by design: `xrdcp`,
+   `xrdfs`, `xrdadler32`, XRootD's copy engine from any program (Python's
+   `CopyProcess`, `gfal-copy`, `rucio download`) and ROOT's `TFile::Cp` are
+   recognised and read straight from the origin, because a copy must be the
+   origin's bytes and uCache may show readers a file in a layout of its own.
+   `stats` then shows `copier_handles` and direct (relayed) bytes, not hits —
+   which also proves the plugin is loaded. Analysis reads (ROOT, RDataFrame,
+   uproot) cache normally. To smoke-test, use `ucache test <url>`; to push one
+   copy through the byte cache, `UCACHE_COPY_DETECT=off
+   UCACHE_MAX_READ_FRACTION=100 XRD_CPUSEPGWRTRD=0 xrdcp …` (a copy reads all
+   of a file, see item 8; recent `xrdcp` otherwise transfers with PgRead,
+   which the plugin relays without caching).
 7. **The job's XrdCl refuses the plugin (version or glibc).** Two variants,
    both **silently fail-open** (job correct, nothing cached); diagnose either
    with `XRD_LOGLEVEL=Debug <your job> … 2>&1 | grep -i plug` in the same
@@ -63,6 +70,14 @@ second. If not:
    - *Older containers* (`cmssw-el8`/`cmssw-el7`): the el9-built `.so` needs
      GLIBC_2.34 and cannot load in an el8/el7 apptainer (glibc ≤ 2.28). el9
      CMSSW releases work as-is; an el8-flavor artifact is future work.
+8. **The job reads most of each file.** A job whose reads of a ROOT file (a
+   TTree or RNTuple of 64 MiB or more) cover branches holding more than
+   `max_read_fraction` of the file's data (default 25%) reads that file
+   straight from the origin and does not cache it: one `WARN` per job names
+   the first such file and the share it read, and `ucache stats` counts them in
+   `direct_read_files`. That is deliberate — such a job would fill the cache
+   with the whole dataset. To cache it anyway, `UCACHE_MAX_READ_FRACTION=100
+   <your job>`, or `ucache set max_read_fraction 100` for every job.
 
 ## `[Error][File] Plug-in factory failed to produce a plug-in … continuing without one`
 
@@ -119,6 +134,29 @@ trusts the cache. When you know a file changed:
 - `UCACHE_REVALIDATE_S=0 <your job>` — force origin re-checks for one run.
 - `revalidate_seconds = 0` in your `ucache.conf` — always re-check (the
   pre-0.9.1 behavior; adds a remote open+stat to every open).
+
+## A copy of a file does not match the origin (size or checksum)
+
+A copy that uCache recognises is read straight from the origin and is the
+origin's bytes: `xrdcp`, `xrdfs`, `xrdadler32`, `edmCopyUtil`, XRootD's copy
+engine from any program (Python's `CopyProcess`, `gfal-copy`, `rucio
+download`) and ROOT's `TFile::Cp`. `ucache stats` counts each such handle in
+`copier_handles`.
+
+A copy made any other way reads through the cache like an analysis job, and a
+file with a replica is then shown in the replica's layout — the same data to
+ROOT, but a larger file with different bytes. That is the case for reading a
+file handle in a loop (fsspec's `get` or `open().read()`, a hand-written
+loop), ROOT's fast cloning (`rootcp`, `hadd`), and copies through an XRootD
+proxy or a FUSE mount with uCache inside it. Make those copies with the cache
+switched off:
+
+```sh
+UCACHE_DISABLE=1 python3 my_copy.py
+```
+
+A copy tool that uses XRootD's copy engine and still is not counted in
+`copier_handles` is worth reporting, with its name and the client version.
 
 ## `doctor` reports a problem
 

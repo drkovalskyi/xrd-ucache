@@ -217,6 +217,7 @@ void FileEntry::emitObsRecord() {
      << ",\"disk_bytes\":" << v(obs_.diskBytes)
      << ",\"first_touch_bytes\":" << v(obs_.firstTouchBytes)
      << ",\"wire_bytes\":" << v(obs_.wireBytes)
+     << ",\"direct_bytes\":" << v(obs_.directBytes)
      << ",\"prefetch_issued\":" << v(obs_.prefetchIssued)
      << ",\"prefetch_served\":" << v(obs_.prefetchServed)
      << ",\"prefetch_dropped\":" << v(obs_.prefetchDropped)
@@ -229,7 +230,12 @@ void FileEntry::emitObsRecord() {
      << ",\"read_sig\":\"" << readSig << "\",\"read_buckets\":" << readBuckets
      // A file this process mostly FETCHED is a fill, whatever else it also
      // served; the distinction decides which population a measurement joins.
-     << ",\"mode\":\"" << (v(obs_.wireBytes) > v(obs_.servedBytes) ? "fill" : "cached")
+     // One it mostly read straight from the origin without keeping it
+     // (max_read_fraction) is relayed, as a pass-through file is.
+     << ",\"mode\":\""
+     << (v(obs_.directBytes) > v(obs_.servedBytes) + v(obs_.replicaBytes) ? "relay"
+         : v(obs_.wireBytes) > v(obs_.servedBytes)                        ? "fill"
+                                                                            : "cached")
      << "\"}\n";
   obsSink_->append(os.str());
 }

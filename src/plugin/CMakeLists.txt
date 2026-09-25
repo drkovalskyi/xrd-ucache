@@ -19,6 +19,7 @@ ucache_require_xrootd_version("${XRDCL_INCLUDE_DIR}")
 
 add_library(XrdClUCache SHARED
   Announce.cc
+  CopyDetect.cc
   Executor.cc
   OpenRetry.cc
   UCacheFactory.cc
@@ -28,11 +29,13 @@ target_include_directories(XrdClUCache SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR}) # SY
 # The version uCache announces to servers at login (same source of truth as
 # `ucache --version`).
 target_compile_definitions(XrdClUCache PRIVATE UCACHE_VERSION="${PROJECT_VERSION}")
-target_link_libraries(XrdClUCache PRIVATE ucache-core ${XRDCL_LIBRARY})
+# CMAKE_DL_LIBS: the copy detector's loader queries (dladdr, dlopen) -- empty
+# where the C library already provides them.
+target_link_libraries(XrdClUCache PRIVATE ucache-core ${XRDCL_LIBRARY} ${CMAKE_DL_LIBS})
 # Read-ahead needs the tree parser (and so the codecs it decompresses the
 # metadata record with); a codec-less build ships the plugin without it.
 if (TARGET ucache-transpose)
-  target_sources(XrdClUCache PRIVATE Prefetch.cc ColdRun.cc)
+  target_sources(XrdClUCache PRIVATE Prefetch.cc ColdRun.cc ReadRule.cc)
   target_link_libraries(XrdClUCache PRIVATE ucache-transpose)
   target_compile_definitions(XrdClUCache PRIVATE UCACHE_HAVE_PREFETCH=1 UCACHE_HAVE_COLDRUN=1)
 endif()

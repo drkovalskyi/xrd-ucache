@@ -188,6 +188,16 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.transpose = !falsy(v); // replica-tier kill switch
   else if (k == "announce")
     c.announce = !falsy(v); // default on; see Config.h
+  else if (k == "copy_detect")
+    c.copyDetect = !falsy(v); // default on; see Config.h
+  else if (k == "max_read_fraction") {
+    const int pct = ::atoi(v.c_str());
+    if (pct >= 1 && pct <= 100)
+      c.maxReadFraction = pct;
+    else
+      UCACHE_WARN("%s: max_read_fraction=%s invalid (a percentage, 1 to 100); ignored", src,
+                  v.c_str());
+  }
   else if (k == "recompress")
     c.recompress = truthy(v);
   else if (k == "recompress_keep_originals")
@@ -392,6 +402,8 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"disable", "UCACHE_DISABLE"},
       {"transpose", "UCACHE_TRANSPOSE"},
       {"announce", "UCACHE_ANNOUNCE"},
+      {"copy_detect", "UCACHE_COPY_DETECT"},
+      {"max_read_fraction", "UCACHE_MAX_READ_FRACTION"},
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
@@ -516,6 +528,10 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(transpose);
   if (key == "announce")
     return onoff(announce);
+  if (key == "copy_detect")
+    return onoff(copyDetect);
+  if (key == "max_read_fraction")
+    return std::to_string(maxReadFraction);
   if (key == "recompress")
     return onoff(recompress);
   if (key == "recompress_keep_originals")

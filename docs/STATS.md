@@ -57,7 +57,8 @@ the consumers together.
  "evicted_entries": 0, "evicted_bytes": 0,
  "failopen_events": 0, "admissions_bypassed": 0,
  "open_retries": 0, "open_retries_exhausted": 0,
- "disabled_handles": 0,
+ "disabled_handles": 0, "copier_handles": 0,
+ "direct_read_files": 0, "direct_read_bytes": 0,
  "replica_opens": 0, "replica_published": 0, "replica_invalid": 0,
  "replica_crc_failures": 0, "replica_punched_bytes": 0, "replica_orphans_swept": 0,
  "files_opened": 0, "ram_hit_bytes": 0, "first_touch_bytes": 0,
@@ -133,6 +134,17 @@ not to cache, and says the cache is under pressure rather than broken.
 - `failopen_events` — cache-side faults that degraded to pass-through
   (failed page writes, failed sidecar persists). `disabled_handles` —
   handles that tripped `UCACHE_MAX_ERRORS` (plugin layer).
+- `copier_handles` (plugin layer) — file handles opened for a copy: by a copy
+  tool (`xrdcp`, `xrdfs`, `xrdadler32`, `edmCopyUtil`), from inside XRootD's
+  copy engine, from ROOT's `TFile::Cp` or from gfal2's xrootd plugin. They are
+  served as pure pass-through, so a copy is the origin's bytes: their reads
+  are in `relay_bytes`, and they add nothing to the cache. Zero with
+  `copy_detect = off`.
+- `direct_read_files` / `direct_read_bytes` (plugin layer) — ROOT files this
+  process decided to read straight from the origin because its reads covered
+  branches holding more than `max_read_fraction` of the file's data, and the
+  bytes it fetched for their data and did not keep (also in `relay_bytes`).
+  A file is counted once per process. Zero with `max_read_fraction = 100`.
 - `open_retries` / `open_retries_exhausted` (plugin layer) —
   transient inner-open failures re-attempted (`UCACHE_OPEN_RETRIES`), and opens
   that ultimately gave up after retrying. Uncounted when caching is off (retry
@@ -228,7 +240,8 @@ reading was re-reading, and what the cache disk was asked to do.
   `replica_bytes_served` because whole overlay pages are read and verified,
   and a page read for two different user reads counts twice).
 - Pass-through and vector reads: `relay_bytes` — pure pass-through, the cache
-  never touched them; `readv_chunks` /
+  never touched them (copies included: see `copier_handles`; files read directly
+  too: see `direct_read_files`); `readv_chunks` /
   `readv_calls` / `readv_mixed` — vector-read chunks seen, vector reads the
   cache handled (`readv_chunks / readv_calls` = mean batch width), and
   vectors mixing hits with misses.
@@ -322,7 +335,7 @@ reading was re-reading, and what the cache disk was asked to do.
 
 - `<stem>.files.jsonl` — one record per entry per process lifetime, emitted
   once (at last release, or at the final dump). A handle the cache never
-  served — pass-through under `UCACHE_DISABLE`, or a write-opened file — also
+  served — pass-through under `UCACHE_DISABLE`, a copy, or a write-opened file — also
   leaves one at close, with the relayed bytes under `wire_bytes` and the
   cache-side fields zero; that is what makes a baseline run matchable file by
   file. Consumed by
@@ -331,9 +344,14 @@ reading was re-reading, and what the cache disk was asked to do.
   ```json
   {"ts": 0, "key": "root://…", "opens": 0, "served_bytes": 0, "ram_bytes": 0,
    "replica_bytes": 0, "disk_reads": 0, "disk_seq": 0, "disk_bytes": 0,
-   "first_touch_bytes": 0, "wire_bytes": 0, "span_us": 0, "origin_size": 0,
-   "read_sig": "", "read_buckets": 0, "mode": "cached"}
+   "first_touch_bytes": 0, "wire_bytes": 0, "direct_bytes": 0, "span_us": 0,
+   "origin_size": 0, "read_sig": "", "read_buckets": 0, "mode": "cached"}
   ```
+
+  `direct_bytes` are the bytes a file read directly (`max_read_fraction`)
+  fetched and did not keep. `mode` is `fill` when the process mostly fetched
+  the file, `relay` when it mostly read it straight from the origin (a file
+  read directly), and `cached` otherwise.
 
   `origin_size` is the file's size at the origin — the one measure of a file
   that means the same thing whichever route served it, and therefore the only

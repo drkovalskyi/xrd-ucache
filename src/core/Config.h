@@ -143,6 +143,24 @@ struct Config {
   bool transpose = true;                  // `transpose` / UCACHE_TRANSPOSE=0/off/
                                           // false: never serve replica views
                                           // (replica-tier kill switch)
+  // `copy_detect` / UCACHE_COPY_DETECT. A handle opened by a copy tool or a
+  // copy engine -- xrdcp, xrdfs, xrdadler32, edmCopyUtil, XRootD's copy engine
+  // from any language (Python's CopyProcess, gfal2, rucio), gfal2's xrootd
+  // plugin, ROOT's static TFile::Cp -- reads straight from the origin, so a
+  // copy is the origin's bytes whatever layout the cache would show a reader.
+  // off = such handles are ordinary handles and use the cache (`ucache test`
+  // turns it off to exercise the byte cache with xrdcp). Fixed at process
+  // start, like every setting.
+  bool copyDetect = true;                 // UCACHE_COPY_DETECT
+  // `max_read_fraction` / UCACHE_MAX_READ_FRACTION, percent, 1..100. A process
+  // whose first read of a ROOT file (a TTree or RNTuple of 64 MiB or more)
+  // that needs the origin asks for more than this share of the file's data --
+  // of the baskets of every branch (pages of every column) covering the same
+  // entries -- reads that file straight from the origin and keeps none of its
+  // data: a reader that wide would fill the cache with the dataset. Decided
+  // once per file per process, at the first request that reads two or more
+  // branches. 100 = every file is cached.
+  int maxReadFraction = 25;               // UCACHE_MAX_READ_FRACTION
   // Recompression: ONE switch.
   // `recompress = on` => a file with no replica gets one on its first pass,
   // converted as the job reads it (off by default — opt-in CPU/disk; the user

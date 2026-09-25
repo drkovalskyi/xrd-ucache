@@ -39,6 +39,7 @@ TEST(Stats, JsonBodyHasAllCounters) {
   s.hitReadUs.add(7);
   s.replicaReadBytes = 65536;
   s.readvCalls = 9;
+  s.copierHandles = 2;
   s.reqReadBytes.add(4096);
   s.hitReadSize.add(4096);
   std::string j = "{" + s.toJsonBody() + "}";
@@ -49,6 +50,7 @@ TEST(Stats, JsonBodyHasAllCounters) {
   EXPECT_NE(j.find("\"origin_bytes\":0"), std::string::npos);
   EXPECT_NE(j.find("\"failopen_events\":0"), std::string::npos);
   EXPECT_NE(j.find("\"disabled_handles\":0"), std::string::npos);
+  EXPECT_NE(j.find("\"copier_handles\":2"), std::string::npos);
   EXPECT_NE(j.find("\"hist_hit_read_us\":[0,0,1]"), std::string::npos);
   // Read-shape surface: sizes are histogrammed in log2 BYTES (4096 => bucket 12).
   EXPECT_NE(j.find("\"replica_read_bytes\":65536"), std::string::npos);
@@ -76,7 +78,7 @@ TEST(StatsAggregate, LastLinePerFileSummedAcrossProcesses) {
   {
     std::ofstream f(dir + "/hostB-200-1.jsonl");
     f << "{\"ts\":9,\"pid\":200,\"opens\":3,\"hit_bytes\":30,\"served_bytes\":7,"
-         "\"failopen_events\":1}\n";
+         "\"failopen_events\":1,\"copier_handles\":2}\n";
   }
   // Noise that must be ignored: wrong suffix, and an empty file.
   { std::ofstream(dir + "/notes.txt") << "ignore me\n"; }
@@ -90,6 +92,7 @@ TEST(StatsAggregate, LastLinePerFileSummedAcrossProcesses) {
   EXPECT_EQ(t.originReads, 4u);   // A's last
   EXPECT_EQ(t.servedBytes, 7u);   // B
   EXPECT_EQ(t.failopenEvents, 1u);
+  EXPECT_EQ(t.copierHandles, 2u); // B only; A's lines predate the counter and read as 0
 }
 
 // Stats files written on either side of the coalescing change use the same

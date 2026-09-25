@@ -292,7 +292,10 @@ progress shown. It PASSes only if the warm pass is served entirely from
 cache with **zero origin contact**, then removes the entry it created (a
 file that was already cached is verified warm-only and kept). Exit 0 = the
 whole chain works: conf → plugin loaded → interception → caching → warm
-serving. It tests the byte cache: its copies run with recompression's layout
+serving. It tests the byte cache: its copies run with copy detection off,
+because uCache otherwise reads a copy straight from the origin (below) and the
+test would see no cache traffic at all, with `max_read_fraction` at 100, since
+a copy reads all of a file, and with recompression's layout
 switched off, because a whole-file copy of a file in that layout would read
 baskets the layout never keeps.
 
@@ -304,9 +307,13 @@ python my_analysis.py     # warm: served from local cache
 ucache stats              # warm pass shows origin_bytes == 0
 ```
 
-(Don't smoke-test with plain `xrdcp` — it transfers with PgRead, which the
-cache deliberately passes through, so `stats` stays at zero. If you must:
-`XRD_CPUSEPGWRTRD=0 xrdcp …` uses the cached read path.)
+(Don't smoke-test with plain `xrdcp`: a copy never uses the cache — it is
+read straight from the origin, so `stats` shows only `copier_handles` and
+direct bytes. Use `ucache test`, or, to push one copy through the byte cache,
+`UCACHE_COPY_DETECT=off UCACHE_MAX_READ_FRACTION=100 XRD_CPUSEPGWRTRD=0 xrdcp …`
+— the second setting because a copy reads all of a file, which a ROOT file is
+otherwise not cached for (see `max_read_fraction`), the third because xrdcp
+otherwise transfers with PgRead, which the cache passes through.)
 
 `ucache status` shows where the cache lives, the disk budget, how much is cached,
 and aggregate counters.
@@ -661,6 +668,8 @@ overriding your defaults. Common keys:
 | `prefetch_join = on` | `UCACHE_PREFETCH_JOIN` | when your job asks for bytes read-ahead is already fetching, wait for that copy instead of asking the origin a second time. `off` restores the older behaviour, which fetched them twice |
 | `prefetch_threads = 4` | `UCACHE_PREFETCH_THREADS` | threads predicting and reading basket maps. One cannot both parse a new file's map and keep up with the batches of many reader threads |
 | `announce = on`     | `UCACHE_ANNOUNCE`       | name uCache as the application in what the client tells servers at login, so a site can see traffic that comes through a cache (default on; see below). `off` = send your program's own name, as without uCache |
+| `copy_detect = on`  | `UCACHE_COPY_DETECT`    | copy tools and copy engines read straight from the origin, so a copy is the origin's bytes (default on; see below). `off` = they are ordinary readers and use the cache |
+| `max_read_fraction = 25` | `UCACHE_MAX_READ_FRACTION` | a job whose reads of a ROOT file (a TTree or RNTuple of 64 MiB or more) cover branches holding more than this percentage of the file's data reads that file straight from the origin and caches none of its data (see below). `100` = cache every file |
 | `disable = true`    | `UCACHE_DISABLE`        | turn caching off (pure pass-through) |
 
 Sizes accept `k`/`m`/`g`/`t` suffixes.
@@ -717,9 +726,58 @@ anyway, as they do without uCache.
 Turn it off with `announce = off` and your program is named as before. A name
 you set yourself always wins: export `XRD_APPNAME` or `XRD_MONINFO` and uCache
 leaves that field alone. And uCache stays quiet whenever it is not actually in
-the data path — `disable = true`, or no `dir` — because those reads really are
-your program's own, which also keeps a `UCACHE_DISABLE=1` baseline run looking
-like exactly what it is.
+the data path — `disable = true`, or no `dir`, or a copy tool (`xrdcp`,
+`xrdfs`, `xrdadler32`, `edmCopyUtil`), whose reads are all copies — because
+those reads really are your program's own, which also keeps a
+`UCACHE_DISABLE=1` baseline run looking like exactly what it is.
+
+**Copies are the origin's bytes.** uCache can show a reader a file in a layout
+of its own (a replica, see below): the same data to ROOT, but a different file.
+A copy is meant to be the file, so a copy never goes through the cache. These
+are recognised and read straight from the origin, and never enter or use the
+cache: `xrdcp` (and `xrdcopy`), `xrdfs cat`/`tail`, `xrdadler32`,
+`edmCopyUtil`, XRootD's copy engine from any program or language (Python's
+`XRootD.client.CopyProcess`, `gfal-copy`, `rucio download`), and ROOT's
+`TFile::Cp`. Only the copy's own file handle is affected: a program that reads
+a file and also copies one keeps its reads cached. A checksum asked for at the
+end of a copy (`xrdcp --cksum`, `gfal-copy -K`) is the origin's. Because a copy
+reads the origin, it needs the origin to be reachable, even for a file that is
+cached.
+
+A copy made any other way reads through the cache like any reader, and for a
+file with a replica it copies the replica's layout: reading a file handle in a
+loop (fsspec's `get` or `open().read()`, a hand-written loop), ROOT's fast
+cloning (`rootcp`, `hadd`), and copies through an XRootD proxy or a FUSE mount
+with uCache inside it. Make those copies with the cache switched off:
+`UCACHE_DISABLE=1 …`. Each handle recognised as a copy is counted in
+`copier_handles` (`ucache stats`); `copy_detect = off` turns the recognition
+off.
+
+**Jobs that read most of every file are read, not cached.** uCache is built for
+analyses that read part of each file, again and again. A job that reads most
+of every file — a skim that writes out nearly every branch, a format
+conversion — would fill the cache with the whole dataset and push out what
+your analyses use, for little gain; if you have the space for the whole
+dataset, a local copy serves such a job better. So when a job's reads of a ROOT
+file (a TTree or RNTuple of 64 MiB or more) cover branches holding more than
+`max_read_fraction` of the file's data (default 25%), the job reads that file
+straight from the origin:
+
+- what it fetches for the file's data is not kept. Bytes already in the cache
+  are still served, and the file's own records (header, keys list, tree
+  metadata) are cached as usual;
+- the decision is taken once per file per job, early — as soon as the branches
+  read so far hold more than the limit, or once the job comes back to branches
+  it has already read — and is not revisited;
+- one warning per job names the first such file. `ucache stats` counts them
+  (`direct_read_files`, `direct_read_bytes`), and their bytes show as direct,
+  like pass-through.
+
+To cache such a job anyway — decompression is what slows it and a replica
+would help, or you want its second pass warm — raise the limit for that job,
+`UCACHE_MAX_READ_FRACTION=100 ./my_job`, or for every job with
+`ucache set max_read_fraction 100`. Files under 64 MiB, and files that are not
+a TTree or RNTuple, are always cached.
 
 **Eviction is on by default.** With no `max_bytes` set, the cache uses the disk
 freely and evicts least-recently-used entries only to keep a free-space floor
@@ -736,7 +794,7 @@ below and the dedicated guide in `docs/CACHE_MANAGEMENT.md`.
 | `ucache --version` (`-V`) | print the version and the build id, then exit. The build id identifies the revision this binary was built from (`v0.18.3`, or `v0.18.3-4-g1a2b3c-dirty` for a local build with edits); it also appears in every benchmark record, so a measurement can be traced back to a binary. A build id equal to the bare version means the build could not read its own revision |
 | `ucache setup [--host H] [--dir PATH]` | write the single conf file (activation + settings, cache dir explicit) to `~/.xrootd/client.plugins.d` |
 | `ucache doctor`    | check install, filesystem (sparse/flock), and activation |
-| `ucache test <url>` | end-to-end self-test: cold + warm whole-file read via xrdcp against your setup as-is; warm must be origin-free; cleans up the entry it created (pre-existing entries kept) |
+| `ucache test <url>` | end-to-end self-test: cold + warm whole-file read via xrdcp against your setup as-is (its copies run with copy detection and recompression off and `max_read_fraction` at 100, so they exercise the byte cache); warm must be origin-free; cleans up the entry it created (pre-existing entries kept) |
 | `ucache enable` / `disable` | turn caching on/off (flips the conf) |
 | `ucache summary [--detail] [--json]` | **overall performance across every recorded run, and the time the cache has saved (or cost) you, measured against a no-cache baseline** — record one by running your job once with `UCACHE_DISABLE=1`. Refused with a reason rather than qualified when the comparison would not be sound. `--detail` adds the last run: tier split, delivered rate, per-tier read counts and sizes, replica coverage |
 | `ucache history [--top N] [--json]` | an **ALL** row aggregating every recorded run, then one row per run, newest first — whether the numbers are holding up across runs, versions and machines |
@@ -787,8 +845,12 @@ between them, and a job that ends abruptly loses at most the last few seconds
 of conversion. Branches a later job reads for the first time are converted as
 it reads them. Two consequences:
 
-- A copy of such a file made through the cache (`xrdcp`) is that larger
-  layout. Copy with the cache out of the way: `UCACHE_DISABLE=1 xrdcp ...`.
+- A copy is still the origin's file: `xrdcp`, `xrdfs`, `xrdadler32`, XRootD's
+  copy engine from any language (`gfal-copy`, `rucio download`, Python's
+  `CopyProcess`) and ROOT's `TFile::Cp` are recognised and read straight from
+  the origin (see "Copies are the origin's bytes" above). A copy made any other
+  way — a read loop, fsspec's `get`, `rootcp`/`hadd` — gets the larger layout:
+  make it with `UCACHE_DISABLE=1`.
 - Do not share a cache directory with uCache 1.2.0 or older. It does not know
   these replicas: it serves such files from the byte cache and the origin
   (correctly, but slowly) and can leave the replicas behind when it evicts.

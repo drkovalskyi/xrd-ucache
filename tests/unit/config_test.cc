@@ -43,6 +43,8 @@ TEST(Config, Defaults) {
   EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kSuperseded); // default reclaim mode
   EXPECT_TRUE(c.transpose);
   EXPECT_TRUE(c.announce); // servers are told uCache is in the path, by default
+  EXPECT_TRUE(c.copyDetect); // a copy is the origin's bytes, by default
+  EXPECT_EQ(c.valueOf("copy_detect"), "on");
   EXPECT_FALSE(c.disable);
   EXPECT_FALSE(c.recompressKeepOriginals); // a converted basket is not also kept
   EXPECT_TRUE(c.cacheDir.empty()); // deliberately NO default cache dir
@@ -65,6 +67,7 @@ TEST(Config, ParsesEverything) {
   ::setenv("UCACHE_DISABLE", "1", 1);
   ::setenv("UCACHE_TRANSPOSE", "off", 1);
   ::setenv("UCACHE_ANNOUNCE", "off", 1);
+  ::setenv("UCACHE_COPY_DETECT", "off", 1);
   ::setenv("UCACHE_RECOMPRESS", "on", 1);
   ::setenv("UCACHE_RECOMPRESS_RECLAIM", "full", 1);
   ::setenv("UCACHE_RECOMPRESS_KEEP_ORIGINALS", "on", 1);
@@ -87,6 +90,9 @@ TEST(Config, ParsesEverything) {
   EXPECT_FALSE(c.transpose);
   EXPECT_FALSE(c.announce);
   EXPECT_EQ(c.valueOf("announce"), "off"); // reported by `ucache settings`
+  EXPECT_FALSE(c.copyDetect);
+  EXPECT_EQ(c.valueOf("copy_detect"), "off");
+  EXPECT_EQ(c.sources.at("copy_detect"), "env");
   EXPECT_TRUE(c.recompress);
   EXPECT_EQ(c.recompressReclaim, Config::Reclaim::kFull);
   EXPECT_EQ(c.valueOf("recompress_reclaim"), "full");
@@ -96,6 +102,33 @@ TEST(Config, ParsesEverything) {
   EXPECT_EQ(c.allowHosts, (std::vector<std::string>{"*.cern.ch"}));
   EXPECT_EQ(c.denyHosts, (std::vector<std::string>{"bad.host"}));
   EXPECT_EQ(c.sources.at("revalidate_seconds"), "env");
+}
+
+// max_read_fraction: a percentage, 25 by default; anything outside 1..100 is
+// refused and the value below it stands.
+TEST(Config, MaxReadFraction) {
+  EnvGuard g;
+  {
+    Config c = Config::fromEnv();
+    EXPECT_EQ(c.maxReadFraction, 25);
+    EXPECT_EQ(c.valueOf("max_read_fraction"), "25");
+  }
+  std::map<std::string, std::string> conf = {{"max_read_fraction", "60"}};
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.maxReadFraction, 60);
+    EXPECT_EQ(c.sources.at("max_read_fraction"), "conf");
+  }
+  ::setenv("UCACHE_MAX_READ_FRACTION", "100", 1);
+  {
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.maxReadFraction, 100) << "the per-job override wins";
+  }
+  for (const char* bad : {"0", "101", "-5", "abc"}) {
+    ::setenv("UCACHE_MAX_READ_FRACTION", bad, 1);
+    Config c = Config::fromEnv(&conf);
+    EXPECT_EQ(c.maxReadFraction, 60) << bad;
+  }
 }
 
 // ucache settings live in the XrdCl plugin conf. Layering:
