@@ -26,7 +26,7 @@ not found, add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup
 file (`~/.bashrc`, `~/.zshrc`, …). Any other prefix works too — nothing
 cares where the files live. Continue with §2 (activation — one config
 file). The tarball and an EL9 RPM are attached to every release on the
-[Releases page](https://github.com/drkovalskyi/xrd-ucache/releases).
+[Releases page](https://github.com/xrootd/xrd-ucache/releases).
 
 The one runtime dependency is the XRootD 5 client library — and any machine
 that already reads `root://` URLs has it (CMSSW, LCG/CVMFS ROOT, or EPEL's
@@ -41,13 +41,13 @@ All three routes below build the same tree, and their `cmake -S .` means this
 directory:
 
 ```sh
-git clone https://github.com/drkovalskyi/xrd-ucache.git
+git clone https://github.com/xrootd/xrd-ucache.git
 cd xrd-ucache
 git checkout v<version>     # optional — a release rather than the tip of main
 ```
 
 A source tarball from the [Releases
-page](https://github.com/drkovalskyi/xrd-ucache/releases) works the same way:
+page](https://github.com/xrootd/xrd-ucache/releases) works the same way:
 unpack it and `cd` into it instead. Downloading either with `git` or `curl`
 matters on macOS — see that section.
 
