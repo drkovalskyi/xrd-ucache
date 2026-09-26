@@ -66,11 +66,11 @@ void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Ru
     return;
   }
   std::printf("uCache try: branch %s of %s in\n  %s\n\n", branch, tree, url);
-  std::printf("  1/3 first read, fills the cache ...\n");
+  std::printf("  read 1 of 3 ...\n");
   const Pass fill = readInChild("", __FILE__, url, tree, branch);
-  std::printf("  2/3 from the server, uCache off ...\n");
+  std::printf("  read 2 of 3 ...\n");
   const Pass direct = readInChild("UCACHE_DISABLE=1", __FILE__, url, tree, branch);
-  std::printf("  3/3 from the cache ...\n");
+  std::printf("  read 3 of 3 ...\n");
   const Pass warm = readInChild("", __FILE__, url, tree, branch);
   if (!fill.ok || !direct.ok || !warm.ok) {
     std::printf("\n  A read failed; its messages are above.\n");
@@ -80,11 +80,14 @@ void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Ru
   const bool same = fill.entries == warm.entries && fill.mean == warm.mean &&
                     direct.entries == warm.entries && direct.mean == warm.mean;
   const double gain = warm.seconds > 0 ? direct.seconds / warm.seconds : 0;
-  std::printf("\n  from the server, uCache off: %7.1f s\n", direct.seconds);
-  std::printf("  first read, fills the cache: %7.1f s\n", fill.seconds);
-  std::printf("  from the cache:              %7.1f s   %.1fx faster than the server\n",
+  std::printf("\n  1. with uCache, first read (fetches, fills the cache): %6.1f s\n", fill.seconds);
+  std::printf("  2. uCache off, straight from the server:               %6.1f s\n", direct.seconds);
+  std::printf("  3. with uCache, from the cache:                        %6.1f s   %.1fx faster than 2\n",
               warm.seconds, gain);
-  std::printf("  same result every time: %s (%.0f values, mean %g)\n", same ? "yes" : "NO",
+  std::printf("\n  Read 2 came right after read 1, when the server had just served the same\n"
+              "  data: the best case for reading without the cache. Read 1 is usually the\n"
+              "  slowest: the server had not served it just before, and it also writes the cache.\n");
+  std::printf("  Same result every time: %s (%.0f values, mean %g)\n", same ? "yes" : "NO",
               warm.entries, warm.mean);
   if (gain < 1.2)
     std::printf("\n  No gain. If uCache is on (`ucache doctor`), reading is not what this job\n"

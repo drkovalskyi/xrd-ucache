@@ -63,20 +63,19 @@ root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C
 
 `doctor` names anything that would stop uCache from caching, and exits
 non-zero if there is. `ucache_try.C` reads one branch of a public CMS open-data
-file three times, each in a fresh ROOT process: once to fill the cache, once
-from the server with uCache switched off (`UCACHE_DISABLE=1`), and once from
-the cache. On a machine at CERN, next to the server:
+file three times, each in a fresh ROOT process, and reports:
 
 ```
-  from the server, uCache off:     8.7 s
-  first read, fills the cache:     5.2 s
-  from the cache:                  4.8 s   1.8x faster than the server
-  same result every time: yes (4488046 values, mean 39.944)
+  1. with uCache, first read (fetches, fills the cache):    7.2 s
+  2. uCache off, straight from the server:                  3.5 s
+  3. with uCache, from the cache:                           2.3 s   1.6x faster than 2
 ```
 
-Most of those seconds are ROOT starting up. The further away the server, the
-more the cache saves: on the Mac it was tested on, the same read took 27 s the
-first time and 3 s the second. To try a file of your own, give it the URL, tree and
+Read 2 is the fairest a server gets: it comes right after read 1, so the
+server has just served the same data. Much of each read is ROOT starting up,
+and the further away the server, the more the cache saves: on the Mac it was
+tested on, the same data took 27 s to read the first time and 3 s from the
+cache. To try a file of your own, give it the URL, tree and
 branch: `root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//path/file.root\", \"Events\", \"Muon_pt\")"`.
 
 Your own jobs run exactly as before: the first run fills the cache, later runs
