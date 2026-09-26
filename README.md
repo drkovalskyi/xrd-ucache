@@ -66,13 +66,21 @@ non-zero if there is. `ucache_demo.C` is a small analysis: from 100 files of
 public CMS open data (Run2016 SingleMuon) it selects events with two muons of
 opposite charge, computes their invariant mass from six muon branches on all
 cores, and saves the mass spectrum as `ucache_demo_dimuon.png`. It makes four
-passes, each in a fresh ROOT process: cold and then warm through the byte
-cache, and cold and then warm again with recompression on, which converts each
-file as it is read into a form faster to decode. Before each cold pass it
-removes the files from the cache, so everything comes from the server. For each
-pass it reports the event-loop time (ROOT starting up and compiling are left
-out: they take the same with or without a cache), how much came from the
-server, and whether the result was the same every time. Each cold pass
+passes, each in a fresh ROOT process:
+
+1. **cold, byte cache** — reads the data from the server and keeps a copy of
+   it on your local disk (the files are removed from the cache first);
+2. **warm, byte cache** — reads the same data from that copy, nothing from the
+   server;
+3. **cold, replica** — reads from the server again (the copy is removed
+   first), converting each file as it arrives into a form that is faster to
+   decode, and keeps that instead (recompression);
+4. **warm, replica** — reads the converted copy: nothing from the server, and
+   less time spent decompressing.
+
+For each pass it reports the event-loop time (ROOT starting up and compiling
+are left out: they take the same with or without a cache), how much came from
+the server, and whether the result was the same every time. Each cold pass
 fetches about 4 GB, and the cache needs about 6 GB of room.
 
 On a Mac mini (Apple M2 Pro), for example:
@@ -93,6 +101,22 @@ uCache demo: dimuon mass spectrum of 100 files, 10 threads
   Same result every time: yes (27012477 muon pairs)
   Mass plot: ucache_demo_dimuon.png
 ```
+
+The same demo on two machines, 4.16 GB from the server in each cold pass and
+the same 27,012,477 muon pairs in every pass:
+
+| pass | Mac mini M2 Pro, 10 threads, far from the server | Linux, 64 threads, next to the server |
+|---|--:|--:|
+| 1. cold, byte cache | 105.0 s | 34.0 s |
+| 2. warm, byte cache | 32.6 s (3.2x) | 17.0 s (2.0x) |
+| 3. cold, replica | 105.0 s (1.0x) | 27.1 s (1.3x) |
+| 4. warm, replica | 12.5 s (8.4x) | 9.5 s (3.6x) |
+
+On the Mac both cold passes wait for the network, so converting the files
+costs nothing and saves nothing on the first read; it pays off on every read
+after it. On the Linux machine, pass 3 was likely helped by the server, which
+had just served the same data in pass 1; and the warm passes probably read the
+cache from memory, since the machine has room to keep it all.
 
 The gain depends on how much of the job is waiting for data or decompressing
 it, and so on how far away the server is. Other NanoAOD directories work too:
