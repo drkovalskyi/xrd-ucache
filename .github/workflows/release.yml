@@ -1,7 +1,8 @@
 # Release: build the floor-correct el9 RPM + tarball and attach them to the
-# GitHub Release for a v* tag. The artifact MUST declare the 5.6 XrdCl
-# handshake floor (see docs), and GitHub runners have no CVMFS, so we build the
-# xrootd 5.6.4 client from source (headers + libXrdCl) and package against it.
+# GitHub Release for a v* tag. The package carries two plugin builds, one per
+# XRootD major, each declaring its major's XrdCl handshake floor (5.6 and 6.0,
+# see docs). GitHub runners have no CVMFS, so we build the xrootd 5.6.4 and
+# 6.0.2 clients from source (headers + libXrdCl) and package against them.
 # workflow_dispatch runs the build + uploads the artifact for inspection
 # WITHOUT creating a release (safe to test the pipeline before tagging).
 name: release
@@ -17,6 +18,8 @@ jobs:
     env:
       XRD_VER: 5.6.4
       XRD_PREFIX: /opt/xrootd-5.6.4
+      XRD6_VER: 6.0.2
+      XRD6_PREFIX: /opt/xrootd-6.0.2
     steps:
       - name: deps (host toolchain + xrootd build deps + codec -devel)
         run: |
@@ -46,6 +49,26 @@ jobs:
                 -DENABLE_READLINE=FALSE
           cmake --build /tmp/xrd/build -j"$(nproc)"
           cmake --install /tmp/xrd/build
+      - name: cache xrootd ${{ env.XRD6_VER }} floor build
+        id: xrd6cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.XRD6_PREFIX }}
+          key: xrootd-${{ env.XRD6_VER }}-el9-v1
+      - name: build xrootd ${{ env.XRD6_VER }} client from source (headers + libXrdCl)
+        if: steps.xrd6cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch v$XRD6_VER --depth 1 https://github.com/xrootd/xrootd /tmp/xrd6
+          # The same selection as the 5.6.4 build; XrdOssArc is new in 6 and
+          # would want libzip.
+          cmake -S /tmp/xrd6 -B /tmp/xrd6/build -DCMAKE_INSTALL_PREFIX="$XRD6_PREFIX" \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DENABLE_HTTP=FALSE -DENABLE_PYTHON=FALSE -DENABLE_VOMS=FALSE \
+                -DENABLE_KRB5=FALSE -DENABLE_XRDEC=FALSE -DENABLE_MACAROONS=FALSE \
+                -DENABLE_SCITOKENS=FALSE -DENABLE_TESTS=FALSE -DENABLE_FUSE=FALSE \
+                -DENABLE_READLINE=FALSE -DENABLE_XRDOSSARC=FALSE
+          cmake --build /tmp/xrd6/build -j"$(nproc)"
+          cmake --install /tmp/xrd6/build
       # fetch-depth 0 so `git describe` can resolve the tag being released:
       # at the default shallow depth with no tags it fails, and the build id
       # falls back to the plain version — leaving the one artifact whose
@@ -53,8 +76,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: package (build against the 5.6.4 floor, produce RPM + tarball)
-        run: UCACHE_PKG_XROOTD_ROOT="$XRD_PREFIX" bash scripts/package-el9.sh
+      - name: package (build against the 5.6.4 and 6.0.2 floors, produce RPM + tarball)
+        run: |
+          UCACHE_PKG_XROOTD_ROOT="$XRD_PREFIX" UCACHE_PKG_XROOTD6_ROOT="$XRD6_PREFIX" \
+            bash scripts/package-el9.sh
       # A released binary exists to be identifiable, and until now it silently
       # was not: `git describe` failed inside the container and the build id fell
       # back to the plain version, which is indistinguishable from success. Assert
@@ -74,15 +99,18 @@ jobs:
             exit 1
           fi
           echo "OK: build id matches the tag"
-      - name: assert the plugin declares the 5.6 handshake floor
+      - name: assert each plugin declares its major's handshake floor
         run: |
-          v=$(strings build-pkg/src/plugin/libXrdClUCache.so \
-              | grep -oE '@V:XrdClUCache v[0-9.]+' | head -1)
-          echo "handshake: $v"
-          case "$v" in
-            *v5.6.*) echo "OK: 5.6 floor" ;;
-            *) echo "FATAL: artifact does not declare the 5.6 floor ($v)"; exit 1 ;;
-          esac
+          for pair in 5:v5.6. 6:v6.0.; do
+            major=${pair%%:*}; floor=${pair#*:}
+            v=$(strings build-pkg/src/plugin/libXrdClUCache-$major.so \
+                | grep -oE '@V:XrdClUCache v[0-9.]+' | head -1)
+            echo "libXrdClUCache-$major.so handshake: $v"
+            case "$v" in
+              *"$floor"*) echo "OK: ${floor%.} floor" ;;
+              *) echo "FATAL: libXrdClUCache-$major.so does not declare the ${floor%.} floor ($v)"; exit 1 ;;
+            esac
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: xrd-ucache-el9-${{ github.sha }}

@@ -4,9 +4,16 @@
 # MUST be built with the host toolchain (system gcc), never an LCG shell, so
 # the binaries' libstdc++/glibc requirements are stock-EL9.
 #
-# Runtime dependencies are the auto-generated soname Requires (libXrdCl.so.3,
-# liblzma.so.5, libzstd.so.1, libz.so.1) — any XRootD 5.x client install
-# satisfies them; on EL9 that is EPEL's xrootd-client-libs.
+# Runtime dependencies are the auto-generated soname Requires (liblzma.so.5,
+# libzstd.so.1, libz.so.1, and glibc/libstdc++ versions) with ONE exception:
+# the XRootD client library. The plugin never needs an XRootD installed from a
+# package — it runs inside a process that has already loaded its client
+# (/usr/bin/xrdcp, or a ROOT from CVMFS, conda or anywhere else), and a library
+# whose name is already loaded is taken from the process, not the disk. A
+# requirement on libXrdCl.so.3 would install an XRootD nobody uses on every
+# machine that gets its XRootD from CVMFS, and one on libXrdCl.so.6 (the second
+# build) would stop the package installing wherever XRootD 6 is absent.
+# ucache-netbench links the client itself and runs where one is available.
 
 # The installed set must be CLOSED under the pointers it contains: a doc that
 # tells the reader to see another doc, which the package does not carry, is a
@@ -58,11 +65,23 @@ set(CPACK_RPM_PACKAGE_RELEASE 1)
 set(CPACK_RPM_PACKAGE_RELEASE_DIST ON)       # -> 1.el9
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)         # -> xrd-ucache-<v>-1.el9.x86_64.rpm
 set(CPACK_RPM_PACKAGE_DESCRIPTION
-    "An XrdCl client plugin (libXrdClUCache.so) and CLI that cache the pages \
-your jobs read from root:// URLs on local disk, so repeat passes over the \
-same data are served locally. Fail-open by construction: any cache problem \
-degrades to a normal uncached read. Activation is per-user and needs no \
-administrator: run `ucache setup` once. Works with any XRootD 5.6+ client \
-stack, including CMSSW and LCG/CVMFS ROOT builds.")
+    "An XrdCl client plugin and CLI that cache the pages your jobs read from \
+root:// URLs on local disk, so repeat passes over the same data are served \
+locally. Fail-open by construction: any cache problem degrades to a normal \
+uncached read. Activation is per-user and needs no administrator: run \
+`ucache setup` once. The plugin is built twice, libXrdClUCache-5.so for \
+XRootD 5.6+ clients and libXrdClUCache-6.so for XRootD 6, and a conf naming \
+libXrdClUCache.so makes each client load its own. Works with the system \
+client and with CMSSW, LCG/CVMFS and other ROOT builds; no XRootD package is \
+required.")
+
+# Lines added to the generated spec. The first drops the XRootD client library
+# from the requirements (see the top of this file); the second works around
+# hosts without /sbin/ldconfig, which rpm's brp-ldconfig step calls by that
+# path and which is a no-op for this package anyway.
+set(CPACK_RPM_SPEC_MORE_DEFINE "%global __requires_exclude ^libXrdCl[.]so")
+if(NOT EXISTS /sbin/ldconfig)
+  string(APPEND CPACK_RPM_SPEC_MORE_DEFINE "\n%define __brp_ldconfig %{nil}")
+endif()
 
 include(CPack)

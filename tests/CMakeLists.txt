@@ -37,6 +37,7 @@ add_executable(ucache-unit-tests
   unit/readfootprint_test.cc
   unit/origin_inflight_test.cc
   unit/publish_test.cc
+  unit/pluginfile_test.cc
   ${CMAKE_SOURCE_DIR}/src/plugin/Announce.cc  # pure identity strings (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/CopyDetect.cc # copy tools and copy engines (no XrdCl)
   ${CMAKE_SOURCE_DIR}/src/plugin/OpenRetry.cc  # pure policy TU (no XrdCl)

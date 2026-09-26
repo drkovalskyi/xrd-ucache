@@ -20,20 +20,23 @@ ucache doctor      # expect FAILs for cache dir + activation — §2 fixes both;
                    # the `plugin loads` line is what confirms the install
 ```
 
-That's the whole install: `bin/ucache`, `bin/ucache-netbench` and
-`lib64/libXrdClUCache.so` under `~/.local`. On EL9 `~/.local/bin` is on `PATH` by default; if `ucache` is
+That's the whole install: `bin/ucache`, `bin/ucache-netbench`, and the plugin
+built twice, `lib64/libXrdClUCache-5.so` and `lib64/libXrdClUCache-6.so`, under
+`~/.local`. On EL9 `~/.local/bin` is on `PATH` by default; if `ucache` is
 not found, add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup
 file (`~/.bashrc`, `~/.zshrc`, …). Any other prefix works too — nothing
 cares where the files live. Continue with §2 (activation — one config
 file). The tarball and an EL9 RPM are attached to every release on the
 [Releases page](https://github.com/xrootd/xrd-ucache/releases).
 
-The one runtime dependency is the XRootD 5 client library — and any machine
-that already reads `root://` URLs has it (CMSSW, LCG/CVMFS ROOT, or EPEL's
-`xrootd-client`). The plugin never links ROOT; it binds to whatever XrdCl
-**5.6–5.9** the process already uses, and where it can't load (CentOS 7-era
-releases under apptainer, xrootd 6 stacks) it fails open — the job just runs
-uncached.
+No XRootD needs to be installed for it: the plugin runs inside a process that
+already has an XRootD client (CMSSW, LCG/CVMFS ROOT, EPEL's `xrootd-client`, …)
+and uses that one. A compiled plugin serves one XRootD major, so there are two:
+`libXrdClUCache-5.so` for XRootD **5.6** and later 5.x clients,
+`libXrdClUCache-6.so` for XRootD **6**. Your configuration names
+`libXrdClUCache.so`, and each client opens the build for its own major beside
+it. The plugin never links ROOT, and where it can't load (CentOS 7-era releases
+under apptainer) it fails open — the job just runs uncached.
 
 ### Get the source
 
@@ -87,8 +90,12 @@ cmake --install build --prefix ~/.local        # or a system prefix (needs write
 `configure` prints `ucache: XRootD client <version> (>= 5.6 required) — OK`; if
 it instead can't find `XrdCl/XrdClPlugInInterface.hh`, `xrootd-client-devel`
 isn't installed or `-DUCACHE_XROOTD_ROOT` doesn't point at its prefix. This
-installs the plugin `lib64/libXrdClUCache.so` and the `ucache` CLI to `bin/`.
-Put the prefix's `bin` on your `PATH` if it isn't already.
+installs the plugin as `lib64/libXrdClUCache-<major>.so`, named after the
+XRootD major it was built against (`-5` for EPEL's client), and the `ucache`
+CLI to `bin/`. Put the prefix's `bin` on your `PATH` if it isn't already. To
+build for both majors, as the release packages are, add
+`-DUCACHE_XROOTD_EXTRA_ROOT=<prefix>` naming a client install of the other
+major.
 
 > **Note:** `-DUCACHE_XROOTD_ROOT=/usr` is required on a stock EL9 box — the
 > default points at the CERN CVMFS/LCG build used for development, which a
@@ -157,7 +164,7 @@ cmake --install build --prefix ~/.local
 
 ```sh
 ~/.local/bin/ucache --version
-otool -L ~/.local/lib/libXrdClUCache.so | grep -i XrdCl   # same path as step 2
+otool -L ~/.local/lib/libXrdClUCache-*.so | grep -i XrdCl   # same path as step 2
 ```
 
 The **second** line of that output is the one to read — the `libXrdCl` the
@@ -168,11 +175,13 @@ Mach-O dylib version. The version XRootD checks at load is separate, and is
 the client release the plugin was compiled against:
 
 ```sh
-strings ~/.local/lib/libXrdClUCache.so | grep '@V:'   # e.g. @V:XrdClUCache v5.9.1
+strings ~/.local/lib/libXrdClUCache-*.so | grep '@V:'   # e.g. @V:XrdClUCache v5.9.1
 ```
 
-It must be less than or equal to the client that loads the plugin; building
-against that same client, as above, satisfies it by construction.
+It must be the same major as the client that loads the plugin and no newer
+than it; building against that same client, as above, satisfies it by
+construction. The file is named after that major: `libXrdClUCache-5.so` with
+MacPorts' XRootD 5, `libXrdClUCache-6.so` with Homebrew's or conda's XRootD 6.
 
 > **Set `TMPDIR` before building.** With it unset, the compiler is handed a
 > per-session `/var/folders/...` path it may not own, and AppleClang then fails to
@@ -196,8 +205,9 @@ volume with room to spare.
 ### For site administrators (optional)
 
 Each release also ships `xrd-ucache-<version>-1.el9.x86_64.rpm` for a system-wide
-install (`dnf install`, lands in `/usr/lib64` + `/usr/bin`; EPEL provides the
-xrootd dependency). Nothing about uCache *needs* this — it exists for admins
+install (`dnf install`, lands in `/usr/lib64` + `/usr/bin`). It requires no
+XRootD package: the plugin uses whichever client a job runs, from the system
+or from CVMFS. Nothing about uCache *needs* this — it exists for admins
 who want one shared copy; users still activate per-user (§2). Maintainers:
 `scripts/package-el9.sh` builds both artifacts into `dist/` with the host
 toolchain (never an LCG shell), so they run on stock EL9 and inside CMSSW/LCG
@@ -259,8 +269,12 @@ dir = /path/on/a/local/disk/ucache
   `/usr/lib64/libXrdClUCache.so` from the RPM (as shipped), or
   `$HOME/.local/lib64/libXrdClUCache.so` for the no-root tarball/source
   install — written out in full: the conf needs a literal absolute path, no
-  `~` and no `$HOME`. If unsure, `ucache doctor` prints the resolved path on
-  its `plugin loads` line, and `ucache setup` (below) fills it in for you.
+  `~` and no `$HOME`. No file has exactly that name: an XRootD client adds its
+  own major and opens `libXrdClUCache-5.so` or `libXrdClUCache-6.so` beside
+  it, so one line serves both. Name the plain file, not one of the builds —
+  naming one makes every client load it, and a client of the other major then
+  refuses it. `ucache doctor` prints the file your client opens on its
+  `plugin loads` line, and `ucache setup` (below) fills the path in for you.
 - `url = *` intercepts every `root://` URL. If a system config in
   `/etc/xrootd/client.plugins.d/` already claims the `*` slot (`doctor`
   warns), list your data hosts explicitly instead:
@@ -276,12 +290,39 @@ dir = /path/on/a/local/disk/ucache
 
 Deactivation is equally boring: delete the file (or set `enable = false`).
 
-However you configured things — this file, `XRD_PLUGINCONFDIR`, environment
-variables, `setup` — **`ucache doctor` is the one verification step**: it
-finds the governing conf exactly as XrdCl would, dlopens the very library
-that conf names, checks the cache filesystem, and exits nonzero if anything
-would stop caching (no conf, `enable = false`, a shadowed `url = *`, a stale
-`lib =` path, an unset or unsuitable cache dir).
+However you configured things — this file, `XRD_PLUGINCONFDIR`, `XRD_PLUGIN`,
+environment variables, `setup` — **`ucache doctor` is the one verification
+step**: it finds the governing conf exactly as XrdCl would, dlopens the very
+file your client would open for the library that conf names, checks the cache
+filesystem, and exits nonzero if anything would stop caching (no conf,
+`enable = false`, a shadowed `url = *`, a stale `lib =` path, no build for
+your client's XRootD major, an unset or unsuitable cache dir).
+
+### Or: no file at all (`XRD_PLUGIN`)
+
+Two environment variables switch uCache on with every default:
+
+```sh
+export XRD_PLUGIN=/usr/lib64/libXrdClUCache.so   # the RPM; else <prefix>/lib64/libXrdClUCache.so
+export UCACHE_DIR=/path/on/a/local/disk/ucache   # required: there is no default
+ucache doctor
+```
+
+`XRD_PLUGIN` is XRootD's own variable: every client loads the library it
+names, for every URL, and reads no plugin configuration at all. Settings then
+come from `UCACHE_*` variables and `ucache set` (§Configuration). Three things
+follow from how it works:
+
+- **No plugin config file is read while it is set** — not yours, not the
+  system's. Any other client plugin configured on the machine is off in that
+  process, and a `ucache.conf`'s settings, `dir` included, do not apply
+  (`doctor` says so if you have one).
+- **It applies to every URL on every host.** A config file can limit uCache to
+  some hosts; this cannot.
+- **Every process that reads data needs both variables**, batch jobs
+  included: export them in the job script.
+
+To switch it off, unset `XRD_PLUGIN`.
 
 ### Or: `ucache setup` (writes the same file)
 

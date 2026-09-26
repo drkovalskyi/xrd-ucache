@@ -16,7 +16,15 @@ set(UCACHE_XROOTD_NEXT_MAJOR "7.0")
 # minimum — the compile-time half of fail-open: a too-old XrdCl
 # must fail loudly at build, not silently at runtime. Called from the plugin
 # CMakeLists with the found include dir, so core-only builds don't require XRootD.
+#
+# The optional second argument names a variable that receives the client's
+# plugin version suffix: the number an XRootD client inserts into a plugin's
+# file name before loading it (a conf naming libXrdClUCache.so makes a 5.x
+# client open libXrdClUCache-5.so, falling back to the plain name only when
+# that file does not exist). It is XRDPLUGIN_SOVERSION from the same header,
+# so the file name cannot disagree with the headers it was compiled against.
 function(ucache_require_xrootd_version include_dir)
+  set(_suffix_var "${ARGV1}")
   set(_hdr "${include_dir}/XrdVersion.hh")
   if(NOT EXISTS "${_hdr}")
     message(FATAL_ERROR "ucache: XrdVersion.hh not found under ${include_dir}")
@@ -53,4 +61,13 @@ function(ucache_require_xrootd_version include_dir)
       "not use the plugin, so jobs keep working uncached; only the build must be told.")
   endif()
   message(STATUS "ucache: XRootD client ${_found} (>= ${UCACHE_XROOTD_MINIMUM} required) — OK")
+  if(_suffix_var)
+    file(STRINGS "${_hdr}" _so REGEX "define[ \t]+XRDPLUGIN_SOVERSION[ \t]+\"[0-9]+\"")
+    if(_so MATCHES "\"([0-9]+)\"")
+      set(_suffix "${CMAKE_MATCH_1}")
+    else()
+      string(REGEX MATCH "^[0-9]+" _suffix "${_found}") # same number: the major
+    endif()
+    set(${_suffix_var} "${_suffix}" PARENT_SCOPE)
+  endif()
 endfunction()

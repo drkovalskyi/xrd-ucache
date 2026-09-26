@@ -5,9 +5,13 @@
 # HOST toolchain (system gcc/cmake) so the binaries need only stock-EL9
 # libstdc++/glibc. XRootD headers: host xrootd-client-devel when present
 # (canonical, matches USER_GUIDE §1), else the pinned LCG install — headers
-# only; either way the linked soname is the same libXrdCl.so.3 that EPEL's
-# xrootd-client-libs provides, and the ABI floor (>= 5.6) is enforced at
-# configure time by cmake/XRootDPin.cmake.
+# only; the ABI floor (>= 5.6) is enforced at configure time by
+# cmake/XRootDPin.cmake.
+#
+# The plugin is built TWICE, once per XRootD major, and both builds ship:
+# libXrdClUCache-5.so (against 5.6) and libXrdClUCache-6.so (against 6.0). A
+# conf naming libXrdClUCache.so makes each client open the file for its own
+# major. The package requires no XRootD at all (cmake/Packaging.cmake).
 #
 # lz4 is intentionally absent (matches every gated build to date): the
 # transposer refuses LZ4-compressed *source* payloads — fail-open, page cache
@@ -31,6 +35,9 @@ command -v rpmbuild >/dev/null || { echo "need rpmbuild (dnf install rpm-build)"
 # runtime path leaks into the artifacts: INSTALL_RPATH is $ORIGIN and deps
 # are recorded by soname (libXrdCl.so.3, identical across 5.6-5.9).
 XRD_FLOOR=/cvmfs/cms.cern.ch/el9_amd64_gcc12/external/xrootd/5.6.4-9891f6fd76a9cee982d9ea3c7ac53fcd
+# The same rule for the XRootD 6 build: 6.0, the first 6.x. The handshake
+# compares major and minor only, so any 6.0.x patch release is the same floor.
+XRD6_FLOOR=/cvmfs/cms.cern.ch/el9_amd64_gcc13/external/xrootd/6.0.2-16d7210c72f2d44b713bbd3a73c3f91b
 XRDROOT_ARGS=()
 if [ -n "${UCACHE_PKG_XROOTD_ROOT:-}" ]; then
   XRDROOT_ARGS=(-DUCACHE_XROOTD_ROOT="$UCACHE_PKG_XROOTD_ROOT")
@@ -43,6 +50,16 @@ else
     XRDROOT_ARGS=(-DUCACHE_XROOTD_ROOT=/usr)
   fi
 fi
+if [ -n "${UCACHE_PKG_XROOTD6_ROOT:-}" ]; then
+  XRD6=$UCACHE_PKG_XROOTD6_ROOT
+elif [ -e "$XRD6_FLOOR/include/xrootd/XrdCl/XrdClPlugInInterface.hh" ]; then
+  XRD6=$XRD6_FLOOR
+else
+  echo "FATAL: no XRootD 6.0 client to build the second plugin against (no CVMFS?) —"
+  echo "       set UCACHE_PKG_XROOTD6_ROOT to a 6.0.x install (headers + libXrdCl.so.6)."
+  exit 1
+fi
+XRDROOT_ARGS+=(-DUCACHE_XROOTD_EXTRA_ROOT="$XRD6")
 
 env -u LD_LIBRARY_PATH -u CC -u CXX -u CMAKE_PREFIX_PATH -u CMAKE_MODULE_PATH \
   "$CMAKE" -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Release \
@@ -52,15 +69,34 @@ env -u LD_LIBRARY_PATH -u CC -u CXX -u CMAKE_PREFIX_PATH -u CMAKE_MODULE_PATH \
 env -u LD_LIBRARY_PATH "$CMAKE" --build "$BUILD" -j"$(nproc)"
 rm -f "$BUILD"/xrd-ucache-*.rpm "$BUILD"/xrd-ucache-*.tar.gz  # stale versions would be re-copied below
 
-# Hard gate: the shipped plugin must carry a 5.6.x handshake version, or old
-# clients (CMSSW externals) will refuse it — exactly the bug this pin fixes.
-PLUGVER=$(strings "$BUILD/src/plugin/libXrdClUCache.so" \
-          | grep -oE "@V:XrdClUCache v[0-9.]+" | head -1 | grep -oE "v[0-9.]+" || true)
-case "${UCACHE_PKG_XROOTD_ROOT:+skip}$PLUGVER" in
-  skip*) echo "NOTE: custom UCACHE_PKG_XROOTD_ROOT — plugin handshake version: $PLUGVER" ;;
-  v5.6.*) echo "plugin handshake version: $PLUGVER (5.6 floor — accepted by all >=5.6 clients)" ;;
-  *) echo "FATAL: plugin handshake version '$PLUGVER' is not the 5.6 floor"; exit 1 ;;
-esac
+# Hard gate: each shipped plugin must carry its major's floor handshake
+# version (5.6.x, 6.0.x), or older clients of that major (CMSSW externals)
+# refuse it — exactly the bug this pin fixes. And each must link its own
+# major's client library: a build that picked up the wrong headers would
+# compile just as happily and be refused at run time.
+plugver() {
+  strings "$1" | grep -oE "@V:XrdClUCache v[0-9.]+" | head -1 | grep -oE "v[0-9.]+" || true
+}
+for want in "5 v5.6. libXrdCl.so.3 ${UCACHE_PKG_XROOTD_ROOT:+custom}" \
+            "6 v6.0. libXrdCl.so.6 ${UCACHE_PKG_XROOTD6_ROOT:+custom}"; do
+  read -r major floor soname custom <<<"$want"
+  so="$BUILD/src/plugin/libXrdClUCache-$major.so"
+  [ -f "$so" ] || { echo "FATAL: $so was not built"; exit 1; }
+  v=$(plugver "$so")
+  needed=$(objdump -p "$so" | grep NEEDED || true) # not `| grep -q`: SIGPIPE under pipefail
+  case "$needed" in
+    *"$soname"*) ;;
+    *) echo "FATAL: $so does not link $soname; it needs:"; echo "$needed"; exit 1 ;;
+  esac
+  if [ -n "$custom" ]; then
+    echo "NOTE: custom XRootD $major root — libXrdClUCache-$major.so handshake version: $v"
+  else
+    case "$v" in
+      "$floor"*) echo "libXrdClUCache-$major.so: handshake $v, links $soname (floor — accepted by every $major.x client)" ;;
+      *) echo "FATAL: libXrdClUCache-$major.so handshake version '$v' is not the ${floor%.} floor"; exit 1 ;;
+    esac
+  fi
+done
 
 # Hard gate: the installed docs must be CLOSED under their own pointers. A
 # shipped guide that says "see docs/X.md" for a file the package omits is a
@@ -88,19 +124,35 @@ fi
 echo "installed docs are closed under their own pointers ($(ls "$DOCDIR"/*.md | wc -l) docs)"
 # Hard gate: the recommended configuration the package ships names the plugin
 # where the RPM puts it. The staged install above is laid out as the RPM (its
-# prefix is /usr), so the path must exist under it.
+# prefix is /usr). The conf names the plain libXrdClUCache.so, which a client
+# turns into libXrdClUCache-<its major>.so, so both of those must exist — and
+# the plain file must NOT: it is what a client of any other major falls back
+# to, and it would refuse it rather than find nothing.
 REC="$DOCSTAGE/usr/share/xrd-ucache/ucache.conf"
 RECLIB=$(sed -n 's/^lib = //p' "$REC" 2>/dev/null)
-[ -n "$RECLIB" ] && [ -e "$DOCSTAGE$RECLIB" ] \
-  || { echo "FATAL: the shipped ucache.conf names lib = '${RECLIB:-?}', which the package does not install"; exit 1; }
-echo "the shipped ucache.conf names the packaged plugin ($RECLIB)"
+[ -n "$RECLIB" ] || { echo "FATAL: the shipped ucache.conf names no lib ="; exit 1; }
+for major in 5 6; do
+  [ -e "$DOCSTAGE${RECLIB%.so}-$major.so" ] \
+    || { echo "FATAL: the shipped ucache.conf names lib = '$RECLIB', but the package does not install ${RECLIB%.so}-$major.so"; exit 1; }
+done
+[ ! -e "$DOCSTAGE$RECLIB" ] || { echo "FATAL: the package installs the plain $RECLIB"; exit 1; }
+echo "the shipped ucache.conf names the packaged plugins ($RECLIB -> -5.so, -6.so)"
 rm -rf "$DOCSTAGE"
 
-# Host quirk guard: rpm's brp-ldconfig hardcodes /sbin/ldconfig, which some
-# hosts (this dev box) lack; the script is a buildroot no-op for us anyway.
-RPM_ARGS=()
-[ -e /sbin/ldconfig ] || RPM_ARGS=(-D 'CPACK_RPM_SPEC_MORE_DEFINE=%define __brp_ldconfig %{nil}')
-(cd "$BUILD" && "$CPACK" -G RPM "${RPM_ARGS[@]}" && "$CPACK" -G TGZ)
+(cd "$BUILD" && "$CPACK" -G RPM && "$CPACK" -G TGZ)
+
+# Hard gate: the RPM requires no XRootD (cmake/Packaging.cmake says why) and
+# carries both plugin builds and no plain-named one.
+RPMFILE=$(ls "$BUILD"/xrd-ucache-*.rpm)
+if rpm -qp --requires "$RPMFILE" 2>/dev/null | grep -i xrdcl; then
+  echo "FATAL: the RPM requires an XRootD client library (above) — it must not"; exit 1
+fi
+RPMLIST=$(rpm -qpl "$RPMFILE" 2>/dev/null)
+for f in libXrdClUCache-5.so libXrdClUCache-6.so; do
+  grep -q "/$f\$" <<<"$RPMLIST" || { echo "FATAL: the RPM does not carry $f"; exit 1; }
+done
+! grep -q '/libXrdClUCache[.]so$' <<<"$RPMLIST" || { echo "FATAL: the RPM carries a plain libXrdClUCache.so"; exit 1; }
+echo "the RPM requires no XRootD and carries libXrdClUCache-5.so and libXrdClUCache-6.so"
 
 mkdir -p dist
 cp -v "$BUILD"/xrd-ucache-*.rpm "$BUILD"/xrd-ucache-*.tar.gz dist/

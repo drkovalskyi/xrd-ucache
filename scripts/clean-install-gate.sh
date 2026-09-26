@@ -67,7 +67,14 @@ cmake -S "$REPO" -B /tmp/ucache-gate/build -DCMAKE_BUILD_TYPE=Release \
 cmake --build /tmp/ucache-gate/build -j"$(nproc)" >>/tmp/ucache-gate/cmake.log 2>&1 || fail "build failed"
 cmake --install /tmp/ucache-gate/build --prefix "$PREFIX" >>/tmp/ucache-gate/cmake.log 2>&1 || fail "install failed"
 test -x "$PREFIX/bin/ucache" || fail "ucache CLI not installed"
-readelf -d "$PREFIX"/lib*/libXrdClUCache.so | grep -q 'ORIGIN' || fail "plugin RPATH not relocatable"
+# The plugin is installed under the name of the XRootD major it was built for,
+# as XRootD names its own plugins; a conf names the plain libXrdClUCache.so and
+# the client adds its major. So the plain file must not be installed.
+PLUGIN_SO=$(ls "$PREFIX"/lib*/libXrdClUCache-[0-9]*.so 2>/dev/null | head -1)
+[ -n "$PLUGIN_SO" ] || fail "plugin not installed as libXrdClUCache-<major>.so"
+! ls "$PREFIX"/lib*/libXrdClUCache.so >/dev/null 2>&1 || fail "the plain libXrdClUCache.so was installed"
+readelf -d "$PLUGIN_SO" | grep -q 'ORIGIN' || fail "plugin RPATH not relocatable"
+PLUGIN_LIB="$(dirname "$PLUGIN_SO")/libXrdClUCache.so"   # the name confs carry
 
 say "3. ucache setup (unprivileged; ONE conf file, nothing else touched)"
 "$PREFIX/bin/ucache" setup --host "localhost:$PORT" --dir "$CACHE" || fail "setup failed"
@@ -81,7 +88,7 @@ diff <(grep -v '^url = \|^lib = \|^dir = ' "$REC") <(grep -v '^url = \|^lib = \|
   || fail "setup's conf and the installed recommended one differ beyond url/lib/dir"
 grep -q "^# recompress = on" "$CONF_FILE" && grep -q "MEMORY" "$CONF_FILE" \
   || fail "the conf does not carry the recompression block and its memory note"
-grep -q "^lib = $PREFIX/lib" "$CONF_FILE" || fail "setup did not name this install's plugin"
+grep -qx "lib = $PLUGIN_LIB" "$CONF_FILE" || fail "setup did not name this install's plugin as $PLUGIN_LIB"
 
 say "4. start a self-contained local xrootd origin"
 head -c 4194304 /dev/urandom > "$ORIGINDIR/probe.bin"       # 4 MiB test object
@@ -161,8 +168,31 @@ env -u XRD_PLUGINCONFDIR -u UCACHE_DIR xrdcp -f "root://localhost:$PORT/$ORIGIND
 COPIES=$(stat_sum copier_handles); echo "copier_handles=$COPIES"
 [ "$COPIES" -gt 0 ] || fail "the copy was not counted as one (plugin not engaged, or copy detection off?)"
 
+say "5c. no conf at all: XRD_PLUGIN + UCACHE_DIR switch it on with every default"
+# XrdCl loads the library XRD_PLUGIN names for every URL and reads no plugin
+# conf while it is set; the conf is moved away anyway, so nothing can mask a
+# failure here.
+CACHE2=/tmp/ucache-gate/cache-env
+mv "$CONF_FILE" "$CONF_FILE.off"
+read_env() {
+  env -u XRD_PLUGINCONFDIR XRD_PLUGIN="$PLUGIN_LIB" UCACHE_DIR="$CACHE2" \
+      UCACHE_COPY_DETECT=off XRD_CPUSEPGWRTRD=0 xrdcp -f "$URL" /tmp/ucache-gate/out-env.bin >/dev/null 2>&1
+}
+read_env || fail "cold read with XRD_PLUGIN failed"
+COLD=$(CACHE=$CACHE2 origin_bytes); echo "cold origin_bytes=$COLD"
+[ "$COLD" -gt 0 ] || fail "XRD_PLUGIN read cached nothing (plugin not engaged?)"
+rm -f "$CACHE2"/stats/*.jsonl
+read_env || fail "warm read with XRD_PLUGIN failed"
+WARM=$(CACHE=$CACHE2 origin_bytes); echo "warm origin_bytes=$WARM"
+[ "$WARM" -eq 0 ] || fail "XRD_PLUGIN warm read fetched $WARM bytes (expected 0)"
+env -u XRD_PLUGINCONFDIR XRD_PLUGIN="$PLUGIN_LIB" UCACHE_DIR="$CACHE2" \
+    "$PREFIX/bin/ucache" doctor >/tmp/ucache-gate/doctor-env.log 2>&1
+grep -q "activation: XRD_PLUGIN" /tmp/ucache-gate/doctor-env.log \
+  || { cat /tmp/ucache-gate/doctor-env.log; fail "doctor does not recognise XRD_PLUGIN activation"; }
+mv "$CONF_FILE.off" "$CONF_FILE"
+
 say "6. fail-open: break the plugin, read must still succeed"
-mv "$PREFIX"/lib*/libXrdClUCache.so /tmp/ucache-gate/broken.so
+mv "$PLUGIN_SO" /tmp/ucache-gate/broken.so
 "$PREFIX/bin/ucache" doctor >/tmp/ucache-gate/doctor.log 2>&1
 grep -qiE 'FAIL|not loadable' /tmp/ucache-gate/doctor.log || echo "  (note: doctor did not flag the broken plugin)"
 read_via_plugin || fail "read did not fail open with a broken plugin (FAIL-OPEN VIOLATION)"

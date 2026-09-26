@@ -9,7 +9,9 @@
 
 # Which servers' files go through the cache ("*" = all), and the plugin. The
 # copy the package ships names the RPM's plugin (/usr/lib64); from any other
-# install `lib` must name yours -- `ucache setup` writes it for you.
+# install `lib` must name yours -- `ucache setup` writes it for you. No file
+# has that exact name: each XRootD client opens the build for its own major
+# beside it (libXrdClUCache-5.so, libXrdClUCache-6.so).
 url = {{URL}}
 lib = {{LIB}}
 enable = true

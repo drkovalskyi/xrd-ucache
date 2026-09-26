@@ -9,6 +9,7 @@
 #include "SlotStore.h"
 #include "ReplicaStore.h"
 #include "ConfTemplate.h"
+#include "PluginFile.h"
 #include "RunLog.h"
 #include "DiskBench.h"
 #include "Publish.h"
@@ -3574,9 +3575,23 @@ std::string homeDir() {
   return "/tmp";
 }
 
-// Absolute path to the installed plugin .so: UCACHE_PLUGIN_SO override, else
-// derived from this binary (bin/ucache -> ../lib{64}), with the build tree as a
-// dev fallback.
+// Names in a directory ("" entries skipped; empty if it cannot be read).
+std::vector<std::string> dirEntries(const std::string& dir) {
+  std::vector<std::string> out;
+  if (DIR* d = ::opendir(dir.c_str())) {
+    while (dirent* e = ::readdir(d))
+      out.emplace_back(e->d_name);
+    ::closedir(d);
+  }
+  return out;
+}
+
+// The plugin path a conf should name: the plain libXrdClUCache.so in the
+// directory this install keeps its builds in (UCACHE_PLUGIN_SO overrides).
+// Installed, only the per-major builds exist (libXrdClUCache-5.so, -6.so) and a
+// client adds its own major to the plain name (PluginFile.h), so the plain
+// name is the one that serves every client. Derived from this binary
+// (bin/ucache -> ../lib{64}), with the build tree as a dev fallback.
 std::string pluginSoPath() {
   if (const char* v = ::getenv("UCACHE_PLUGIN_SO"))
     return v;
@@ -3586,14 +3601,23 @@ std::string pluginSoPath() {
     return s == std::string::npos ? std::string(".") : p.substr(0, s);
   };
   std::string bindir = dir(exe), root = dir(bindir);
-  std::vector<std::string> cands = {root + "/lib64/libXrdClUCache.so",
-                                    root + "/lib/libXrdClUCache.so",
-                                    bindir + "/../plugin/libXrdClUCache.so"};
   struct ::stat st;
-  for (auto& c : cands)
-    if (::stat(c.c_str(), &st) == 0)
-      return c;
+  for (const std::string& d : {root + "/lib64", root + "/lib", bindir + "/../plugin"}) {
+    const std::string plain = d + "/libXrdClUCache.so";
+    if (::stat(plain.c_str(), &st) == 0 || !pluginBuildsBeside(plain, dirEntries(d)).empty())
+      return plain;
+  }
   return "";
+}
+
+// XrdCl's own variable: when XRD_PLUGIN is set (non-empty), every client loads
+// that library for every URL and reads no plugin conf at all — not the user's,
+// not the system's. uCache then runs on its built-in defaults, `ucache set`
+// values and UCACHE_* variables, which is the whole of a conf-free setup:
+// XRD_PLUGIN=<lib dir>/libXrdClUCache.so plus UCACHE_DIR.
+std::string xrdPluginEnv() {
+  const char* v = ::getenv("XRD_PLUGIN");
+  return v ? v : "";
 }
 
 bool writeFileStr(const std::string& path, const std::string& content) {
@@ -3693,11 +3717,12 @@ std::string ucacheConfIn(const std::string& dir) {
   return found;
 }
 
-// The governing ucache plugin conf — the one config file. Searched
-// in XrdCl's precedence order, highest first: $XRD_PLUGINCONFDIR (processed
-// last by XrdCl, so it wins), the default user dir ~/.xrootd/client.plugins.d
-// (passwd home, then $HOME), then the system dir. "" = none found.
-std::string findUCacheConf() {
+// The ucache plugin conf XrdCl would process, were XRD_PLUGIN not set.
+// Searched in XrdCl's precedence order, highest first: $XRD_PLUGINCONFDIR
+// (processed last by XrdCl, so it wins), the default user dir
+// ~/.xrootd/client.plugins.d (passwd home, then $HOME), then the system dir.
+// "" = none found.
+std::string findUCacheConfFile() {
   if (const char* env = ::getenv("XRD_PLUGINCONFDIR")) {
     std::string p = ucacheConfIn(env);
     if (!p.empty())
@@ -3709,6 +3734,13 @@ std::string findUCacheConf() {
       return p;
   }
   return ucacheConfIn("/etc/xrootd/client.plugins.d");
+}
+
+// The governing ucache plugin conf — the one config file, or "" when there is
+// none XrdCl will read: while XRD_PLUGIN is set it reads none, and the plugin
+// sees no conf settings, so neither may the CLI.
+std::string findUCacheConf() {
+  return xrdPluginEnv().empty() ? findUCacheConfFile() : "";
 }
 
 // ---- Settings model: conf = defaults, state = current, env = job -----------
@@ -3766,7 +3798,9 @@ int writeStateFile(const std::string& path,
 int cmdSettings(const Config& cfg) {
   std::string conf = findUCacheConf();
   std::printf("defaults : %s\n",
-              conf.empty() ? "(no plugin conf found — built-ins only)" : conf.c_str());
+              !conf.empty()              ? conf.c_str()
+              : !xrdPluginEnv().empty()  ? "(XRD_PLUGIN is set: no plugin conf is read — built-ins only)"
+                                         : "(no plugin conf found — built-ins only)");
   if (cfg.cacheDir.empty())
     std::printf("current  : (cache dir not set — no state file)\n");
   else {
@@ -3903,6 +3937,9 @@ int cmdSetup(int argc, char** argv) {
   if (host == "*" && systemStarSlotClaimed())
     std::fprintf(stderr, "\nWARNING: a /etc/xrootd/client.plugins.d conf claims the '*' slot and "
                          "shadows `url = *`. Re-run `ucache setup --host <host:port>`.\n");
+  if (!xrdPluginEnv().empty())
+    std::fprintf(stderr, "\nNOTE: XRD_PLUGIN is set in this shell, and while it is XrdCl reads no "
+                         "plugin conf, this one included. Unset it to use the conf.\n");
   return 0;
 }
 
@@ -3932,25 +3969,16 @@ int fsProbe(const std::string& dir) {
   ::unlink(probe.c_str());
   return bad;
 }
-// Probe the library XrdCl will ACTUALLY load — the conf's `lib =` path when a
-// conf exists (a stale lib path must fail here, not silently at runtime);
-// falls back to the install-relative plugin for the pre-activation case.
-int soProbe(const std::string& confLib) {
-  std::string so = confLib.empty() ? pluginSoPath() : confLib;
-  if (so.empty()) {
-    std::printf("  [FAIL] plugin library not found (set UCACHE_PLUGIN_SO)\n");
-    return 1;
-  }
-  const char* what = confLib.empty() ? "plugin loads" : "plugin loads (lib = from conf)";
-  void* h = ::dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (!h) {
-    std::printf("  [FAIL] plugin not loadable: %s\n", ::dlerror());
-    return 1;
-  }
-  bool sym = ::dlsym(h, "XrdClGetPlugIn") != nullptr; // -z nodelete: no dlclose
-  std::printf("  [%s] %s (%s)\n", sym ? " OK " : "WARN", what, so.c_str());
-  return sym ? 0 : 1;
-}
+// The library XrdCl will use and the file it will open for it. `lib` is what
+// governs — XRD_PLUGIN, else the conf's `lib =`, else this install's plugin
+// (before activation) — and `file` is what a client of `major` opens for it
+// (PluginFile.h): a stale lib path must fail here, not silently at runtime.
+struct PluginPick {
+  std::string lib, from, file, client; // client: its `xrdcp --version` line, "" if unknown
+  int major = 0;                       // the client's major, 0 if unknown
+  bool foreign = false;                // XRD_PLUGIN names another plugin (activationProbe says so)
+};
+PluginPick pickPlugin(const std::string& conf);
 
 // Parse the first vX.Y.Z in a string into {major,minor,patch}; false if none.
 bool parseXrdVersion(const std::string& s, int v[3]) {
@@ -3993,30 +4021,111 @@ std::string ambientClientVersion() {
   return parseXrdVersion(buf, v) ? std::string(buf).substr(0, std::string(buf).find_first_of("\r\n"))
                                  : "";
 }
-// Handshake compatibility: XrdCl loads a plugin only when the plugin's declared
-// version is <= the client's — a NEWER-looking plugin is refused SILENTLY and
-// the job runs uncached. Catch that here instead of letting it fail invisibly.
-int handshakeProbe(const std::string& confLib) {
-  std::string so = confLib.empty() ? pluginSoPath() : confLib;
-  if (so.empty())
-    return 0; // soProbe already reported the missing library
-  std::string decl = pluginDeclaredVersion(so);
-  std::string client = ambientClientVersion();
+// The XRootD client in this environment, and the plugin file it would open.
+PluginPick pickPlugin(const std::string& conf) {
+  PluginPick p;
+  if (std::string xp = xrdPluginEnv(); !xp.empty()) {
+    p.lib = xp;
+    p.from = " (XRD_PLUGIN)";
+    p.foreign = !isUCachePluginName(xp);
+  } else if (!conf.empty()) {
+    p.lib = confKey(conf, "lib");
+    p.from = " (the conf's lib =)";
+  } else {
+    p.lib = pluginSoPath();
+    p.from = "";
+  }
+  p.client = ambientClientVersion();
+  int cv[3];
+  if (!p.client.empty() && parseXrdVersion(p.client, cv))
+    p.major = cv[0];
+  // A path is looked up on disk; a bare name the way the client finds it, on
+  // the library search path — which is also where a build that cannot load
+  // (its client library absent here) counts as missing, as the client's own
+  // fallback treats it.
+  if (p.major > 0)
+    p.file = pluginFileFor(p.lib, p.major, [](const std::string& f) {
+      if (f.find('/') == std::string::npos)
+        return ::dlopen(f.c_str(), RTLD_LAZY | RTLD_LOCAL) != nullptr;
+      struct ::stat st;
+      return ::stat(f.c_str(), &st) == 0;
+    });
+  // Report, and read the handshake version from, the file actually found.
+  if (!p.file.empty() && p.file.find('/') == std::string::npos)
+    if (void* h = ::dlopen(p.file.c_str(), RTLD_LAZY | RTLD_LOCAL))
+      if (void* sym = ::dlsym(h, "XrdClGetPlugIn")) {
+        Dl_info di;
+        if (::dladdr(sym, &di) && di.dli_fname)
+          p.file = di.dli_fname;
+      }
+  return p;
+}
+
+int soProbe(const PluginPick& p) {
+  if (p.foreign)
+    return 0;
+  if (p.lib.empty()) {
+    std::printf("  [FAIL] plugin library not found (set UCACHE_PLUGIN_SO)\n");
+    return 1;
+  }
+  const auto slash = p.lib.rfind('/');
+  const auto builds =
+      pluginBuildsBeside(p.lib, dirEntries(slash == std::string::npos ? "." : p.lib.substr(0, slash)));
+  std::string present;
+  for (const auto& b : builds)
+    present += (present.empty() ? "" : ", ") + b.second.substr(b.second.rfind('/') + 1);
+  if (p.major == 0) {
+    // No single answer: which build loads depends on a client we cannot see.
+    // handshakeProbe says so; list what is there.
+    if (!builds.empty())
+      std::printf("  [WARN] XRootD client unknown, so which build it loads cannot be checked "
+                  "(beside %s%s: %s)\n",
+                  p.lib.c_str(), p.from.c_str(), present.c_str());
+    else if (::access(p.lib.c_str(), F_OK) != 0) {
+      std::printf("  [FAIL] no plugin library at %s%s\n", p.lib.c_str(), p.from.c_str());
+      return 1;
+    }
+    return 0;
+  }
+  if (p.file.empty()) {
+    std::printf("  [FAIL] no plugin build for XRootD %d: neither %s nor %s exists%s, so this "
+                "client runs UNCACHED%s%s\n",
+                p.major, versionedPluginName(p.lib, p.major).c_str(), p.lib.c_str(),
+                p.from.c_str(), present.empty() ? "" : "; present: ", present.c_str());
+    return 1;
+  }
+  void* h = ::dlopen(p.file.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (!h) {
+    std::printf("  [FAIL] plugin not loadable: %s\n", ::dlerror());
+    return 1;
+  }
+  bool sym = ::dlsym(h, "XrdClGetPlugIn") != nullptr; // -z nodelete: no dlclose
+  std::printf("  [%s] plugin loads (%s — what an XRootD %d client opens for %s%s)\n",
+              sym ? " OK " : "WARN", p.file.c_str(), p.major, p.lib.c_str(), p.from.c_str());
+  return sym ? 0 : 1;
+}
+
+// Handshake compatibility: XrdCl calls a plugin only when it was built for the
+// client's own major version and a minor no newer than the client's — anything
+// else is refused SILENTLY and the job runs uncached. The patch number is not
+// compared. Catch it here instead of letting it fail invisibly.
+int handshakeProbe(const PluginPick& p) {
+  if (p.file.empty() || p.foreign)
+    return 0; // soProbe or activationProbe already reported it
+  std::string decl = pluginDeclaredVersion(p.file);
   int dv[3], cv[3];
   if (decl.empty() || !parseXrdVersion("v" + decl, dv)) {
-    std::printf("  [WARN] could not read the plugin's handshake version from %s\n", so.c_str());
+    std::printf("  [WARN] could not read the plugin's handshake version from %s\n", p.file.c_str());
     return 0;
   }
-  if (client.empty() || !parseXrdVersion(client, cv)) {
+  if (p.client.empty() || !parseXrdVersion(p.client, cv)) {
     std::printf("  [WARN] XRootD client version unknown (xrdcp not on PATH?) — cannot verify "
-                "handshake; the plugin needs a client >= %s\n",
-                decl.c_str());
+                "handshake; the plugin needs a %d.x client >= %d.%d\n",
+                dv[0], dv[0], dv[1]);
     return 0;
   }
-  bool clientNewerOrEqual = (cv[0] > dv[0]) || (cv[0] == dv[0] && (cv[1] > dv[1] ||
-                            (cv[1] == dv[1] && cv[2] >= dv[2])));
-  if (clientNewerOrEqual) {
-    std::printf("  [ OK ] XRootD client %s >= plugin handshake floor %s\n", client.c_str(),
+  if (cv[0] == dv[0] && cv[1] >= dv[1]) {
+    std::printf("  [ OK ] XRootD client %s accepts the plugin (built for %s)\n", p.client.c_str(),
                 decl.c_str());
     return 0;
   }
@@ -4024,12 +4133,27 @@ int handshakeProbe(const std::string& confLib) {
     std::printf("  [FAIL] XRootD client %s predates the 5.x plugin ABI (needs libXrdCl.so.3); this "
                 "plugin cannot load here AT ALL and jobs run uncached. Use a client/framework "
                 "built against XRootD >= %s.\n",
-                client.c_str(), decl.c_str());
+                p.client.c_str(), decl.c_str());
+  } else if (cv[0] != dv[0]) {
+    std::printf("  [FAIL] XRootD client %s loads only a plugin built for XRootD %d, and %s is built "
+                "for %s: the client refuses it and jobs run UNCACHED.\n",
+                p.client.c_str(), cv[0], p.file.c_str(), decl.c_str());
+    // Naming one build pins every client to it; the plain name lets each pick.
+    const std::string plain = plainPluginName(p.lib);
+    if (plain != p.lib)
+      std::printf("         Name %s instead (each client then opens the build for its own "
+                  "major beside it) and put the XRootD %d build there as %s",
+                  plain.c_str(), cv[0], versionedPluginName(plain, cv[0]).c_str());
+    else
+      std::printf("         Put the XRootD %d build beside it as %s", cv[0],
+                  versionedPluginName(p.lib, cv[0]).c_str());
+    std::printf(" (the prebuilt packages carry builds for 5 and 6), or build uCache against "
+                "this client.\n");
   } else {
     std::printf("  [FAIL] XRootD client %s is OLDER than this plugin (built for %s); XrdCl "
                 "silently refuses a plugin newer than the client, so jobs run UNCACHED. Use a "
-                "client/framework built against XRootD >= %s (newer framework builds ship it).\n",
-                client.c_str(), decl.c_str(), decl.c_str());
+                "client/framework built against XRootD >= %d.%d (newer framework builds ship it).\n",
+                p.client.c_str(), decl.c_str(), dv[0], dv[1]);
   }
   return 1;
 }
@@ -4067,6 +4191,22 @@ int confVerdict(const std::string& p, const char* how) {
 }
 
 int activationProbe() {
+  if (const std::string xp = xrdPluginEnv(); !xp.empty()) {
+    if (!isUCachePluginName(xp)) {
+      std::printf("  [FAIL] XRD_PLUGIN=%s is set: XrdCl loads that plugin for every URL and reads "
+                  "no plugin conf, so uCache is not active in this shell\n",
+                  xp.c_str());
+      return 1;
+    }
+    std::printf("  [ OK ] activation: XRD_PLUGIN=%s\n           hosts: every URL (no plugin conf "
+                "is read while XRD_PLUGIN is set)\n",
+                xp.c_str());
+    if (const std::string c = findUCacheConfFile(); !c.empty())
+      std::printf("  [NOTE] %s is not read while XRD_PLUGIN is set: its settings, dir = included,\n"
+                  "         do not apply; they come from UCACHE_* variables and `ucache set`\n",
+                  c.c_str());
+    return 0;
+  }
   const char* env = ::getenv("XRD_PLUGINCONFDIR");
   if (env) {
     std::string p = ucacheConfIn(env);
@@ -4091,17 +4231,21 @@ int activationProbe() {
                 pdir.c_str());
     return 1;
   }
-  std::printf("  [FAIL] no plugin conf%s — write one yourself (USER_GUIDE §2) or run "
-              "`ucache setup`\n",
-              env ? " (XRD_PLUGINCONFDIR is set but holds no ucache conf)" : "");
+  const std::string so = pluginSoPath();
+  std::printf("  [FAIL] no plugin conf%s — write one yourself (USER_GUIDE §2), run "
+              "`ucache setup`, or for no conf at all export XRD_PLUGIN=%s\n",
+              env ? " (XRD_PLUGINCONFDIR is set but holds no ucache conf)" : "",
+              so.empty() ? "<plugin dir>/libXrdClUCache.so" : so.c_str());
   return 1;
 }
 int cmdDoctor(const Config& cfg) {
   std::string conf = findUCacheConf();
   std::printf("ucache doctor\n  cache dir: %s\n  settings : %s\n  freshness: %s\n",
               cfg.cacheDir.empty() ? "(not set)" : cfg.cacheDir.c_str(),
-              conf.empty() ? "built-in defaults + UCACHE_* env (no plugin conf found)"
-                           : (conf + " (+ UCACHE_* env overrides)").c_str(),
+              !conf.empty() ? (conf + " (+ UCACHE_* env overrides)").c_str()
+              : !xrdPluginEnv().empty()
+                  ? "built-in defaults + UCACHE_* env (XRD_PLUGIN is set: no plugin conf is read)"
+                  : "built-in defaults + UCACHE_* env (no plugin conf found)",
               freshnessSummary(cfg).c_str());
   // Current-values layer: never invisible — name every override.
   if (!cfg.cacheDir.empty()) {
@@ -4125,9 +4269,10 @@ int cmdDoctor(const Config& cfg) {
     ++problems;
   } else
     problems += fsProbe(cfg.cacheDir);
-  problems += soProbe(conf.empty() ? "" : confKey(conf, "lib")) + activationProbe();
-  problems += handshakeProbe(conf.empty() ? "" : confKey(conf, "lib"));
-  if (conf.empty() && systemStarSlotClaimed())
+  const PluginPick pick = pickPlugin(conf);
+  problems += soProbe(pick) + activationProbe();
+  problems += handshakeProbe(pick);
+  if (conf.empty() && xrdPluginEnv().empty() && systemStarSlotClaimed())
     std::printf("  [WARN] /etc/xrootd/client.plugins.d claims the '*' slot; bind explicit hosts "
                 "(url = host:port) or use `setup --host`\n");
   // Recompression enabled and nothing built: the user's symptom is silence,
@@ -4238,14 +4383,22 @@ int cmdTest(CacheStore& store, const Config& cfg, int argc, char** argv) {
     return 2;
   }
   const std::string conf = findUCacheConf();
-  if (conf.empty()) {
+  // XRD_PLUGIN naming uCache is activation with no conf, for every URL.
+  const std::string xp = xrdPluginEnv();
+  if (!xp.empty() && !isUCachePluginName(xp)) {
+    std::fprintf(stderr, "test: XRD_PLUGIN=%s loads another plugin for every URL — uCache is not "
+                         "active in this shell\n",
+                 xp.c_str());
+    return 1;
+  }
+  if (conf.empty() && xp.empty()) {
     std::fputs("test: no plugin conf found — run `ucache doctor` and fix activation first\n",
                stderr);
     return 1;
   }
   // Binding sanity: warn up front if the conf can't intercept this URL.
   // key->key is "scheme://host:port/path" — extract host:port.
-  const std::string binding = confKey(conf, "url");
+  const std::string binding = xp.empty() ? confKey(conf, "url") : "*";
   std::string hostport = key->key;
   if (auto ss = hostport.find("://"); ss != std::string::npos)
     hostport = hostport.substr(ss + 3);
@@ -4328,6 +4481,14 @@ int cmdTest(CacheStore& store, const Config& cfg, int argc, char** argv) {
 }
 
 int cmdEnableDisable(bool enable) {
+  if (const std::string xp = xrdPluginEnv(); !xp.empty()) {
+    std::fprintf(stderr, "%s: XRD_PLUGIN is set (%s), so XrdCl reads no plugin conf and there is "
+                         "nothing here to switch. %s\n",
+                 enable ? "enable" : "disable", xp.c_str(),
+                 enable ? "uCache is on wherever XRD_PLUGIN names it."
+                        : "Unset XRD_PLUGIN, or set UCACHE_DISABLE=1, to run uncached.");
+    return 1;
+  }
   std::string conf = findUCacheConf();
   if (conf.empty()) // legacy setup layout not reachable via env? still try it
     conf = homeDir() + kConfSubdir + "/ucache.conf";

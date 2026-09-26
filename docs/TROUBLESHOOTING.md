@@ -47,21 +47,28 @@ second. If not:
    both **silently fail-open** (job correct, nothing cached); diagnose either
    with `XRD_LOGLEVEL=Debug <your job> … 2>&1 | grep -i plug` in the same
    environment:
-   - *Version handshake:* XrdCl accepts a plugin only when the plugin's build
-     version ≤ the client's. Release artifacts are therefore built against
-     the **5.6 ABI floor** (`@V:XrdClUCache v5.6.x`) and load on every 5.6+
-     client, including CMSSW externals (verified: xrootd 5.6.4/5.8.4/5.9.6).
-     If you build from source against newer headers, older clients (e.g.
-     CMSSW's) log `Plugin version client v5.6.4 is incompatible …` and run
-     uncached — rebuild against the oldest headers you need to serve.
-     **`ucache doctor` now checks this for you**: it compares the plugin's
-     declared version against the `xrootd` client on your PATH and FAILs with
-     a clear message when the client is too old (silent-refusal) or is a 4.x
-     client (a different ABI — `libXrdCl.so.3` is absent, so a 5.x plugin
-     cannot load at all).
+   - *Version handshake:* XrdCl accepts a plugin only when it was built for
+     the client's own major version, with a minor no newer than the client's.
+     The release packages therefore carry two builds, each against its
+     major's oldest release: `libXrdClUCache-5.so` (`@V:XrdClUCache v5.6.x`,
+     loads in every 5.6+ client, CMSSW externals included — verified: xrootd
+     5.6.4/5.8.4/5.9.6) and `libXrdClUCache-6.so` (`v6.0.x`, every 6.x
+     client). A conf naming `libXrdClUCache.so` makes each client open its
+     own. Two ways to lose that: naming one build in the conf (`lib = …-5.so`
+     pins every client to it, and an XRootD 6 client — ROOT 6.40 in LCG_110,
+     for one — then refuses it), or an install with no build for your
+     client's major (a source build has only the one it was built against).
+     If you build from source against newer headers, older clients of the
+     same major (e.g. CMSSW's) log `Plugin version client v5.6.4 is
+     incompatible …` and run uncached — rebuild against the oldest headers
+     you need to serve. **`ucache doctor` checks all of this for you**: it
+     works out which file the `xrootd` client on your PATH opens for your
+     conf, and FAILs when that file is missing, built for another major, or
+     newer than the client, or when the client is 4.x (a different ABI —
+     `libXrdCl.so.3` is absent, so a 5.x plugin cannot load at all).
    - *Which framework release do I need?* Find your client version with
      `xrdcp --version` (or, in a CMSSW area, `scram tool info xrootd`). The
-     prebuilt plugin needs xrootd **≥ 5.6**. CMSSW ships modern xrootd in the
+     prebuilt plugin needs xrootd **≥ 5.6**, or any 6.x. CMSSW ships modern xrootd in the
      latest patch release of **actively-maintained** cycles — e.g.
      `CMSSW_10_6_50` (2026) carries xrootd 5.7.2, though early patches of the
      same cycle (`10_6_26`) shipped 4.8.5 — so *upgrading to the newest patch
@@ -79,6 +86,11 @@ second. If not:
    `direct_read_files`. That is deliberate — such a job would fill the cache
    with the whole dataset. To cache it anyway, `UCACHE_MAX_READ_FRACTION=100
    <your job>`, or `ucache set max_read_fraction 100` for every job.
+9. **`XRD_PLUGIN` is set.** While it is, XrdCl loads the library it names for
+   every URL and reads no plugin config file at all, so a `ucache.conf` does
+   nothing — and if it names some other plugin, uCache is not loaded.
+   `ucache doctor` says which. Unset it, or point it at uCache on purpose
+   (USER_GUIDE §2, "no file at all").
 
 ## `[Error][File] Plug-in factory failed to produce a plug-in … continuing without one`
 
