@@ -4061,6 +4061,35 @@ PluginPick pickPlugin(const std::string& conf) {
   return p;
 }
 
+#if defined(__APPLE__)
+// The macOS packages' plugin names no XRootD library at all (it binds to the
+// client of the process that loads it), so it opens only in a process that
+// already has a client loaded, as every real job does. Load the client that
+// belongs to the `xrdcp` on PATH — the one `doctor` takes as ambient — before
+// opening the plugin: <xrdcp's real dir>/../lib/libXrdCl.<N>.dylib, which is
+// where MacPorts, Homebrew, conda and XRootD's own install put it (N is 3 for
+// XRootD 5, the major from 6 on). Nothing to do for a plugin that links it.
+void preloadAmbientXrdCl(int major) {
+  if (major <= 0)
+    return;
+  const char* path = ::getenv("PATH");
+  std::string dirs = path ? path : "";
+  for (size_t at = 0; at <= dirs.size();) {
+    const size_t colon = std::min(dirs.find(':', at), dirs.size());
+    const std::string cand = dirs.substr(at, colon - at) + "/xrdcp";
+    at = colon + 1;
+    char real[PATH_MAX];
+    if (::access(cand.c_str(), X_OK) != 0 || !::realpath(cand.c_str(), real))
+      continue;
+    std::string bin = real;
+    bin = bin.substr(0, bin.rfind('/'));
+    const std::string lib = bin + "/../lib/libXrdCl." + std::to_string(major == 5 ? 3 : major) + ".dylib";
+    ::dlopen(lib.c_str(), RTLD_NOW | RTLD_GLOBAL); // failure shows as the plugin's own
+    return;
+  }
+}
+#endif
+
 int soProbe(const PluginPick& p) {
   if (p.foreign)
     return 0;
@@ -4094,6 +4123,9 @@ int soProbe(const PluginPick& p) {
                 p.from.c_str(), present.empty() ? "" : "; present: ", present.c_str());
     return 1;
   }
+#if defined(__APPLE__)
+  preloadAmbientXrdCl(p.major);
+#endif
   void* h = ::dlopen(p.file.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!h) {
     std::printf("  [FAIL] plugin not loadable: %s\n", ::dlerror());

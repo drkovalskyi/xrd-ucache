@@ -55,9 +55,16 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "Transparent per-user read cache for remote ROOT/XRootD data")
 # Tarball name (the RPM overrides its own below): unpacks into a single
 # xrd-ucache-<version>-el9-x86_64/ prefix — extract with --strip-components=1.
-set(CPACK_PACKAGE_FILE_NAME
-    "${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-el9-x86_64")
-set(CPACK_GENERATOR "RPM;TGZ")
+# On macOS only the tarball is made, named for the architecture it holds.
+if(APPLE)
+  set(CPACK_PACKAGE_FILE_NAME
+      "${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-macos-${CMAKE_SYSTEM_PROCESSOR}")
+  set(CPACK_GENERATOR "TGZ")
+else()
+  set(CPACK_PACKAGE_FILE_NAME
+      "${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-el9-x86_64")
+  set(CPACK_GENERATOR "RPM;TGZ")
+endif()
 set(CPACK_STRIP_FILES ON)
 
 set(CPACK_RPM_PACKAGE_LICENSE "MIT")         # copyright (c) MIT, LICENSE at repo root

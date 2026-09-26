@@ -26,186 +26,134 @@ Nothing about your analysis changes — same commands, same file names, same
 results; only where the bytes come from. Delete that one config file and the
 same job runs exactly as it did before.
 
-## Getting started
+An environment variable, `XRD_PLUGIN`, can take the config file's place: the
+plug-in manager then loads the library it names for every server. That is the
+quickest way to try uCache, below.
 
-### 1. What you need
+## Try it
 
-An XRootD client (5.6 or newer, 6.x included) and whatever reads your data —
-ROOT, uproot, `cmsRun`. On EL9:
+No administrator needed: everything goes into `~/ucache` in your own account.
+You need:
 
-```sh
-sudo dnf install epel-release xrootd-client root-netx
-```
-
-uCache itself needs no administrator: without root, install it from the
-tarball instead (below). For Debian/Ubuntu, macOS, or building from source,
-see [the user guide](docs/USER_GUIDE.md).
-
-### 2. Install
-
-Download the RPM from the [Releases
-page](https://github.com/xrootd/xrd-ucache/releases) and install it:
+- **x86_64 Linux of the EL9 generation or newer.** Tested on AlmaLinux 9;
+  the other EL9 systems (RHEL and Rocky 9, lxplus) are the same platform. The
+  binaries need glibc 2.34 or newer, so EL8 and CentOS 7 cannot run them. EL10
+  and other distributions that new are likely to work but are not tested.
+- **ROOT that already reads `root://` files in your shell** — from lxplus, an
+  LCG view, CMSSW or conda. uproot works too, through its XRootD bindings.
 
 ```sh
-sudo dnf install ./xrd-ucache-<version>-1.el9.x86_64.rpm
+# 0. your ROOT can read root:// (prints "yes")
+root-config --has-xrootd
+
+# 1. get it: nothing written outside ~/ucache
+mkdir -p ~/ucache
+curl -L https://github.com/xrootd/xrd-ucache/releases/latest/download/xrd-ucache-el9-x86_64.tar.gz \
+  | tar -xz -C ~/ucache --strip-components=1
+
+# 2. switch it on, in this shell only
+export PATH=$HOME/ucache/bin:$PATH
+export XRD_PLUGIN=$HOME/ucache/lib64/libXrdClUCache.so
+export UCACHE_DIR=/tmp/$USER/ucache        # fine for a try; see below for real use
+
+# 3. check, then run your job twice
+ucache doctor
+ucache summary                              # after the second run
 ```
 
-It puts the `ucache` command in `/usr/bin` and the plugin in `/usr/lib64`. It
-requires no XRootD package: the plugin runs inside whichever XRootD client your
-job uses, from the system or from CVMFS.
+`doctor` names anything that would stop uCache from caching, and exits
+non-zero if there is. Your job itself runs exactly as before: the first run
+fills the cache, the second is served from it, and if anything goes wrong with
+the cache a read falls back to the server rather than failing. For a measured
+gain, run the job once more with `UCACHE_DISABLE=1`, which reads everything
+from the server: uCache reports a gain only when it has measured one, and a
+loss as a loss.
 
-### 3. Choose a disk
+To switch it off, `unset XRD_PLUGIN`; to remove it,
+`rm -rf ~/ucache /tmp/$USER/ucache`. The variables last only for this shell,
+and while `XRD_PLUGIN` is set the XRootD client reads no plugin config file,
+so any other client plugin configured on the machine is off.
 
-The disk decides whether caching helps at all: on a slow or network-backed
-volume a cache can be worse than reading the origin. Use a **local SSD or
-NVMe**, never AFS or NFS, and avoid `/tmp` if a system reaper cleans it. If
-you have a choice, measure the candidates before committing to one —
-`ucache bench /path/to/candidate`, a few minutes each; [storage
-benchmarking](docs/BENCH.md) explains how to read the result.
+## Using it for real
 
-### 4. Switch it on
+### Keep it on: one config file
 
-Two environment variables, with every other setting at its default:
+A config file switches uCache on for every process you start, batch jobs
+included, without any variables:
 
 ```sh
-export XRD_PLUGIN=/usr/lib64/libXrdClUCache.so   # the plugin
-export UCACHE_DIR=/path/to/cache                 # the cache, on the disk from step 3
+unset XRD_PLUGIN                                  # the file is not read while it is set
+ucache setup --dir /path/on/a/local/disk/ucache   # writes ~/.xrootd/client.plugins.d/ucache.conf
+ucache doctor
 ```
 
-- `XRD_PLUGIN` is the XRootD client's own variable: every client loads the
-  library it names, for every server. No file has exactly that name — the
-  client adds its own XRootD major and loads `libXrdClUCache-5.so` or
-  `libXrdClUCache-6.so`, so one line serves both.
-- `UCACHE_DIR` has **no default**, on purpose: a default would quietly land in
-  your home, which at many sites is AFS, and caching network data onto a
-  network filesystem defeats the point. A process that has `XRD_PLUGIN` but
-  not `UCACHE_DIR` runs uncached and says so.
+Keep `export PATH=$HOME/ucache/bin:$PATH` in your shell startup file for the
+`ucache` command; the plugin itself needs nothing else. To switch uCache off,
+`ucache disable`, or delete the file.
 
-Every process that reads data needs both, so put them in your shell startup
-file and in your batch job scripts. And while `XRD_PLUGIN` is set the client
-reads no plugin config file at all, so any other client plugin configured on
-the machine is off, and uCache caches every server you read from. If either
-matters, use a config file instead (below).
+**Choose the disk with care.** It decides whether caching helps at all: on a
+slow or network-backed volume a cache can be worse than reading the server.
+Use a local SSD or NVMe, never AFS or NFS, and not a `/tmp` that the system
+cleans. `ucache bench /path/to/candidate` measures a candidate in a few
+minutes; [storage benchmarking](docs/BENCH.md) explains the result.
 
-### 5. Check it before trusting it
+`setup` binds uCache to every server (`url = *`). To cache only some, name
+them in the file: `url = eospublic.cern.ch;eoscms.cern.ch`. If you edit it by
+hand, a `#` comment must start in the first column, and every value is taken
+literally, with no `~` or `$HOME` expanded.
+
+**Recompression (optional, off by default).** With `recompress = on` in the
+file, a ROOT file compressed with LZMA or ZLIB is converted, the first time it
+is read, into a form that is faster to decode, so later passes spend less time
+unpacking. Before you turn it on:
+
+> **Memory.** With it on, jobs hold more memory while they read. On the
+> analyses measured, warm passes needed about 1.8x (TTree) and 2.3x (RNTuple)
+> the memory the same job needs from a replica made by `ucache recompress`. If
+> your jobs run short of memory, turn it off. Files already converted keep
+> their layout until you remove them, while no job is reading them
+> (`ucache untranspose <url>`, or `ucache clear`; a job still reading one
+> would fail).
+
+### Install for everyone on a machine: the RPM
+
+An administrator can install uCache system-wide on EL9 (x86_64):
 
 ```sh
-ucache doctor                       # install, activation, settings, cache filesystem
-ucache test root://<host>//<file>   # real cold and warm read, then cleans up
+curl -LO https://github.com/xrootd/xrd-ucache/releases/latest/download/xrd-ucache-el9.x86_64.rpm
+sudo dnf install ./xrd-ucache-el9.x86_64.rpm
 ```
 
-`doctor` is static and exits non-zero if anything is wrong. `test` is the
-end-to-end proof: it reads a file twice and passes only if the second read
-fetched nothing from the origin.
+It puts `ucache` in `/usr/bin` and the plugin in `/usr/lib64`, and requires no
+XRootD package: the plugin runs inside whichever XRootD client a job uses. So
+ROOT can come from the system (`sudo dnf install epel-release xrootd-client
+root-netx`) or, for each user, from CVMFS, an LCG view or conda. Installing it
+switches uCache on for nobody: each user does that as in "Try it", with
+`XRD_PLUGIN=/usr/lib64/libXrdClUCache.so`, or with `ucache setup` above.
 
-### 6. Run your job
+### macOS
 
-Nothing changes. Run ROOT, uproot or `cmsRun` exactly as before; the first
-pass fills the cache and later passes are served locally. If anything goes
-wrong with the cache the read falls back to the origin rather than failing —
-that behaviour is the design's first rule, not a safety net bolted on.
+> **Not published yet.** There are no prebuilt macOS binaries at the moment;
+> until there are, build from source as the [user
+> guide](docs/USER_GUIDE.md#build-from-source--macos) describes.
 
-### 7. See whether it helped
+With them, trying it on an Apple silicon Mac takes the same three steps, with a
+ROOT that reads `root://` (MacPorts `root6 +xrootd`, Homebrew, or conda):
 
 ```sh
-ucache status     # what is cached, disk used, headroom
-ucache summary    # is this cache worth having
-ucache history    # per-run detail
+root-config --has-xrootd                   # MacPorts names it root-config6
+mkdir -p ~/ucache
+curl -L https://github.com/xrootd/xrd-ucache/releases/latest/download/xrd-ucache-macos-arm64.tar.gz \
+  | tar -xz -C ~/ucache --strip-components=1
+export PATH=$HOME/ucache/bin:$PATH
+export XRD_PLUGIN=$HOME/ucache/lib/libXrdClUCache.so
+export UCACHE_DIR=$HOME/ucache-cache
+ucache doctor
 ```
 
-One thing worth doing once: run the same job with `UCACHE_DISABLE=1`, so there
-is a switched-off run to compare against. uCache reports a gain only when it
-has measured one, and it reports a loss as a loss.
-
-### Without root: the tarball
-
-Instead of the RPM, download the tarball from the same page, unpack it where
-you stand and copy the parts you want, so nothing is written anywhere you did
-not name:
-
-```sh
-tar xf xrd-ucache-<version>-el9-x86_64.tar.gz
-cd xrd-ucache-<version>-el9-x86_64
-
-mkdir -p ~/.local/bin ~/.local/lib64
-cp bin/ucache bin/ucache-netbench  ~/.local/bin/
-cp lib64/libXrdClUCache-*.so       ~/.local/lib64/
-
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-`libXrdClUCache-5.so` and `libXrdClUCache-6.so` are the plugin, the only part
-loaded into your job: one build for XRootD 5 clients and one for XRootD 6, of
-which each client loads its own. `ucache` is the command you will use.
-`ucache-netbench` is a helper that `ucache netbench` runs for you; it is a
-separate executable because it is the one piece that needs the XRootD client
-library. The archive also carries the guides under `share/doc/xrd-ucache/` for
-machines with no web access; nothing requires them.
-
-In step 4 the plugin is then `XRD_PLUGIN=$HOME/.local/lib64/libXrdClUCache.so`.
-
-### Instead of the variables: one config file
-
-A config file does the same job as the two variables, for every process you
-start, and binds uCache to the servers you name. Create the directory the
-XRootD client reads, and put `ucache.conf` in it:
-
-```sh
-mkdir -p ~/.xrootd/client.plugins.d
-```
-
-`~/.xrootd/client.plugins.d/ucache.conf`:
-
-```
-# which servers to cache (several: separate them with ;)
-url = eospublic.cern.ch:1094;eoscms.cern.ch:1094
-
-# the plugin library, absolute path (~ is not expanded)
-lib = /usr/lib64/libXrdClUCache.so
-enable = true
-
-# the cache itself: a local SSD or NVMe, not AFS or NFS
-# UCACHE_DIR overrides it: one conf, a disk per machine
-dir = /path/to/cache
-```
-
-This is the file in the diagram above, and each line is doing one job:
-
-- `url` — the servers uCache intercepts, separated by `;`. The port is
-  optional. `*` means every server, but a site-wide plugin config may already
-  hold that slot, in which case yours is skipped and `ucache doctor` says so;
-  naming your servers avoids the question.
-- `lib` — a literal absolute path: `/usr/lib64/libXrdClUCache.so` from the
-  RPM. The file is read by the XRootD client, which does not expand `~`, so
-  for the tarball run `echo "$HOME/.local/lib64/libXrdClUCache.so"` and paste
-  what it prints. As with `XRD_PLUGIN`, the client adds its own XRootD major to
-  the name.
-- `enable` — the switch. `false` turns uCache off without deleting anything.
-- `dir`, and anything below it, is uCache's own configuration. As with
-  `UCACHE_DIR`, there is no default. If your home is shared across machines
-  that each have their own local disk, leave `dir` out of the file and set
-  `UCACHE_DIR` per machine instead — it overrides the conf, it also tells
-  `ucache status` and `summary` which cache to read, and a machine where you
-  forget it runs uncached and says so rather than caching onto the shared home.
-
-Four syntax rules the client enforces strictly, none of which it explains: a
-`#` comment must start in the **first column** — an indented one makes the
-client reject the whole file and load nothing; a comment written after a value
-becomes **part of that value**; every value is taken **literally**, with no
-`$VAR`, `~` or hostname expanded for you; and the file must be named `*.conf`.
-
-With the file in place nothing else takes part. No environment variable, no
-`LD_PRELOAD`, no ROOT configuration, and no shell to reload — a batch job
-launched tomorrow picks up the same file. Leave `XRD_PLUGIN` unset: while it is
-set, the client never reads this file.
-
-### Housekeeping
-
-Eviction is on by default so the disk cannot fill; `ucache status` shows the
-budget. To remove uCache, `sudo dnf remove xrd-ucache` and unset the two
-variables — or delete the files you copied from the tarball, and the config
-file if you wrote one.
-
+Download it with `curl`, as above, not with a web browser: macOS marks files a
+browser downloads as quarantined, and the XRootD client then cannot load the
+plugin, without saying so.
 
 ## Testing
 

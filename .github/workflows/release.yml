@@ -117,6 +117,148 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # macOS (Apple silicon): one tarball whose plugin binds to whichever XRootD
+  # client the user's ROOT loads — MacPorts, Homebrew or any other — so users
+  # bring ROOT and XRootD and we ship only our files. Built for macOS 11 and
+  # later, with zstd and xz built in (macOS has neither; a package manager's
+  # copies would tie the binary to that manager and raise the minimum macOS).
+  # The two XRootD clients built here give the headers (5.6.4 and 6.0.2, the
+  # floors) and a client and server to test each build with; nothing of them
+  # is shipped. A separate job, so a macOS failure never holds up the EL9
+  # packages; workflow_dispatch builds and uploads it for testing.
+  package-macos:
+    runs-on: macos-14
+    env:
+      XRD_VER: 5.6.4
+      XRD_PREFIX: /Users/runner/xrootd-5.6.4
+      XRD6_VER: 6.0.2
+      XRD6_PREFIX: /Users/runner/xrootd-6.0.2
+      CODECS: /Users/runner/codecs
+      ZSTD_VER: 1.5.6
+      XZ_VER: 5.6.3
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: deps
+        run: brew install openssl@3
+      - name: cache the xrootd ${{ env.XRD_VER }} and ${{ env.XRD6_VER }} builds and the codecs
+        id: depcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.XRD_PREFIX }}
+            ${{ env.XRD6_PREFIX }}
+            ${{ env.CODECS }}
+          key: macos-arm64-xrootd-${{ env.XRD_VER }}-${{ env.XRD6_VER }}-zstd-${{ env.ZSTD_VER }}-xz-${{ env.XZ_VER }}-v1
+      - name: build the xrootd clients and servers (headers, and something to test with)
+        if: steps.depcache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          for pair in "$XRD_VER:$XRD_PREFIX" "$XRD6_VER:$XRD6_PREFIX"; do
+            ver=${pair%%:*}; prefix=${pair#*:}
+            git clone --branch "v$ver" --depth 1 https://github.com/xrootd/xrootd "/tmp/xrd-$ver"
+            cmake -S "/tmp/xrd-$ver" -B "/tmp/xrd-$ver/build" -DCMAKE_INSTALL_PREFIX="$prefix" \
+                  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  -DCMAKE_INSTALL_RPATH="$prefix/lib" -DCMAKE_INSTALL_NAME_DIR="$prefix/lib" \
+                  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+                  -DENABLE_HTTP=FALSE -DENABLE_PYTHON=FALSE -DENABLE_VOMS=FALSE \
+                  -DENABLE_KRB5=FALSE -DENABLE_XRDEC=FALSE -DENABLE_MACAROONS=FALSE \
+                  -DENABLE_SCITOKENS=FALSE -DENABLE_TESTS=FALSE -DENABLE_FUSE=FALSE \
+                  -DENABLE_READLINE=FALSE -DENABLE_XRDOSSARC=FALSE
+            cmake --build "/tmp/xrd-$ver/build" -j"$(sysctl -n hw.ncpu)"
+            cmake --install "/tmp/xrd-$ver/build"
+          done
+      - name: build zstd and xz as static libraries for macOS 11
+        if: steps.depcache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          curl -fsSL "https://github.com/facebook/zstd/releases/download/v$ZSTD_VER/zstd-$ZSTD_VER.tar.gz" | tar -xz -C /tmp
+          make -C "/tmp/zstd-$ZSTD_VER/lib" -j"$(sysctl -n hw.ncpu)" libzstd.a
+          make -C "/tmp/zstd-$ZSTD_VER/lib" install-static install-includes PREFIX="$CODECS"
+          curl -fsSL "https://github.com/tukaani-project/xz/releases/download/v$XZ_VER/xz-$XZ_VER.tar.gz" | tar -xz -C /tmp
+          cd "/tmp/xz-$XZ_VER"
+          ./configure --prefix="$CODECS" --disable-shared --enable-static --disable-xz --disable-xzdec \
+                      --disable-lzmadec --disable-lzmainfo --disable-lzma-links --disable-scripts \
+                      --disable-doc --disable-nls
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: build both plugin majors and the CLI, and make the tarball
+        run: |
+          set -e
+          cmake -S . -B build-pkg -DCMAKE_BUILD_TYPE=Release \
+                -DUCACHE_BUILD_BENCH=OFF -DUCACHE_BUILD_TESTS=OFF \
+                -DUCACHE_XROOTD_ROOT="$XRD_PREFIX" -DUCACHE_XROOTD_EXTRA_ROOT="$XRD6_PREFIX" \
+                -DUCACHE_PLUGIN_BIND_AT_LOAD=ON \
+                -DUCACHE_LZMA="$CODECS/lib/liblzma.a" -DUCACHE_LZMA_INC="$CODECS/include" \
+                -DUCACHE_ZSTD="$CODECS/lib/libzstd.a" -DUCACHE_ZSTD_INC="$CODECS/include" \
+                -DUCACHE_ZLIB=z -DUCACHE_LZ4=OFF
+          cmake --build build-pkg -j"$(sysctl -n hw.ncpu)"
+          (cd build-pkg && cpack -G TGZ)
+          mkdir -p dist && cp build-pkg/xrd-ucache-*-macos-arm64.tar.gz dist/
+          ls -l dist
+      - name: assert the binaries depend on nothing outside macOS, from macOS 11 on
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/stage"
+          tar -xzf dist/xrd-ucache-*-macos-arm64.tar.gz -C "$RUNNER_TEMP/stage" --strip-components=1
+          ls -lR "$RUNNER_TEMP/stage/bin" "$RUNNER_TEMP/stage/lib"
+          for f in "$RUNNER_TEMP"/stage/bin/ucache "$RUNNER_TEMP"/stage/lib/libXrdClUCache-*.so; do
+            deps=$(otool -L "$f" | tail -n +2 | grep -v 'libXrdClUCache' || true)
+            echo "$(basename "$f"):"; echo "$deps"
+            if echo "$deps" | grep -v -E '^[[:space:]]*(/usr/lib/|/System/)' | grep -q .; then
+              echo "FATAL: $f links a library outside macOS"; exit 1
+            fi
+            minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{b=1} b && $1=="minos"{print $2; exit}')
+            echo "  minimum macOS: $minos"
+            [ "$minos" = "11.0" ] || { echo "FATAL: $f requires macOS $minos, not 11.0"; exit 1; }
+          done
+          for pair in 5:v5.6. 6:v6.0.; do
+            major=${pair%%:*}; floor=${pair#*:}
+            so="$RUNNER_TEMP/stage/lib/libXrdClUCache-$major.so"
+            v=$(strings "$so" | grep -oE '@V:XrdClUCache v[0-9.]+' | head -1)
+            echo "libXrdClUCache-$major.so handshake: $v"
+            case "$v" in *"$floor"*) ;; *) echo "FATAL: not the ${floor%.} floor"; exit 1 ;; esac
+          done
+          ! ls "$RUNNER_TEMP/stage/lib/libXrdClUCache.so" 2>/dev/null || { echo "FATAL: plain file shipped"; exit 1; }
+      - name: each build caches under its own XRootD client, through XRD_PLUGIN alone
+        run: |
+          set -e
+          stage="$RUNNER_TEMP/stage"
+          for pair in "5:$XRD_PREFIX:10945" "6:$XRD6_PREFIX:10946"; do
+            IFS=: read -r major prefix port <<<"$pair"
+            t="$RUNNER_TEMP/t$major"; mkdir -p "$t/data" "$t/cache"
+            dd if=/dev/urandom of="$t/data/f.bin" bs=1m count=16 2>/dev/null
+            "$prefix/bin/xrootd" -b -n "srv$major" -p "$port" -l "$t/xrootd.log" "$t/data"
+            sleep 2
+            rd() {
+              XRD_PLUGIN="$stage/lib/libXrdClUCache.so" UCACHE_DIR="$t/cache" \
+                UCACHE_COPY_DETECT=off XRD_CPUSEPGWRTRD=0 XRD_LOGLEVEL=Debug \
+                "$prefix/bin/xrdcp" -f "root://localhost:$port/$t/data/f.bin" "$t/out.bin" 2>"$t/xrdcp.log"
+            }
+            st() { UCACHE_DIR="$t/cache" "$stage/bin/ucache" stats | awk -v k="$1" '$1==k {print $2}'; }
+            rd || { cat "$t/xrdcp.log"; exit 1; }
+            grep -i 'plug' "$t/xrdcp.log" | head -5
+            o1=$(st origin_bytes)
+            rd || { cat "$t/xrdcp.log"; exit 1; }
+            o2=$(st origin_bytes); h2=$(st hit_bytes)
+            cmp "$t/data/f.bin" "$t/out.bin"
+            echo "XRootD $major ($("$prefix/bin/xrdcp" --version 2>&1)): cold origin=$o1, after warm origin=$o2 hits=$h2"
+            [ "${o1:-0}" -gt 0 ] && [ "$o2" = "$o1" ] && [ "${h2:-0}" -gt 0 ] \
+              || { echo "FATAL: libXrdClUCache-$major.so did not cache under its client"; cat "$t/xrdcp.log"; exit 1; }
+            out=$(PATH="$prefix/bin:$PATH" XRD_PLUGIN="$stage/lib/libXrdClUCache.so" UCACHE_DIR="$t/cache" \
+                  "$stage/bin/ucache" doctor 2>&1 || true)
+            echo "$out"
+            echo "$out" | grep -q "plugin loads ($stage/lib/libXrdClUCache-$major.so" \
+              || { echo "FATAL: doctor did not resolve the XRootD $major build"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xrd-ucache-macos-arm64-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     needs: package
     if: startsWith(github.ref, 'refs/tags/v')
@@ -135,6 +277,10 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
+          # Version-free copies, so a fixed link always fetches the newest
+          # release: .../releases/latest/download/<name> (the README's).
+          cp dist/xrd-ucache-*-el9-x86_64.tar.gz dist/xrd-ucache-el9-x86_64.tar.gz
+          cp dist/xrd-ucache-*-1.el9.x86_64.rpm dist/xrd-ucache-el9.x86_64.rpm
           ls -l dist
           if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.rpm dist/*.tar.gz -R "$REPO" --clobber
@@ -142,3 +288,27 @@ jobs:
             gh release create "$TAG" dist/*.rpm dist/*.tar.gz -R "$REPO" \
                --title "$TAG" --generate-notes
           fi
+
+  # Added to the release the EL9 job made, so the two cannot race to create it.
+  release-macos:
+    needs: [release, package-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: xrd-ucache-macos-arm64-*
+          merge-multiple: true
+          path: dist
+      - name: add the macOS tarball to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          # A version-free copy too, for the README's fixed link.
+          cp dist/xrd-ucache-*-macos-arm64.tar.gz dist/xrd-ucache-macos-arm64.tar.gz
+          ls -l dist
+          gh release upload "$TAG" dist/*.tar.gz -R "$REPO" --clobber

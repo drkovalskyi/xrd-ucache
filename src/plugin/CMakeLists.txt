@@ -40,6 +40,21 @@ if(UCACHE_XROOTD_EXTRA_ROOT)
   endif()
 endif()
 
+# macOS only: link the plugin WITHOUT naming an XRootD client library, so it
+# binds at load time to the client the loading process already has. A macOS
+# library records the full path of each library it links, and on macOS every
+# package manager keeps its client somewhere else (MacPorts /opt/local,
+# Homebrew /opt/homebrew, conda inside the environment): a plugin linked to
+# one of them, loaded by a ROOT from another, would bring a second client into
+# the process. Built this way, one binary serves them all — which is what a
+# prebuilt macOS package needs. (Linux needs none of this: there a library is
+# recorded by name, and the process's own copy is reused.)
+option(UCACHE_PLUGIN_BIND_AT_LOAD
+       "macOS: bind the plugin to the XRootD client already loaded, not one at a fixed path" OFF)
+if(UCACHE_PLUGIN_BIND_AT_LOAD AND NOT APPLE)
+  message(FATAL_ERROR "ucache: UCACHE_PLUGIN_BIND_AT_LOAD is for macOS builds only")
+endif()
+
 # One plugin build against one XRootD client. The file is named after the
 # client major it serves, libXrdClUCache-<major>.so, which is how XRootD names
 # its own plugins: a conf that says `lib = <dir>/libXrdClUCache.so` makes a
@@ -65,7 +80,12 @@ function(ucache_add_plugin target include_dir library suffix)
   target_compile_definitions(${target} PRIVATE UCACHE_VERSION="${PROJECT_VERSION}")
   # CMAKE_DL_LIBS: the copy detector's loader queries (dladdr, dlopen) -- empty
   # where the C library already provides them.
-  target_link_libraries(${target} PRIVATE ucache-core ${library} ${CMAKE_DL_LIBS})
+  if(UCACHE_PLUGIN_BIND_AT_LOAD)
+    target_link_libraries(${target} PRIVATE ucache-core ${CMAKE_DL_LIBS})
+    target_link_options(${target} PRIVATE "LINKER:-undefined,dynamic_lookup")
+  else()
+    target_link_libraries(${target} PRIVATE ucache-core ${library} ${CMAKE_DL_LIBS})
+  endif()
   # Read-ahead needs the tree parser (and so the codecs it decompresses the
   # metadata record with); a codec-less build ships the plugin without it.
   if (TARGET ucache-transpose)
@@ -114,9 +134,13 @@ add_custom_command(TARGET XrdClUCache POST_BUILD
 
 # ucache-netbench: origin random-read baseline. Lives here (not in
 # src/cli) because it needs XrdCl, which the CLI deliberately does not link.
-find_package(Threads REQUIRED)
-add_executable(ucache-netbench NetBench.cc)
-target_include_directories(ucache-netbench SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
-target_link_libraries(ucache-netbench PRIVATE ${XRDCL_LIBRARY} Threads::Threads)
-set_target_properties(ucache-netbench PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
-install(TARGETS ucache-netbench RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# Not built when the plugin binds at load: a program has no loaded client to
+# bind to, so it would be tied to one installation again.
+if(NOT UCACHE_PLUGIN_BIND_AT_LOAD)
+  find_package(Threads REQUIRED)
+  add_executable(ucache-netbench NetBench.cc)
+  target_include_directories(ucache-netbench SYSTEM PRIVATE ${XRDCL_INCLUDE_DIR})
+  target_link_libraries(ucache-netbench PRIVATE ${XRDCL_LIBRARY} Threads::Threads)
+  set_target_properties(ucache-netbench PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+  install(TARGETS ucache-netbench RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
