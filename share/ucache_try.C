@@ -4,13 +4,15 @@
 //   root -l -b -q ucache_try.C
 //   root -l -b -q 'ucache_try.C("root://host//path/file.root", "Events", "Muon_pt")'
 //
-// Three reads, each in a fresh ROOT process so that none inherits another's
-// connection or compiled code: the first fills the cache; the second reads
-// from the server with uCache switched off (UCACHE_DISABLE=1), after the first
-// has warmed the server, so it is the fairest read the server can give; the
-// third is served from the cache. With no arguments it reads one branch of a
-// public CMS open-data file. One branch on purpose: uCache reads a job that
-// takes most of a large file straight from the server, without caching it.
+// The file is first removed from the cache (`ucache rm`), then read three
+// times, each in a fresh ROOT process so that none inherits another's
+// connection or compiled code: with uCache, which fetches it and keeps it;
+// with uCache switched off (UCACHE_DISABLE=1), straight from the server; and
+// with uCache again, from the cache. Each line of the report says how much
+// came from the server (`ucache stats`), so it shows rather than assumes where
+// the data came from. With no arguments it reads one branch of a public CMS
+// open-data file. One branch on purpose: uCache reads a job that takes most of
+// a large file straight from the server, without caching it.
 
 #include <ROOT/RDataFrame.hxx>
 #include <TError.h>
@@ -40,6 +42,18 @@ Pass readOnce(const char* url, const char* tree, const char* branch) {
   return {true, seconds, entries, h->GetMean()};
 }
 
+// Bytes uCache has fetched from servers so far, from `ucache stats`; -1 when
+// the `ucache` command is not on PATH.
+double fetchedBytes() {
+  std::istringstream out(gSystem->GetFromPipe("ucache stats 2>/dev/null").Data());
+  for (std::string line; std::getline(out, line);) {
+    double v = 0;
+    if (std::sscanf(line.c_str(), " origin_bytes %lf", &v) == 1)
+      return v;
+  }
+  return -1;
+}
+
 // One read in a fresh ROOT process, with `env` in front of it.
 Pass readInChild(const char* env, const char* macro, const char* url, const char* tree,
                  const char* branch) {
@@ -66,12 +80,26 @@ void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Ru
     return;
   }
   std::printf("uCache try: branch %s of %s in\n  %s\n\n", branch, tree, url);
+  const bool haveCli = fetchedBytes() >= 0;
+  if (haveCli)
+    gSystem->Exec(TString::Format("ucache rm '%s' >/dev/null 2>&1", url)); // start from nothing
+  else
+    std::printf("  `ucache` is not on PATH: the file is not removed from the cache first,\n"
+                "  and the report cannot say where the data came from.\n\n");
   std::printf("  read 1 of 3 ...\n");
+  const double f0 = fetchedBytes();
   const Pass fill = readInChild("", __FILE__, url, tree, branch);
+  const double f1 = fetchedBytes();
   std::printf("  read 2 of 3 ...\n");
   const Pass direct = readInChild("UCACHE_DISABLE=1", __FILE__, url, tree, branch);
   std::printf("  read 3 of 3 ...\n");
+  const double f2 = fetchedBytes();
   const Pass warm = readInChild("", __FILE__, url, tree, branch);
+  const double f3 = fetchedBytes();
+  auto fromServer = [&](double before, double after) {
+    return haveCli ? TString::Format("%6.1f MB from the server", (after - before) / 1e6)
+                   : TString("");
+  };
   if (!fill.ok || !direct.ok || !warm.ok) {
     std::printf("\n  A read failed; its messages are above.\n");
     return;
@@ -80,13 +108,10 @@ void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Ru
   const bool same = fill.entries == warm.entries && fill.mean == warm.mean &&
                     direct.entries == warm.entries && direct.mean == warm.mean;
   const double gain = warm.seconds > 0 ? direct.seconds / warm.seconds : 0;
-  std::printf("\n  1. with uCache, first read (fetches, fills the cache): %6.1f s\n", fill.seconds);
-  std::printf("  2. uCache off, straight from the server:               %6.1f s\n", direct.seconds);
-  std::printf("  3. with uCache, from the cache:                        %6.1f s   %.1fx faster than 2\n",
-              warm.seconds, gain);
-  std::printf("\n  Read 2 came right after read 1, when the server had just served the same\n"
-              "  data: the best case for reading without the cache. Read 1 is usually the\n"
-              "  slowest: the server had not served it just before, and it also writes the cache.\n");
+  std::printf("\n  1. with uCache:   %6.1f s   %s\n", fill.seconds, fromServer(f0, f1).Data());
+  std::printf("  2. uCache off:    %6.1f s   all of it from the server\n", direct.seconds);
+  std::printf("  3. with uCache:   %6.1f s   %s   %.1fx faster than 2\n", warm.seconds,
+              fromServer(f2, f3).Data(), gain);
   std::printf("  Same result every time: %s (%.0f values, mean %g)\n", same ? "yes" : "NO",
               warm.entries, warm.mean);
   if (gain < 1.2)
