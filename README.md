@@ -102,6 +102,8 @@ uCache demo: dimuon mass spectrum of 100 files, 10 threads
   Mass plot: ucache_demo_dimuon.png
 ```
 
+![The dimuon mass spectrum from the demo: events with two muons of opposite charge in 100 files of CMS Run2016 SingleMuon open data, on log-log axes from 0.25 to 300 GeV, with the phi, J/psi, psi-prime, Upsilon and Z peaks labelled.](docs/images/ucache_demo_dimuon.png)
+
 The same demo on two machines, 4.16 GB from the server in each cold pass and
 the same 27,012,477 muon pairs in every pass:
 
