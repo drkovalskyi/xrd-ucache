@@ -83,7 +83,7 @@ are left out: they take the same with or without a cache), how much came from
 the server, and whether the result was the same every time. Each cold pass
 fetches about 4 GB, and the cache needs about 6 GB of room.
 
-On a Mac mini (Apple M2 Pro), for example:
+On a Mac mini (Apple M2 Pro), for example, on 2026-09-26:
 
 ```
 Processing ucache_demo.C...
@@ -104,8 +104,8 @@ uCache demo: dimuon mass spectrum of 100 files, 10 threads
 
 ![The dimuon mass spectrum from the demo: events with two muons of opposite charge in 100 files of CMS Run2016 SingleMuon open data, on log-log axes from 0.25 to 300 GeV, with the phi, J/psi, psi-prime, Upsilon and Z peaks labelled.](docs/images/ucache_demo_dimuon.png)
 
-The same demo on two machines, 4.16 GB from the server in each cold pass and
-the same 27,012,477 muon pairs in every pass:
+The same demo on two machines, both on 2026-09-26, with 4.16 GB from the server
+in each cold pass and the same 27,012,477 muon pairs in every pass:
 
 | pass | Mac mini M2 Pro, 10 threads, far from the server | Linux, 64 threads, next to the server |
 |---|--:|--:|
