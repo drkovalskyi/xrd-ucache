@@ -62,19 +62,21 @@ root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C
 ```
 
 `doctor` names anything that would stop uCache from caching, and exits
-non-zero if there is. `ucache_try.C` removes one public CMS open-data file from
-the cache, then reads one branch of it three times, each in a fresh ROOT
-process: with uCache, which fetches it and keeps it; with uCache switched off
-(`UCACHE_DISABLE=1`); and with uCache again. For each read it reports the time
-and how much came from the server — the third read should need nothing from it
-— and whether the result was the same every time.
+non-zero if there is. `ucache_try.C` is a small analysis: from one public CMS
+open-data file it selects events with two muons of opposite charge, computes
+their invariant mass from six muon branches, and saves the mass spectrum as
+`ucache_try_dimuon.png`. It first removes the file from the cache, then runs
+three times, each in a fresh ROOT process: with uCache, which fetches the data
+and keeps it; with uCache switched off (`UCACHE_DISABLE=1`); and with uCache
+again. For each run it reports the time and how much came from the server —
+the third run should need nothing from it — and whether the result was the
+same every time.
 
 The gain depends on how far away the server is. On the Mac this was tested on,
-the same data took 27 s to read the first time and 3 s from the cache; right
-next to the server, where most of each read is ROOT starting up, there is
-little to gain, and the report says so. To try a file of your own, give it the
-URL, tree and branch (it removes that file from the cache first, too):
-`root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//path/file.root\", \"Events\", \"Muon_pt\")"`.
+reading the data took 27 s the first time and 3 s from the cache; right next
+to the server there is little to gain, and the report says so. Any other
+NanoAOD file works too (it is removed from the cache first as well):
+`root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//path/file.root\")"`.
 
 Your own jobs run exactly as before: the first run fills the cache, later runs
 are served from it, and if anything goes wrong with the cache a read falls
