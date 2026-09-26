@@ -47,6 +47,10 @@ string(REPLACE "{{DIR}}" "/path/on/a/local/disk/ucache" _ucache_conf "${_ucache_
 file(WRITE "${CMAKE_BINARY_DIR}/share/ucache.conf" "${_ucache_conf}")
 install(FILES "${CMAKE_BINARY_DIR}/share/ucache.conf"
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/xrd-ucache)
+# A ROOT macro that reads the same data twice and reports the difference: the
+# README's first look at uCache working (`root -l -b -q .../ucache_try.C`).
+install(FILES "${PROJECT_SOURCE_DIR}/share/ucache_try.C"
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/xrd-ucache)
 
 set(CPACK_PACKAGE_NAME "xrd-ucache")
 set(CPACK_PACKAGE_VENDOR "xrd-ucache")

@@ -56,18 +56,34 @@ export PATH=$HOME/ucache/bin:$PATH
 export XRD_PLUGIN=$HOME/ucache/lib64/libXrdClUCache.so
 export UCACHE_DIR=/tmp/$USER/ucache        # fine for a try; see below for real use
 
-# 3. check, then run your job twice
+# 3. check it, then see it work
 ucache doctor
-ucache summary                              # after the second run
+root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C
 ```
 
 `doctor` names anything that would stop uCache from caching, and exits
-non-zero if there is. Your job itself runs exactly as before: the first run
-fills the cache, the second is served from it, and if anything goes wrong with
-the cache a read falls back to the server rather than failing. For a measured
-gain, run the job once more with `UCACHE_DISABLE=1`, which reads everything
-from the server: uCache reports a gain only when it has measured one, and a
-loss as a loss.
+non-zero if there is. `ucache_try.C` reads one branch of a public CMS open-data
+file three times, each in a fresh ROOT process: once to fill the cache, once
+from the server with uCache switched off (`UCACHE_DISABLE=1`), and once from
+the cache. On a machine at CERN, next to the server:
+
+```
+  from the server, uCache off:     8.7 s
+  first read, fills the cache:     5.2 s
+  from the cache:                  4.8 s   1.8x faster than the server
+  same result every time: yes (4488046 values, mean 39.944)
+```
+
+Most of those seconds are ROOT starting up. The further away the server, the
+more the cache saves: on the Mac it was tested on, the same read took 27 s the
+first time and 3 s the second. To try a file of your own, give it the URL, tree and
+branch: `root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//path/file.root\", \"Events\", \"Muon_pt\")"`.
+
+Your own jobs run exactly as before: the first run fills the cache, later runs
+are served from it, and if anything goes wrong with the cache a read falls
+back to the server rather than failing. `ucache summary` reports the time
+saved once there is a run with `UCACHE_DISABLE=1` to compare with: uCache
+reports a gain only when it has measured one, and a loss as a loss.
 
 To switch it off, `unset XRD_PLUGIN`; to remove it,
 `rm -rf ~/ucache /tmp/$USER/ucache`. The variables last only for this shell,
@@ -129,19 +145,17 @@ XRootD package: the plugin runs inside whichever XRootD client a job uses. So
 ROOT can come from the system (`sudo dnf install epel-release xrootd-client
 root-netx`) or, for each user, from CVMFS, an LCG view or conda. Installing it
 switches uCache on for nobody: each user does that as in "Try it", with
-`XRD_PLUGIN=/usr/lib64/libXrdClUCache.so`, or with `ucache setup` above.
+`XRD_PLUGIN=/usr/lib64/libXrdClUCache.so`, or with `ucache setup` above. The
+check is the same too: `root -l -b -q /usr/share/xrd-ucache/ucache_try.C`.
 
 ### macOS
 
-> **Not published yet.** There are no prebuilt macOS binaries at the moment;
-> until there are, build from source as the [user
-> guide](docs/USER_GUIDE.md#build-from-source--macos) describes.
-
-With them, trying it on an Apple silicon Mac takes the same three steps, with a
-ROOT that reads `root://` (MacPorts `root6 +xrootd`, Homebrew, or conda):
+On an Apple silicon Mac with macOS 11 or newer the steps are the same. You
+need a ROOT that reads `root://`: tested with MacPorts' (`root6 +xrootd`);
+Homebrew's and conda's are likely to work but are not tested.
 
 ```sh
-root-config --has-xrootd                   # MacPorts names it root-config6
+root-config --has-xrootd                   # MacPorts: root-config6
 mkdir -p ~/ucache
 curl -L https://github.com/xrootd/xrd-ucache/releases/latest/download/xrd-ucache-macos-arm64.tar.gz \
   | tar -xz -C ~/ucache --strip-components=1
@@ -149,7 +163,11 @@ export PATH=$HOME/ucache/bin:$PATH
 export XRD_PLUGIN=$HOME/ucache/lib/libXrdClUCache.so
 export UCACHE_DIR=$HOME/ucache-cache
 ucache doctor
+root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C   # MacPorts: root6
 ```
+
+To build from source instead, see the [user
+guide](docs/USER_GUIDE.md#build-from-source--macos).
 
 Download it with `curl`, as above, not with a web browser: macOS marks files a
 browser downloads as quarantined, and the XRootD client then cannot load the
