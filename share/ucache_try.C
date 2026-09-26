@@ -48,18 +48,29 @@ struct Pass {
 
 const char* kPlot = "ucache_try_dimuon.png";
 
-// The analysis. Returns its wall time and a fingerprint of its result.
+// The analysis. Returns the time of its event loop -- opening the file,
+// reading it and computing, but not ROOT starting up or compiling anything:
+// the analysis is written with typed functions, so ROOT compiles all of it
+// when it loads this macro, before the clock starts -- and a fingerprint of
+// its result.
 Pass analyse(const char* url, bool plot) {
-  const auto t0 = std::chrono::steady_clock::now();
+  using ROOT::RVecF;
+  using ROOT::RVecI;
   ROOT::RDataFrame df("Events", url);
   // 300 bins, evenly spaced in log(mass), from 0.25 to 300 GeV.
   std::vector<double> edges;
   for (int i = 0; i <= 300; ++i)
     edges.push_back(0.25 * std::pow(300 / 0.25, i / 300.0));
-  auto h = df.Filter("nMuon == 2", "two muons")
-               .Filter("Muon_charge[0] != Muon_charge[1]", "opposite charge")
-               .Define("mass", "ROOT::VecOps::InvariantMass(Muon_pt, Muon_eta, Muon_phi, Muon_mass)")
-               .Histo1D({"mass", ";m_{#mu#mu} (GeV);events", 300, edges.data()}, "mass");
+  auto h = df.Filter([](unsigned n) { return n == 2; }, {"nMuon"}, "two muons")
+               .Filter([](const RVecI& q) { return q[0] != q[1]; }, {"Muon_charge"},
+                       "opposite charge")
+               .Define("mass",
+                       [](const RVecF& pt, const RVecF& eta, const RVecF& phi, const RVecF& m) {
+                         return ROOT::VecOps::InvariantMass(pt, eta, phi, m);
+                       },
+                       {"Muon_pt", "Muon_eta", "Muon_phi", "Muon_mass"})
+               .Histo1D<float>({"mass", ";m_{#mu#mu} (GeV);events", 300, edges.data()}, "mass");
+  const auto t0 = std::chrono::steady_clock::now();
   const double pairs = h->GetEntries(); // runs the event loop
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -160,7 +171,8 @@ void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Ru
                     direct.pairs == warm.pairs && direct.mean == warm.mean;
   const double gain = warm.seconds > 0 ? direct.seconds / warm.seconds : 0;
   const double cost = direct.seconds > 0 ? fill.seconds / direct.seconds : 0;
-  std::printf("\n  warm-up, uCache off:  %6.1f s   (first contact, not compared)\n", warmup.seconds);
+  std::printf("\n  event-loop time (ROOT start-up and compiling not counted):\n");
+  std::printf("  warm-up, uCache off:  %6.1f s   (first contact, not compared)\n", warmup.seconds);
   std::printf("  1. uCache off:        %6.1f s     all of it from the server\n", direct.seconds);
   std::printf("  2. uCache, first run: %6.1f s   %s   %.2fx the time of 1\n", fill.seconds,
               fromServer(f0, f1).Data(), cost);

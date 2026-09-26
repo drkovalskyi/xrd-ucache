@@ -70,13 +70,16 @@ analysis once with uCache off as a warm-up, not compared: the first contact
 with anything is slower, and that would bias whichever run came first. Then
 it runs three times, each in a fresh ROOT process: with uCache off
 (`UCACHE_DISABLE=1`); with uCache, which fetches the data and keeps it; and
-with uCache again. It reports each run's time and how much came from the
-server, what filling the cache cost (run 2 against run 1) and what reading from
-it saved (run 3 against run 1), and whether the result was the same every time.
+with uCache again. It reports each run's event-loop time (ROOT starting up
+and compiling are left out: they take the same with or without a cache) and
+how much came from the server, what filling the cache cost (run 2 against run
+1) and what reading from it saved (run 3 against run 1), and whether the
+result was the same every time.
 
-The gain depends on how far away the server is and how much of the job is
-waiting for data: right next to the server, most of this one is ROOT compiling
-and computing, there is little to gain, and the report says so. Any other
+The gain depends on how much of the job is waiting for data, and so on how far
+away the server is. Right next to it, this analysis spends its time
+decompressing and computing, there is nothing to gain, and the report says so.
+Any other
 NanoAOD file works too (it is removed from the cache first as well):
 `root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//path/file.root\")"`.
 
