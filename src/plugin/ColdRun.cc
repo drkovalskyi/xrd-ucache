@@ -83,8 +83,6 @@ Executor& convertPool() {
   return *pool;
 }
 
-constexpr uint64_t kHeadBlock = 128 * 1024;
-
 // Commits posted and not yet run. A process that exits normally waits for them
 // (bounded); a hard _exit() skips this, and loses at most what the periodic
 // checkpoint had not yet committed.

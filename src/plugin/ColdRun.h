@@ -45,7 +45,7 @@ namespace ucache {
 
 struct HandleState;
 class FileEntry;
-class UrlKey;
+struct UrlKey;
 class ColdFill;
 
 // How a slot run may be set up.
