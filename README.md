@@ -62,26 +62,23 @@ root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C
 ```
 
 `doctor` names anything that would stop uCache from caching, and exits
-non-zero if there is. `ucache_try.C` is a small analysis: from one public CMS
-open-data file it selects events with two muons of opposite charge, computes
-their invariant mass from six muon branches, and saves the mass spectrum as
-`ucache_try_dimuon.png`. It first removes the file from the cache and runs the
-analysis once with uCache off as a warm-up, not compared: the first contact
-with anything is slower, and that would bias whichever run came first. Then
-it runs three times, each in a fresh ROOT process: with uCache off
-(`UCACHE_DISABLE=1`); with uCache, which fetches the data and keeps it; and
-with uCache again. It reports each run's event-loop time (ROOT starting up
-and compiling are left out: they take the same with or without a cache) and
-how much came from the server, what filling the cache cost (run 2 against run
-1) and what reading from it saved (run 3 against run 1), and whether the
-result was the same every time.
+non-zero if there is. `ucache_try.C` is a small analysis: from 100 files of
+public CMS open data (Run2016 SingleMuon) it selects events with two muons of
+opposite charge, computes their invariant mass from six muon branches on all
+cores, and saves the mass spectrum as `ucache_try_dimuon.png`. It makes four
+passes, each in a fresh ROOT process: cold and then warm through the byte
+cache, and cold and then warm again with recompression on, which converts each
+file as it is read into a form faster to decode. Before each cold pass it
+removes the files from the cache, so everything comes from the server. For each
+pass it reports the event-loop time (ROOT starting up and compiling are left
+out: they take the same with or without a cache), how much came from the
+server, and whether the result was the same every time. Each cold pass
+fetches about 4 GB, and the cache needs about 6 GB of room.
 
-The gain depends on how much of the job is waiting for data, and so on how far
-away the server is. Right next to it, this analysis spends its time
-decompressing and computing, there is nothing to gain, and the report says so.
-Any other
-NanoAOD file works too (it is removed from the cache first as well):
-`root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//path/file.root\")"`.
+The gain depends on how much of the job is waiting for data or decompressing
+it, and so on how far away the server is. Other NanoAOD directories work too:
+`root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//dir\", 50)"`
+reads the first 50 files of `dir`.
 
 Your own jobs run exactly as before: the first run fills the cache, later runs
 are served from it, and if anything goes wrong with the cache a read falls

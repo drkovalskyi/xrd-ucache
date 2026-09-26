@@ -1,26 +1,30 @@
-// See uCache work on a small analysis: the dimuon mass spectrum of a CMS
-// NanoAOD file, read from the server and from the cache.
+// See uCache work on a small analysis: the dimuon mass spectrum of 100 CMS
+// NanoAOD files, read cold and warm, first through the byte cache and then
+// through recompressed replicas.
 //
 //   root -l -b -q ucache_try.C
-//   root -l -b -q 'ucache_try.C("root://host//path/other_nanoaod.root")'
+//   root -l -b -q 'ucache_try.C("root://host//dir1,root://host//dir2", 50)'
 //
 // The analysis selects events with exactly two muons of opposite charge,
 // computes their invariant mass from six muon branches, and saves the mass
-// spectrum as ucache_try_dimuon.png. Six of a NanoAOD file's roughly 1500
+// spectrum as ucache_try_dimuon.png. Six of a NanoAOD file's roughly 1300
 // branches, as a typical analysis reads: uCache reads a job that takes most
-// of a large file straight from the server, without caching it.
+// of a large file straight from the server, without caching it. It runs on
+// all cores (ROOT::EnableImplicitMT). The files are the first N `.root` files
+// of the given directories, in order.
 //
-// The file is first removed from the cache (`ucache rm`). Then a warm-up run
-// with uCache off, not compared: the first contact with anything is slow (the
-// server has not served this data lately, ROOT starts for the first time), and
-// charging that to whichever run came first would bias it. Then three runs,
-// each in a fresh ROOT process so that none inherits another's connection or
-// compiled code: with uCache switched off (UCACHE_DISABLE=1), straight from the
-// server; with uCache, which fetches the data and keeps it; and with uCache
-// again, from the cache. Run 2 against run 1 is what filling the cache costs,
-// run 1 against run 3 what it saves. Each line of the report says how much came
-// from the server (`ucache stats`), so it shows rather than assumes where the
-// data came from. With no arguments it reads a public CMS open-data file.
+// Four passes, each in a fresh ROOT process:
+//   1. cold, byte cache  -- the files removed from the cache first, so every
+//                           byte comes from the server and is kept
+//   2. warm, byte cache  -- served from what pass 1 kept
+//   3. cold, replica     -- removed again; with `recompress = on`, each file is
+//                           converted as it is read into a form faster to decode
+//   4. warm, replica     -- served from the replicas
+// Each pass times its event loop only -- opening the files, reading and
+// computing -- not ROOT starting up or compiling: the analysis is written with
+// typed functions, which ROOT compiles when it loads this macro. Each line says
+// how much came from the server (`ucache stats`), and the histogram's bin
+// counts must be the same in every pass.
 
 #include <ROOT/RDataFrame.hxx>
 #include <ROOT/RVec.hxx>
@@ -33,30 +37,57 @@
 #include <TStyle.h>
 #include <TSystem.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
+const char* kPlot = "ucache_try_dimuon.png";
+const char* kDirs =
+    "root://eospublic.cern.ch//eos/opendata/cms/Run2016H/SingleMuon/NANOAOD/"
+    "UL2016_MiniAODv2_NanoAODv9-v1/130000,"
+    "root://eospublic.cern.ch//eos/opendata/cms/Run2016H/SingleMuon/NANOAOD/"
+    "UL2016_MiniAODv2_NanoAODv9-v1/70000,"
+    "root://eospublic.cern.ch//eos/opendata/cms/Run2016G/SingleMuon/NANOAOD/"
+    "UL2016_MiniAODv2_NanoAODv9-v1/70000";
+
 struct Pass {
   bool ok;
-  double seconds, pairs, mean;
+  double seconds, pairs, fingerprint;
 };
 
-const char* kPlot = "ucache_try_dimuon.png";
+// The first `n` .root files of the comma-separated directories, in order.
+std::vector<std::string> listFiles(const char* dirs, int n) {
+  std::vector<std::string> files;
+  std::istringstream in(dirs);
+  for (std::string dir; std::getline(in, dir, ',') && static_cast<int>(files.size()) < n;) {
+    std::vector<std::string> here;
+    if (void* d = gSystem->OpenDirectory(dir.c_str())) {
+      while (const char* e = gSystem->GetDirEntry(d))
+        if (TString(e).EndsWith(".root"))
+          here.push_back(dir + "/" + e);
+      gSystem->FreeDirectory(d);
+    }
+    std::sort(here.begin(), here.end());
+    for (const auto& f : here)
+      if (static_cast<int>(files.size()) < n)
+        files.push_back(f);
+  }
+  return files;
+}
 
-// The analysis. Returns the time of its event loop -- opening the file,
-// reading it and computing, but not ROOT starting up or compiling anything:
-// the analysis is written with typed functions, so ROOT compiles all of it
-// when it loads this macro, before the clock starts -- and a fingerprint of
-// its result.
-Pass analyse(const char* url, bool plot) {
+// The analysis. Returns the time of its event loop and a fingerprint of the
+// histogram's bin counts, which do not depend on how threads split the work.
+Pass analyse(const std::vector<std::string>& files, bool plot) {
   using ROOT::RVecF;
   using ROOT::RVecI;
-  ROOT::RDataFrame df("Events", url);
+  ROOT::EnableImplicitMT();
+  ROOT::RDataFrame df("Events", files);
   // 300 bins, evenly spaced in log(mass), from 0.25 to 300 GeV.
   std::vector<double> edges;
   for (int i = 0; i <= 300; ++i)
@@ -74,6 +105,9 @@ Pass analyse(const char* url, bool plot) {
   const double pairs = h->GetEntries(); // runs the event loop
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  double fingerprint = 0;
+  for (int i = 0; i <= h->GetNbinsX() + 1; ++i)
+    fingerprint += (i + 1) * h->GetBinContent(i);
   if (plot) {
     gStyle->SetOptStat(0);
     TCanvas c("c", "", 900, 600);
@@ -87,8 +121,9 @@ Pass analyse(const char* url, bool plot) {
     t.SetNDC();
     t.SetTextFont(42);
     t.SetTextSize(0.04);
-    t.DrawLatex(0.15, 0.85, "#bf{CMS open data} Run2016H SingleMuon, read through uCache");
-    t.DrawLatex(0.15, 0.80, "two muons of opposite charge");
+    t.DrawLatex(0.15, 0.85,
+                TString::Format("#bf{CMS open data} Run2016 SingleMuon, %zu files", files.size()));
+    t.DrawLatex(0.15, 0.80, "two muons of opposite charge, read through uCache");
     // The resonances, labelled just above their peaks.
     TLatex peak;
     peak.SetTextFont(42);
@@ -100,7 +135,7 @@ Pass analyse(const char* url, bool plot) {
       peak.DrawLatex(m, 1.4 * h->GetBinContent(h->FindBin(m)), name);
     c.SaveAs(kPlot);
   }
-  return {true, seconds, pairs, h->GetMean()};
+  return {true, seconds, pairs, fingerprint};
 }
 
 // Bytes uCache has fetched from servers so far, from `ucache stats`; -1 when
@@ -115,72 +150,85 @@ double fetchedBytes() {
   return -1;
 }
 
-// One analysis in a fresh ROOT process, with `env` in front of it; `child` 2
-// also saves the plot.
-Pass analyseInChild(const char* env, const char* macro, const char* url, int child) {
-  const TString cmd = TString::Format("%s '%s/root.exe' -l -b -q '%s(\"%s\",%d)'", env,
-                                      TROOT::GetBinDir().Data(), macro, url, child);
+// Remove the files from the cache, byte copies and replicas alike.
+void removeFromCache(const std::vector<std::string>& files) {
+  TString cmd = "ucache rm";
+  for (const auto& f : files)
+    cmd += TString::Format(" '%s'", f.c_str());
+  gSystem->Exec(cmd + " >/dev/null 2>&1");
+}
+
+// One pass in a fresh ROOT process, with `env` in front of it; `child` 2 also
+// saves the plot.
+Pass passInChild(const char* env, const char* macro, const char* dirs, int n, int child) {
+  const TString cmd = TString::Format("%s '%s/root.exe' -l -b -q '%s(\"%s\",%d,%d)'", env,
+                                      TROOT::GetBinDir().Data(), macro, dirs, n, child);
   std::istringstream out(gSystem->GetFromPipe(cmd).Data());
   for (std::string line; std::getline(out, line);) {
     Pass p{true, 0, 0, 0};
-    if (std::sscanf(line.c_str(), "UCACHE_TRY %lf %lf %lf", &p.seconds, &p.pairs, &p.mean) == 3)
+    if (std::sscanf(line.c_str(), "UCACHE_TRY %lf %lf %lf", &p.seconds, &p.pairs, &p.fingerprint) == 3)
       return p;
   }
   return {false, 0, 0, 0};
 }
 } // namespace
 
-void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Run2016H/SingleMuon/"
-                                  "NANOAOD/UL2016_MiniAODv2_NanoAODv9-v1/130000/"
-                                  "5CA4CE73-629C-2F48-939C-4274B369F112.root",
-                int child = 0) {
+void ucache_try(const char* dirs = kDirs, int nfiles = 100, int child = 0) {
   gErrorIgnoreLevel = kWarning + 1; // CMS files carry metadata classes ROOT warns it cannot read
+  const std::vector<std::string> files = listFiles(dirs, nfiles);
   if (child) {
-    const Pass p = analyse(url, child == 2);
-    std::printf("UCACHE_TRY %.6f %.0f %.17g\n", p.seconds, p.pairs, p.mean);
+    const Pass p = analyse(files, child == 2);
+    std::printf("UCACHE_TRY %.6f %.0f %.17g\n", p.seconds, p.pairs, p.fingerprint);
     return;
   }
-  std::printf("uCache try: dimuon mass spectrum of\n  %s\n\n", url);
+  if (files.empty()) {
+    std::printf("uCache try: no .root files found in %s\n", dirs);
+    return;
+  }
+  ROOT::EnableImplicitMT();
+  std::printf("uCache try: dimuon mass spectrum of %zu files, %u threads\n", files.size(),
+              ROOT::GetThreadPoolSize());
   const bool haveCli = fetchedBytes() >= 0;
-  if (haveCli)
-    gSystem->Exec(TString::Format("ucache rm '%s' >/dev/null 2>&1", url)); // start from nothing
-  else
-    std::printf("  `ucache` is not on PATH: the file is not removed from the cache first,\n"
-                "  and the report cannot say where the data came from.\n\n");
-  std::printf("  warm-up, uCache off ...\n");
-  const Pass warmup = analyseInChild("UCACHE_DISABLE=1", __FILE__, url, 1);
-  std::printf("  run 1 of 3 ...\n");
-  const Pass direct = analyseInChild("UCACHE_DISABLE=1", __FILE__, url, 1);
-  std::printf("  run 2 of 3 ...\n");
-  const double f0 = fetchedBytes();
-  const Pass fill = analyseInChild("", __FILE__, url, 1);
-  const double f1 = fetchedBytes();
-  std::printf("  run 3 of 3 ...\n");
-  const Pass warm = analyseInChild("", __FILE__, url, 2);
-  const double f2 = fetchedBytes();
-  if (!warmup.ok || !fill.ok || !direct.ok || !warm.ok) {
-    std::printf("\n  An analysis failed; its messages are above.\n");
-    return;
-  }
-  auto fromServer = [&](double before, double after) {
-    return haveCli ? TString::Format("%7.1f MB from the server", (after - before) / 1e6)
-                   : TString("");
-  };
+  if (!haveCli)
+    std::printf("  `ucache` is not on PATH: the files cannot be removed from the cache\n"
+                "  before the cold passes, and the report cannot say where data came from.\n");
 
-  const bool same = fill.pairs == warm.pairs && fill.mean == warm.mean &&
-                    direct.pairs == warm.pairs && direct.mean == warm.mean;
-  const double gain = warm.seconds > 0 ? direct.seconds / warm.seconds : 0;
-  const double cost = direct.seconds > 0 ? fill.seconds / direct.seconds : 0;
+  struct Run {
+    const char* label;
+    const char* env;
+    bool cold;
+    Pass pass;
+    double fetched;
+  } runs[] = {{"cold, byte cache", "UCACHE_RECOMPRESS=off", true, {}, 0},
+              {"warm, byte cache", "UCACHE_RECOMPRESS=off", false, {}, 0},
+              {"cold, replica   ", "UCACHE_RECOMPRESS=on", true, {}, 0},
+              {"warm, replica   ", "UCACHE_RECOMPRESS=on", false, {}, 0}};
+  for (int k = 0; k < 4; ++k) {
+    std::printf("  pass %d of 4: %s ...\n", k + 1, runs[k].label);
+    if (runs[k].cold && haveCli)
+      removeFromCache(files);
+    const double before = fetchedBytes();
+    runs[k].pass = passInChild(runs[k].env, __FILE__, dirs, nfiles, k == 3 ? 2 : 1);
+    runs[k].fetched = fetchedBytes() - before;
+    if (!runs[k].pass.ok) {
+      std::printf("\n  Pass %d failed; its messages are above.\n", k + 1);
+      return;
+    }
+  }
+
+  bool same = true;
+  for (const auto& r : runs)
+    same = same && r.pass.pairs == runs[0].pass.pairs &&
+           r.pass.fingerprint == runs[0].pass.fingerprint;
   std::printf("\n  event-loop time (ROOT start-up and compiling not counted):\n");
-  std::printf("  warm-up, uCache off:  %6.1f s   (first contact, not compared)\n", warmup.seconds);
-  std::printf("  1. uCache off:        %6.1f s     all of it from the server\n", direct.seconds);
-  std::printf("  2. uCache, first run: %6.1f s   %s   %.2fx the time of 1\n", fill.seconds,
-              fromServer(f0, f1).Data(), cost);
-  std::printf("  3. uCache, again:     %6.1f s   %s   %.1fx faster than 1\n", warm.seconds,
-              fromServer(f1, f2).Data(), gain);
-  std::printf("  Same result every time: %s (%.0f muon pairs)\n", same ? "yes" : "NO", warm.pairs);
+  for (int k = 0; k < 4; ++k) {
+    const auto& r = runs[k];
+    TString from = haveCli ? TString::Format("%6.2f GB from the server", r.fetched / 1e9) : TString("");
+    TString rel = k == 0 ? TString("")
+                         : TString::Format("   %.1fx faster than 1", runs[0].pass.seconds / r.pass.seconds);
+    std::printf("  %d. %s %7.1f s   %s%s\n", k + 1, r.label, r.pass.seconds, from.Data(), rel.Data());
+  }
+  std::printf("  Same result every time: %s (%.0f muon pairs)\n", same ? "yes" : "NO",
+              runs[0].pass.pairs);
   std::printf("  Mass plot: %s\n", kPlot);
-  if (gain < 1.2)
-    std::printf("\n  No gain. If uCache is on (`ucache doctor`), reading is not what this job\n"
-                "  waits for here: the server is close, or the job computes more than it reads.\n");
 }
