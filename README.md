@@ -75,6 +75,25 @@ out: they take the same with or without a cache), how much came from the
 server, and whether the result was the same every time. Each cold pass
 fetches about 4 GB, and the cache needs about 6 GB of room.
 
+On a Mac mini (Apple M2 Pro), for example:
+
+```
+Processing ucache_demo.C...
+uCache demo: dimuon mass spectrum of 100 files, 10 threads
+  pass 1 of 4: cold, byte cache ...
+  pass 2 of 4: warm, byte cache ...
+  pass 3 of 4: cold, replica    ...
+  pass 4 of 4: warm, replica    ...
+
+  event-loop time (ROOT start-up and compiling not counted):
+  1. cold, byte cache   105.0 s     4.16 GB from the server
+  2. warm, byte cache    32.6 s     0.00 GB from the server   3.2x faster than 1
+  3. cold, replica      105.0 s     4.16 GB from the server   1.0x faster than 1
+  4. warm, replica       12.5 s     0.00 GB from the server   8.4x faster than 1
+  Same result every time: yes (27012477 muon pairs)
+  Mass plot: ucache_demo_dimuon.png
+```
+
 The gain depends on how much of the job is waiting for data or decompressing
 it, and so on how far away the server is. Other NanoAOD directories work too:
 `root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_demo.C(\"root://host//dir\", 50)"`
