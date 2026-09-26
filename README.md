@@ -58,14 +58,14 @@ export UCACHE_DIR=/tmp/$USER/ucache        # fine for a try; see below for real 
 
 # 3. check it, then see it work
 ucache doctor
-root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C
+root -l -b -q ~/ucache/share/xrd-ucache/ucache_demo.C
 ```
 
 `doctor` names anything that would stop uCache from caching, and exits
-non-zero if there is. `ucache_try.C` is a small analysis: from 100 files of
+non-zero if there is. `ucache_demo.C` is a small analysis: from 100 files of
 public CMS open data (Run2016 SingleMuon) it selects events with two muons of
 opposite charge, computes their invariant mass from six muon branches on all
-cores, and saves the mass spectrum as `ucache_try_dimuon.png`. It makes four
+cores, and saves the mass spectrum as `ucache_demo_dimuon.png`. It makes four
 passes, each in a fresh ROOT process: cold and then warm through the byte
 cache, and cold and then warm again with recompression on, which converts each
 file as it is read into a form faster to decode. Before each cold pass it
@@ -77,7 +77,7 @@ fetches about 4 GB, and the cache needs about 6 GB of room.
 
 The gain depends on how much of the job is waiting for data or decompressing
 it, and so on how far away the server is. Other NanoAOD directories work too:
-`root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//dir\", 50)"`
+`root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_demo.C(\"root://host//dir\", 50)"`
 reads the first 50 files of `dir`.
 
 Your own jobs run exactly as before: the first run fills the cache, later runs
@@ -147,7 +147,7 @@ ROOT can come from the system (`sudo dnf install epel-release xrootd-client
 root-netx`) or, for each user, from CVMFS, an LCG view or conda. Installing it
 switches uCache on for nobody: each user does that as in "Try it", with
 `XRD_PLUGIN=/usr/lib64/libXrdClUCache.so`, or with `ucache setup` above. The
-check is the same too: `root -l -b -q /usr/share/xrd-ucache/ucache_try.C`.
+check is the same too: `root -l -b -q /usr/share/xrd-ucache/ucache_demo.C`.
 
 ### macOS
 
@@ -164,7 +164,7 @@ export PATH=$HOME/ucache/bin:$PATH
 export XRD_PLUGIN=$HOME/ucache/lib/libXrdClUCache.so
 export UCACHE_DIR=$HOME/ucache-cache
 ucache doctor
-root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C   # MacPorts: root6
+root -l -b -q ~/ucache/share/xrd-ucache/ucache_demo.C   # MacPorts: root6
 ```
 
 To build from source instead, see the [user

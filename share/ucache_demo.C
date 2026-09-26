@@ -2,12 +2,12 @@
 // NanoAOD files, read cold and warm, first through the byte cache and then
 // through recompressed replicas.
 //
-//   root -l -b -q ucache_try.C
-//   root -l -b -q 'ucache_try.C("root://host//dir1,root://host//dir2", 50)'
+//   root -l -b -q ucache_demo.C
+//   root -l -b -q 'ucache_demo.C("root://host//dir1,root://host//dir2", 50)'
 //
 // The analysis selects events with exactly two muons of opposite charge,
 // computes their invariant mass from six muon branches, and saves the mass
-// spectrum as ucache_try_dimuon.png. Six of a NanoAOD file's roughly 1300
+// spectrum as ucache_demo_dimuon.png. Six of a NanoAOD file's roughly 1300
 // branches, as a typical analysis reads: uCache reads a job that takes most
 // of a large file straight from the server, without caching it. It runs on
 // all cores (ROOT::EnableImplicitMT). The files are the first N `.root` files
@@ -47,7 +47,7 @@
 #include <vector>
 
 namespace {
-const char* kPlot = "ucache_try_dimuon.png";
+const char* kPlot = "ucache_demo_dimuon.png";
 const char* kDirs =
     "root://eospublic.cern.ch//eos/opendata/cms/Run2016H/SingleMuon/NANOAOD/"
     "UL2016_MiniAODv2_NanoAODv9-v1/130000,"
@@ -166,27 +166,27 @@ Pass passInChild(const char* env, const char* macro, const char* dirs, int n, in
   std::istringstream out(gSystem->GetFromPipe(cmd).Data());
   for (std::string line; std::getline(out, line);) {
     Pass p{true, 0, 0, 0};
-    if (std::sscanf(line.c_str(), "UCACHE_TRY %lf %lf %lf", &p.seconds, &p.pairs, &p.fingerprint) == 3)
+    if (std::sscanf(line.c_str(), "UCACHE_DEMO %lf %lf %lf", &p.seconds, &p.pairs, &p.fingerprint) == 3)
       return p;
   }
   return {false, 0, 0, 0};
 }
 } // namespace
 
-void ucache_try(const char* dirs = kDirs, int nfiles = 100, int child = 0) {
+void ucache_demo(const char* dirs = kDirs, int nfiles = 100, int child = 0) {
   gErrorIgnoreLevel = kWarning + 1; // CMS files carry metadata classes ROOT warns it cannot read
   const std::vector<std::string> files = listFiles(dirs, nfiles);
   if (child) {
     const Pass p = analyse(files, child == 2);
-    std::printf("UCACHE_TRY %.6f %.0f %.17g\n", p.seconds, p.pairs, p.fingerprint);
+    std::printf("UCACHE_DEMO %.6f %.0f %.17g\n", p.seconds, p.pairs, p.fingerprint);
     return;
   }
   if (files.empty()) {
-    std::printf("uCache try: no .root files found in %s\n", dirs);
+    std::printf("uCache demo: no .root files found in %s\n", dirs);
     return;
   }
   ROOT::EnableImplicitMT();
-  std::printf("uCache try: dimuon mass spectrum of %zu files, %u threads\n", files.size(),
+  std::printf("uCache demo: dimuon mass spectrum of %zu files, %u threads\n", files.size(),
               ROOT::GetThreadPoolSize());
   const bool haveCli = fetchedBytes() >= 0;
   if (!haveCli)
