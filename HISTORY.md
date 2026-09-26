@@ -11,6 +11,27 @@ Recompression stays off unless you turn it on. Nothing is published unless you
 run `ucache publish`. Any XRootD 5.6 or newer 5.x client works; 6.x from
 v0.21.0.
 
+## v1.3.0 — 2026-09-26
+- With `recompress = on`, a file's replica is built while it is first read; no
+  separate `ucache recompress` pass is needed.
+- Copies — `xrdcp`, `hadd`, `rootcp`, gfal, ROOT's `TFile::Cp` and similar —
+  read straight from the origin and leave the cache unchanged.
+- Added `max_read_fraction`: a job that reads most of a large file reads it
+  from the origin instead of caching it; default 25%.
+- Prebuilt binaries for macOS on Apple silicon: one tarball that uses the
+  XRootD client of the ROOT or XRootD you already have.
+- The package includes `ucache_demo.C`: a dimuon mass analysis over 100 CMS
+  open-data files that shows the cache working, cold and warm, through the
+  byte cache and the replicas.
+- One package serves XRootD 5 and 6 clients: it carries a build of the plugin
+  for each, and the client loads its own.
+- The RPM no longer requires the XRootD client; uCache uses whichever client
+  the process has loaded.
+- `XRD_PLUGIN=<dir>/libXrdClUCache.so` with `UCACHE_DIR` turns uCache on with
+  every default and no config file.
+- The RPM installs a recommended configuration at
+  `/usr/share/xrd-ucache/ucache.conf`.
+
 ## v1.2.0 — 2026-09-22
 - Added `prefetch`: read-ahead for TTree reads, so a first pass waits less on
   the origin; off by default, on with `prefetch = on`.
