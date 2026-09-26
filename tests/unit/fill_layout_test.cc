@@ -114,6 +114,11 @@ Fx fixture(int64_t fend = 70000, bool largeHeader = false, bool wideEntry = true
   branch("Muon_pt", 207, {1000, 3000}, {1500, 2500}, kB0Seek, kB0Bytes, kB0Zip);
   branch("Muon_eta", 505, {6000}, {800}, kB1Seek, kB1Bytes, kB1Zip);
   branch("Muon_phi", -1, {7000}, {900}, kB2Seek, kB2Bytes, kB2Zip);
+  // The record carries the totals, as a real one does.
+  bePut64(&fm.treeBlob[kTreeZipOff], static_cast<uint64_t>(fm.zipBytes));
+  bePut64(&fm.treeBlob[kAutoFlushOff], static_cast<uint64_t>(autoFlush));
+  for (const auto& b : fm.branches)
+    bePut64(&fm.treeBlob[b.zipBytesOff], static_cast<uint64_t>(b.zipBytes));
 
   fx.header.assign(100, 0);
   std::memcpy(fx.header.data(), "root", 4);
@@ -259,7 +264,8 @@ TEST(FillLayout, SlotsAreContiguousAndSized) {
 }
 
 // The factor is in hundredths: 2.5x, and a factor whose slots must be rounded
-// down to a byte. fZipBytes grows by exactly the padding, whatever the factor.
+// down to a byte (the plugin fixes it at 3; the layout takes any). The tree's
+// totals are left as the file states them, whatever the factor.
 TEST(FillLayout, FractionalSlotFactors) {
   Fx fx = fixture();
   const uint32_t orig[] = {1500, 2500, 900};
@@ -268,26 +274,23 @@ TEST(FillLayout, FractionalSlotFactors) {
     ASSERT_TRUE(L.error.empty()) << L.error;
     ASSERT_EQ(L.slots.size(), 3u);
     uint64_t at = L.slotsBegin;
-    int64_t b0 = 0, b2 = 0;
     for (size_t i = 0; i < 3; ++i) {
       const uint32_t want = orig[i] * k100 / 100; // 3750 6250 2250; 3495 5825 2097
       EXPECT_EQ(L.slots[i].vLen, want) << k100;
       EXPECT_EQ(L.slots[i].vSeek, at);
       at += L.slots[i].vLen;
-      (i < 2 ? b0 : b2) += static_cast<int64_t>(want) - orig[i];
     }
     EXPECT_EQ(L.virtualSize, at);
     auto blob = metaBlob(L, fx);
-    EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kB0Zip])), 4000 + b0);
-    EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kB2Zip])), 900 + b2);
-    EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kTreeZipOff])), 10000 + b0 + b2);
+    for (uint64_t off : {kB0Zip, kB2Zip, kTreeZipOff, kAutoFlushOff})
+      EXPECT_EQ(beGet64(&blob[off]), beGet64(&fx.fm.treeBlob[off])) << "offset " << off;
   }
   EXPECT_EQ(layout(fx, {"lzma", "zlib"}, 100).slots[0].vLen, 1500u) << "1x: the original fits";
   EXPECT_NE(layout(fx, {"lzma", "zlib"}, 99).error.find("at least 1"), std::string::npos)
       << "below 1x the original would not fit its own slot";
 }
 
-TEST(FillLayout, MetadataPointsAtSlotsAndScalesSizes) {
+TEST(FillLayout, MetadataPointsAtSlotsAndKeepsTheRealTotal) {
   Fx fx = fixture();
   FillLayout L = layout(fx);
   ASSERT_TRUE(L.error.empty()) << L.error;
@@ -300,16 +303,12 @@ TEST(FillLayout, MetadataPointsAtSlotsAndScalesSizes) {
   EXPECT_EQ(beGet64(&blob[kB2Seek]), L.slots[2].vSeek);
   // The unlisted branch is untouched.
   EXPECT_EQ(beGet64(&blob[kB1Seek]), 0u);
-  EXPECT_EQ(beGet64(&blob[kB1Zip]), 0u);
-  // fZipBytes grows by exactly the padding, per branch and for the tree.
-  EXPECT_EQ(beGet64(&blob[kB0Zip]), 4u * 4000);
-  EXPECT_EQ(beGet64(&blob[kB2Zip]), 4u * 900);
-  const int64_t growth = 3 * 4000 + 3 * 900;
-  EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kTreeZipOff])), 10000 + growth);
-  // Flushed by size: fAutoFlush scales with fZipBytes, so the cache holds what
-  // it held before and the cluster estimate (entries x cache / zip) is unchanged.
-  const double f = (10000.0 + growth) / 10000.0;
-  EXPECT_EQ(static_cast<int64_t>(beGet64(&blob[kAutoFlushOff])), std::llround(-30000000 * f));
+  EXPECT_EQ(beGet64(&blob[kB1Zip]), 800u);
+  // fZipBytes (per branch, for the tree) and fAutoFlush stay what the file
+  // says: ROOT's read cache keeps the size it has for the original file,
+  // however padded the slots are.
+  for (uint64_t off : {kB0Zip, kB2Zip, kTreeZipOff, kAutoFlushOff})
+    EXPECT_EQ(beGet64(&blob[off]), beGet64(&fx.fm.treeBlob[off])) << "offset " << off;
 }
 
 TEST(FillLayout, AutoFlushByEntriesIsLeftAlone) {
@@ -317,7 +316,7 @@ TEST(FillLayout, AutoFlushByEntriesIsLeftAlone) {
   FillLayout L = layout(fx);
   ASSERT_TRUE(L.error.empty()) << L.error;
   auto blob = metaBlob(L, fx);
-  EXPECT_EQ(beGet64(&blob[kAutoFlushOff]), 0u); // never written: the cache scales via fZipBytes
+  EXPECT_EQ(beGet64(&blob[kAutoFlushOff]), 1000u); // never written
 }
 
 TEST(FillLayout, MetadataRecordKeepsItsKeyHeaderLength) {

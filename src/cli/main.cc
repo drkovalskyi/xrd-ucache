@@ -4139,7 +4139,7 @@ int cmdDoctor(const Config& cfg) {
   // memory cannot say it, and ROOT does not shrink its buffers to fit.
   if (cfg.recompress)
     std::printf("  [NOTE] recompress = on: jobs hold more memory while they read (warm passes\n"
-                "         needed about 1.9x on TTree and 2.3x on RNTuple what a replica made by\n"
+                "         needed about 1.8x on TTree and 2.3x on RNTuple what a replica made by\n"
                 "         `ucache recompress` needs). If they run short, set recompress off; files\n"
                 "         already recompressed this way keep their layout until removed\n"
                 "         while no job is reading them (`ucache untranspose <url>`, or\n"

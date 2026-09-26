@@ -227,10 +227,8 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
 
   std::vector<uint8_t> blob = fm.treeBlob;
   uint64_t at = L.slotsBegin;
-  int64_t treeGrowth = 0;
   for (uint32_t b : L.relocated) {
     const BranchInfo& br = fm.branches[b];
-    int64_t branchGrowth = 0;
     for (int32_t i = 0; i < br.writeBasket; ++i) {
       FillSlot s;
       s.branch = b;
@@ -241,26 +239,18 @@ FillLayout layoutForFill(const FileMeta& fm, uint64_t fileSize, const std::vecto
       s.vLen = static_cast<uint32_t>(std::min<uint64_t>(want, INT32_MAX));
       s.vSeek = at;
       at += s.vLen;
-      branchGrowth += static_cast<int64_t>(s.vLen) - static_cast<int64_t>(s.origLen);
       bePut<int64_t>(blob.data() + br.seekArrayOff + 8ull * i, static_cast<int64_t>(s.vSeek));
       bePut<int32_t>(blob.data() + br.bytesArrayOff + 4ull * i, static_cast<int32_t>(s.vLen));
       L.slots.push_back(s);
     }
-    bePut<int64_t>(blob.data() + br.zipBytesOff, br.zipBytes + branchGrowth);
-    treeGrowth += branchGrowth;
   }
   L.virtualSize = at;
-  const int64_t newZip = fm.zipBytes + treeGrowth;
-  bePut<int64_t>(blob.data() + fm.zipBytesOff, newZip);
-  if (fm.autoFlush < 0) {
-    // Flushed by size: the cache is |fAutoFlush| bytes and a cluster's length
-    // in entries is estimated from fZipBytes. Scaling both by the same factor
-    // keeps the estimate and lets a cluster's slots fit the cache as its
-    // baskets did.
-    const double f = static_cast<double>(newZip) / static_cast<double>(fm.zipBytes);
-    bePut<int64_t>(blob.data() + fm.autoFlushOff,
-                   static_cast<int64_t>(std::llround(static_cast<double>(fm.autoFlush) * f)));
-  }
+  // fZipBytes (tree and branch) and fAutoFlush are left as the file states
+  // them: ROOT sizes its read cache from them (TTree::GetCacheAutoSize), and
+  // the real total keeps that cache the size it has for the original file.
+  // Scaled with the slots it was three times that, for every branch of the
+  // tree, read or not. The price is that a fill holding padded slots splits
+  // into more requests (measured: no cost in time).
 
   // The relocated metadata key: the original header bytes (same length),
   // fNbytes = the record's length, fSeekKey = metaSeek; fObjlen is untouched,

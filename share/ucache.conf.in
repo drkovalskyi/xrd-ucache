@@ -23,17 +23,10 @@ dir = {{DIR}}
 # into a form that is faster to decode -- no separate step.
 #
 # MEMORY: with it on, a job holds more memory while it reads. On the analyses
-# measured, warm passes needed about 1.9x (TTree) and 2.3x (RNTuple) the memory
+# measured, warm passes needed about 1.8x (TTree) and 2.3x (RNTuple) the memory
 # the same job needs from a replica made by `ucache recompress`. If your jobs
 # run short of memory, leave it off and build replicas with `ucache recompress`
 # instead. Turning it off later does not change files already recompressed
 # this way: remove those first, while no job is reading them (`ucache
 # untranspose <url>`, or `ucache clear`; a job still reading one would fail).
 # recompress = on
-#
-# TTree files only: each basket gets room for this many times its stored size
-# (fractions allowed, 1 to 10). ROOT sizes its read buffers from that room, so
-# less needs less memory, and leaves more baskets in their original codec.
-# Applies to files that get their replica after a change; a file that has one
-# keeps its own.
-# recompress_slot_factor = 3

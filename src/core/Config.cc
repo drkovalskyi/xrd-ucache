@@ -205,17 +205,6 @@ bool applyKey(Config& c, const std::string& k, const std::string& v, bool& expli
     c.recompress = truthy(v);
   else if (k == "recompress_keep_originals")
     c.recompressKeepOriginals = truthy(v);
-  else if (k == "recompress_slot_factor") {
-    char* end = nullptr;
-    const double f = std::strtod(v.c_str(), &end);
-    if (!v.empty() && end && *end == '\0' && f >= 1.0 && f <= 10.0) {
-      c.recompressSlotFactor100 = static_cast<uint32_t>(std::llround(f * 100.0));
-    } else {
-      UCACHE_WARN("%s: recompress_slot_factor=%s invalid (a number from 1 to 10); ignored", src,
-                  v.c_str());
-      return false; // the layer below still governs, and `settings` must say so
-    }
-  }
   else if (k == "recompress_codecs")
     c.recompressCodecs = splitCommas(v);
   else if (k == "recompress_reclaim") {
@@ -420,7 +409,6 @@ const std::vector<Config::KeyInfo>& Config::knownKeys() {
       {"max_read_fraction", "UCACHE_MAX_READ_FRACTION"},
       {"recompress", "UCACHE_RECOMPRESS"},
       {"recompress_keep_originals", "UCACHE_RECOMPRESS_KEEP_ORIGINALS"},
-      {"recompress_slot_factor", "UCACHE_RECOMPRESS_SLOT_FACTOR"},
       {"recompress_codecs", "UCACHE_RECOMPRESS_CODECS"},
       {"recompress_reclaim", "UCACHE_RECOMPRESS_RECLAIM"},
       {"trace", "UCACHE_TRACE"},
@@ -551,18 +539,6 @@ std::string Config::valueOf(const std::string& key) const {
     return onoff(recompress);
   if (key == "recompress_keep_originals")
     return onoff(recompressKeepOriginals);
-  if (key == "recompress_slot_factor") {
-    // As typed: 3, 2.5, 2.75.
-    char b[32];
-    const uint32_t f = recompressSlotFactor100;
-    if (f % 100 == 0)
-      std::snprintf(b, sizeof b, "%u", f / 100);
-    else if (f % 10 == 0)
-      std::snprintf(b, sizeof b, "%u.%u", f / 100, (f % 100) / 10);
-    else
-      std::snprintf(b, sizeof b, "%u.%02u", f / 100, f % 100);
-    return b;
-  }
   if (key == "recompress_codecs")
     return join(recompressCodecs);
   if (key == "recompress_reclaim")

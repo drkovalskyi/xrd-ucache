@@ -200,7 +200,7 @@ Header:
 | 24 | 8 | origin_size u64 | validators, compared like a replica's (`validate`) |
 | 32 | 8 | origin_mtime u64 | |
 | 40 | 1 | cksum_kind u8 | |
-| 42 | 2 | slot_factor u16 | in hundredths: a TTree slot is ⌊stored basket length × slot_factor / 100⌋ bytes (`recompress_slot_factor` when the store was made) |
+| 42 | 2 | slot_factor u16 | in hundredths: a TTree slot is ⌊stored basket length × slot_factor / 100⌋ bytes. 300 (3×), fixed; a store an earlier build made with another factor is served with the one it records |
 | 44 | 4 | origin_cksum u32 | |
 | 48 | 8 | virtual_size u64 | the file size readers are shown |
 | 56 | 8 | layout_hash u64 | XXH3-64 of the layout |

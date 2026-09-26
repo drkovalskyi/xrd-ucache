@@ -22,10 +22,10 @@
 //     relocated basket's seek and length pointing at its slot. It comes FIRST
 //     in the extension so that a 32-bit keys-list entry can still address it;
 //     the slots after it may lie anywhere, because fBasketSeek is 64-bit;
-//   * fZipBytes (tree and branch) and, for a tree flushed by size, fAutoFlush,
-//     scaled with the slots. ROOT sizes its read cache from them
-//     (TTree::GetCacheAutoSize): left unscaled, a cluster's slots no longer fit
-//     the cache and every fill splits into several requests.
+//   * fZipBytes (tree and branch) and fAutoFlush are NOT scaled: ROOT sizes
+//     its read cache from them (TTree::GetCacheAutoSize), so the real total
+//     keeps the cache, and the memory it takes, what it is for the original
+//     file. A fill holding padded slots then splits into more requests.
 //
 // Rules this obeys, each checked against ROOT:
 //   * no key header ever changes LENGTH — entry offsets inside a basket are

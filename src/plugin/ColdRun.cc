@@ -48,14 +48,20 @@ using XrdCl::XRootDStatus;
 
 namespace {
 
-// The slot factor (how many times a basket's stored length its slot is) is
-// the setting `recompress_slot_factor` for a new store, and the store's own
-// for an existing one: see Config.h.
+// The slot factor: a TTree basket's slot is 3 times its stored length. Fixed,
+// not a setting: where every slot sits follows from it, so a store made again
+// after one was removed lays out the same grid, and a reader still holding the
+// old store's positions reads the same baskets there. (At 3 the ZSTD-1 form of
+// all but ~2% of NanoAOD's LZMA baskets fits, 0.1% of the bytes; a basket
+// whose form does not fit is served as it was stored.) An existing store is
+// served with the factor it records.
+constexpr uint32_t kSlotFactor100 = 300;
 
 // Bumped whenever the layout a store was made for could be computed
 // differently: a store of another version is replaced, never served.
 // 2: RNTuple slot pages carry their checksum.
-constexpr uint32_t kLayoutVersion = 2;
+// 3: the tree states its real total size; the slot factor is fixed.
+constexpr uint32_t kLayoutVersion = 3;
 
 // Converted records wait in memory until this many bytes, the periodic
 // checkpoint, or the process's last close of the file, then go to the store in
@@ -770,7 +776,7 @@ std::shared_ptr<ColdFill> build(const std::shared_ptr<HandleState>& st,
     src.st = st;
     src.entry = entry;
     cf->codecs = cfg.recompressCodecs;
-    cf->slotFactor100 = cfg.recompressSlotFactor100;
+    cf->slotFactor100 = kSlotFactor100;
     // Rebuilding the layout this process already showed (its store is gone):
     // with what it was computed with, not with today's settings.
     if (std::string shownCodecs; mode == AttachMode::kMatch &&
