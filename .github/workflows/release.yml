@@ -140,9 +140,11 @@ jobs:
     steps:
       - name: deps
         run: brew install openssl@3
-      - name: cache the xrootd ${{ env.XRD_VER }} and ${{ env.XRD6_VER }} builds and the codecs
+      # Restored here and saved right after they are built (below), not at the
+      # end of the job: a failure later in the job must not throw them away.
+      - name: restore the xrootd ${{ env.XRD_VER }} and ${{ env.XRD6_VER }} builds and the codecs
         id: depcache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ env.XRD_PREFIX }}
@@ -181,6 +183,15 @@ jobs:
                       --disable-doc --disable-nls
           make -j"$(sysctl -n hw.ncpu)"
           make install
+      - name: save the xrootd builds and the codecs
+        if: steps.depcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.XRD_PREFIX }}
+            ${{ env.XRD6_PREFIX }}
+            ${{ env.CODECS }}
+          key: ${{ steps.depcache.outputs.cache-primary-key }}
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -193,7 +204,9 @@ jobs:
                 -DUCACHE_PLUGIN_BIND_AT_LOAD=ON \
                 -DUCACHE_LZMA="$CODECS/lib/liblzma.a" -DUCACHE_LZMA_INC="$CODECS/include" \
                 -DUCACHE_ZSTD="$CODECS/lib/libzstd.a" -DUCACHE_ZSTD_INC="$CODECS/include" \
-                -DUCACHE_ZLIB=z -DUCACHE_LZ4=OFF
+                -DUCACHE_LZ4:STRING=OFF
+          # zlib is the system's (found in the SDK); lz4 is left out, as in the
+          # EL9 packages. The dependency check in the next step proves both.
           cmake --build build-pkg -j"$(sysctl -n hw.ncpu)"
           (cd build-pkg && cpack -G TGZ)
           mkdir -p dist && cp build-pkg/xrd-ucache-*-macos-arm64.tar.gz dist/
