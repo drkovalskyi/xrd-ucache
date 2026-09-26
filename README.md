@@ -65,16 +65,18 @@ root -l -b -q ~/ucache/share/xrd-ucache/ucache_try.C
 non-zero if there is. `ucache_try.C` is a small analysis: from one public CMS
 open-data file it selects events with two muons of opposite charge, computes
 their invariant mass from six muon branches, and saves the mass spectrum as
-`ucache_try_dimuon.png`. It first removes the file from the cache, then runs
-three times, each in a fresh ROOT process: with uCache, which fetches the data
-and keeps it; with uCache switched off (`UCACHE_DISABLE=1`); and with uCache
-again. For each run it reports the time and how much came from the server —
-the third run should need nothing from it — and whether the result was the
-same every time.
+`ucache_try_dimuon.png`. It first removes the file from the cache and runs the
+analysis once with uCache off as a warm-up, not compared: the first contact
+with anything is slower, and that would bias whichever run came first. Then
+it runs three times, each in a fresh ROOT process: with uCache off
+(`UCACHE_DISABLE=1`); with uCache, which fetches the data and keeps it; and
+with uCache again. It reports each run's time and how much came from the
+server, what filling the cache cost (run 2 against run 1) and what reading from
+it saved (run 3 against run 1), and whether the result was the same every time.
 
-The gain depends on how far away the server is. On the Mac this was tested on,
-reading the data took 27 s the first time and 3 s from the cache; right next
-to the server there is little to gain, and the report says so. Any other
+The gain depends on how far away the server is and how much of the job is
+waiting for data: right next to the server, most of this one is ROOT compiling
+and computing, there is little to gain, and the report says so. Any other
 NanoAOD file works too (it is removed from the cache first as well):
 `root -l -b -q "$HOME/ucache/share/xrd-ucache/ucache_try.C(\"root://host//path/file.root\")"`.
 

@@ -10,13 +10,17 @@
 // branches, as a typical analysis reads: uCache reads a job that takes most
 // of a large file straight from the server, without caching it.
 //
-// The file is first removed from the cache (`ucache rm`), then analysed three
-// times, each in a fresh ROOT process so that none inherits another's
-// connection or compiled code: with uCache, which fetches the data and keeps
-// it; with uCache switched off (UCACHE_DISABLE=1), straight from the server;
-// and with uCache again, from the cache. Each line of the report says how much
-// came from the server (`ucache stats`), so it shows rather than assumes where
-// the data came from. With no arguments it reads a public CMS open-data file.
+// The file is first removed from the cache (`ucache rm`). Then a warm-up run
+// with uCache off, not compared: the first contact with anything is slow (the
+// server has not served this data lately, ROOT starts for the first time), and
+// charging that to whichever run came first would bias it. Then three runs,
+// each in a fresh ROOT process so that none inherits another's connection or
+// compiled code: with uCache switched off (UCACHE_DISABLE=1), straight from the
+// server; with uCache, which fetches the data and keeps it; and with uCache
+// again, from the cache. Run 2 against run 1 is what filling the cache costs,
+// run 1 against run 3 what it saves. Each line of the report says how much came
+// from the server (`ucache stats`), so it shows rather than assumes where the
+// data came from. With no arguments it reads a public CMS open-data file.
 
 #include <ROOT/RDataFrame.hxx>
 #include <ROOT/RVec.hxx>
@@ -132,17 +136,18 @@ void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Ru
   else
     std::printf("  `ucache` is not on PATH: the file is not removed from the cache first,\n"
                 "  and the report cannot say where the data came from.\n\n");
-  std::printf("  analysis 1 of 3 ...\n");
+  std::printf("  warm-up, uCache off ...\n");
+  const Pass warmup = analyseInChild("UCACHE_DISABLE=1", __FILE__, url, 1);
+  std::printf("  run 1 of 3 ...\n");
+  const Pass direct = analyseInChild("UCACHE_DISABLE=1", __FILE__, url, 1);
+  std::printf("  run 2 of 3 ...\n");
   const double f0 = fetchedBytes();
   const Pass fill = analyseInChild("", __FILE__, url, 1);
   const double f1 = fetchedBytes();
-  std::printf("  analysis 2 of 3 ...\n");
-  const Pass direct = analyseInChild("UCACHE_DISABLE=1", __FILE__, url, 1);
-  std::printf("  analysis 3 of 3 ...\n");
-  const double f2 = fetchedBytes();
+  std::printf("  run 3 of 3 ...\n");
   const Pass warm = analyseInChild("", __FILE__, url, 2);
-  const double f3 = fetchedBytes();
-  if (!fill.ok || !direct.ok || !warm.ok) {
+  const double f2 = fetchedBytes();
+  if (!warmup.ok || !fill.ok || !direct.ok || !warm.ok) {
     std::printf("\n  An analysis failed; its messages are above.\n");
     return;
   }
@@ -154,10 +159,13 @@ void ucache_try(const char* url = "root://eospublic.cern.ch//eos/opendata/cms/Ru
   const bool same = fill.pairs == warm.pairs && fill.mean == warm.mean &&
                     direct.pairs == warm.pairs && direct.mean == warm.mean;
   const double gain = warm.seconds > 0 ? direct.seconds / warm.seconds : 0;
-  std::printf("\n  1. with uCache:   %6.1f s   %s\n", fill.seconds, fromServer(f0, f1).Data());
-  std::printf("  2. uCache off:    %6.1f s     all of it from the server\n", direct.seconds);
-  std::printf("  3. with uCache:   %6.1f s   %s   %.1fx faster than 2\n", warm.seconds,
-              fromServer(f2, f3).Data(), gain);
+  const double cost = direct.seconds > 0 ? fill.seconds / direct.seconds : 0;
+  std::printf("\n  warm-up, uCache off:  %6.1f s   (first contact, not compared)\n", warmup.seconds);
+  std::printf("  1. uCache off:        %6.1f s     all of it from the server\n", direct.seconds);
+  std::printf("  2. uCache, first run: %6.1f s   %s   %.2fx the time of 1\n", fill.seconds,
+              fromServer(f0, f1).Data(), cost);
+  std::printf("  3. uCache, again:     %6.1f s   %s   %.1fx faster than 1\n", warm.seconds,
+              fromServer(f1, f2).Data(), gain);
   std::printf("  Same result every time: %s (%.0f muon pairs)\n", same ? "yes" : "NO", warm.pairs);
   std::printf("  Mass plot: %s\n", kPlot);
   if (gain < 1.2)
